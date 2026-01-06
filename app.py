@@ -12,18 +12,22 @@ from PIL import Image
 from pdf2image import convert_from_bytes
 from streamlit_drawable_canvas import st_canvas
 
+
 # =========================
 # Helpers
 # =========================
-def load_pages(file_bytes: bytes, filename: str, dpi: int, first_page=1, last_page=1) -> List[Image.Image]:
+def load_pages(file_bytes: bytes, filename: str, dpi: int,
+               first_page: int = 1, last_page: int = 1) -> List[Image.Image]:
     fn = filename.lower()
     if fn.endswith(".pdf"):
         return convert_from_bytes(file_bytes, dpi=dpi, first_page=first_page, last_page=last_page)
     return [Image.open(io.BytesIO(file_bytes))]
 
+
 def pil_to_bgr(img: Image.Image) -> np.ndarray:
     arr = np.array(img.convert("RGB"))
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
 
 def preprocess(bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -36,8 +40,10 @@ def preprocess(bgr: np.ndarray) -> np.ndarray:
     )
     return thr
 
+
 def cell_fill_ratio(bin_img: np.ndarray) -> float:
     return float((bin_img > 0).mean())
+
 
 def pick_one_ratio(scores: List[Tuple[str, float]], blank_thr: float, min_ratio: float):
     scores = sorted(scores, key=lambda x: x[1], reverse=True)
@@ -51,6 +57,7 @@ def pick_one_ratio(scores: List[Tuple[str, float]], blank_thr: float, min_ratio:
         return "!", "DOUBLE"
 
     return top_c, "OK"
+
 
 def parse_ranges(txt: str) -> List[Tuple[int, int]]:
     if not txt or not txt.strip():
@@ -67,10 +74,10 @@ def parse_ranges(txt: str) -> List[Tuple[int, int]]:
             out.append((x, x))
     return out
 
+
 def in_ranges(q: int, ranges: List[Tuple[int, int]]) -> bool:
-    if not ranges:
-        return False
     return any(a <= q <= b for a, b in ranges)
+
 
 # =========================
 # Template Data
@@ -78,24 +85,27 @@ def in_ranges(q: int, ranges: List[Tuple[int, int]]) -> bool:
 @dataclass
 class QBlock:
     name: str
-    roi: Tuple[int, int, int, int]  # x,y,w,h in template image coords
+    roi: Tuple[int, int, int, int]  # x,y,w,h
     q_start: int
     q_end: int
-    rows: int  # number of question rows inside this block
+    rows: int
+
 
 @dataclass
 class Template:
     base_w: int
     base_h: int
-    id_roi: Tuple[int, int, int, int]  # x,y,w,h
+    id_roi: Tuple[int, int, int, int]
     id_digits: int
     id_rows: int
     q_blocks: List[QBlock]
-    choices_default: int = 4  # 4 or 5
+    choices_default: int = 4
+
 
 def scale_roi(roi, sx, sy):
     x, y, w, h = roi
     return (int(x * sx), int(y * sy), int(w * sx), int(h * sy))
+
 
 def template_for_page(tpl: Template, page_w: int, page_h: int) -> Template:
     sx, sy = page_w / tpl.base_w, page_h / tpl.base_h
@@ -110,7 +120,8 @@ def template_for_page(tpl: Template, page_w: int, page_h: int) -> Template:
             rows=b.rows
         ))
     return Template(
-        base_w=page_w, base_h=page_h,
+        base_w=page_w,
+        base_h=page_h,
         id_roi=id_roi,
         id_digits=tpl.id_digits,
         id_rows=tpl.id_rows,
@@ -118,12 +129,14 @@ def template_for_page(tpl: Template, page_w: int, page_h: int) -> Template:
         choices_default=tpl.choices_default
     )
 
+
 # =========================
 # OMR Readers
 # =========================
-def read_student_code(thr: np.ndarray, tpl: Template, id_blank_thr: float, id_min_ratio: float):
+def read_student_code(thr: np.ndarray, tpl: Template,
+                      id_blank_thr: float, id_min_ratio: float) -> Tuple[str, List[str]]:
     x, y, w, h = tpl.id_roi
-    roi = thr[y:y+h, x:x+w]
+    roi = thr[y:y + h, x:x + w]
 
     rows, cols = tpl.id_rows, tpl.id_digits
     ch, cw = max(1, h // rows), max(1, w // cols)
@@ -134,22 +147,24 @@ def read_student_code(thr: np.ndarray, tpl: Template, id_blank_thr: float, id_mi
     for c in range(cols):
         col_scores = []
         for r in range(rows):
-            cell = roi[r*ch:(r+1)*ch, c*cw:(c+1)*cw]
+            cell = roi[r * ch:(r + 1) * ch, c * cw:(c + 1) * cw]
             col_scores.append((str(r), cell_fill_ratio(cell)))
 
         d, stt = pick_one_ratio(col_scores, blank_thr=id_blank_thr, min_ratio=id_min_ratio)
-        digits.append(d if d not in ["?","!"] else "?")  # never empty
+        digits.append(d if d not in ["?","!"] else "?")
         statuses.append(stt)
 
     return "".join(digits), statuses
 
-def read_answers(thr: np.ndarray, tpl: Template, choices: int, ans_blank_thr: float, ans_min_ratio: float) -> Dict[int, Tuple[str, str]]:
+
+def read_answers(thr: np.ndarray, tpl: Template, choices: int,
+                 ans_blank_thr: float, ans_min_ratio: float) -> Dict[int, Tuple[str, str]]:
     letters = "ABCDE"[:choices]
     out: Dict[int, Tuple[str, str]] = {}
 
     for block in tpl.q_blocks:
         x, y, w, h = block.roi
-        roi = thr[y:y+h, x:x+w]
+        roi = thr[y:y + h, x:x + w]
 
         rows = block.rows
         rh = max(1, h // rows)
@@ -161,7 +176,7 @@ def read_answers(thr: np.ndarray, tpl: Template, choices: int, ans_blank_thr: fl
                 break
             scores = []
             for c in range(choices):
-                cell = roi[r*rh:(r+1)*rh, c*cw:(c+1)*cw]
+                cell = roi[r * rh:(r + 1) * rh, c * cw:(c + 1) * cw]
                 scores.append((letters[c], cell_fill_ratio(cell)))
             a, stt = pick_one_ratio(scores, blank_thr=ans_blank_thr, min_ratio=ans_min_ratio)
             out[q] = (a, stt)
@@ -169,33 +184,33 @@ def read_answers(thr: np.ndarray, tpl: Template, choices: int, ans_blank_thr: fl
 
     return out
 
+
 def compute_score(key_ans: Dict[int, Tuple[str, str]],
                   stu_ans: Dict[int, Tuple[str, str]],
                   theory_ranges: List[Tuple[int, int]],
                   practical_ranges: List[Tuple[int, int]]) -> int:
-    # If both empty => grade all questions
     grade_all = (not theory_ranges and not practical_ranges)
     score = 0
 
     for q, (ka, _) in key_ans.items():
-        sa, _stt = stu_ans.get(q, ("?", "BLANK"))
+        sa, _ = stu_ans.get(q, ("?", "BLANK"))
         if sa in ["?","!"]:
             continue
 
         if grade_all:
-            if sa == ka:
-                score += 1
+            score += int(sa == ka)
             continue
 
-        if theory_ranges and in_ranges(q, theory_ranges) and sa == ka:
-            score += 1
-        if practical_ranges and in_ranges(q, practical_ranges) and sa == ka:
-            score += 1
+        if theory_ranges and in_ranges(q, theory_ranges):
+            score += int(sa == ka)
+        if practical_ranges and in_ranges(q, practical_ranges):
+            score += int(sa == ka)
 
     return score
 
+
 # =========================
-# Canvas -> rectangles
+# Canvas helpers
 # =========================
 def rects_from_canvas(canvas_json) -> List[Tuple[int, int, int, int]]:
     if not canvas_json:
@@ -212,36 +227,48 @@ def rects_from_canvas(canvas_json) -> List[Tuple[int, int, int, int]]:
         rects.append((left, top, w, h))
     return rects
 
+
+def cloud_safe_image(img: Image.Image) -> Image.Image:
+    # Fix for Streamlit Cloud canvas background bug:
+    # Convert PIL image -> PNG bytes -> reload PIL
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return Image.open(buf)
+
+
 # =========================
-# Streamlit UI
+# Streamlit App
 # =========================
 st.set_page_config(page_title="Remark-Style OMR", layout="wide")
-st.title("OMR Bubble Sheet — واجهة مثل Remark (رسم يدوي + تصحيح + Excel)")
+st.title("OMR Bubble Sheet — Remark-Style (رسم يدوي + تصحيح + Excel)")
 
-st.info(
-    "✅ الخطوات: 1) ابنِ Template بالرسم  2) احفظه  3) ارفع Roster + AnswerKey + أوراق الطلاب  4) صدّر Excel\n"
-    "ملاحظة: Streamlit Cloud يقيّد رفع الملفات الكبيرة (200MB). إذا ملف الطلاب كبير جدًا قسمه إلى أجزاء."
-)
+st.caption("✅ ارسم مناطق الكود والاسئلة بالماوس مثل Remark ثم صحّح وصدّر Excel. "
+           "ملاحظة: Streamlit Cloud يقيّد رفع الملفات الكبيرة 200MB للملف الواحد.")
 
-tab1, tab2 = st.tabs(["① بناء Template (Remark-Style)", "② التصحيح وإخراج Excel"])
+tab1, tab2 = st.tabs(["① بناء Template", "② التصحيح وExcel"])
 
 # =========================
 # TAB 1: Build Template
 # =========================
 with tab1:
-    st.subheader("1) ارفع صفحة نموذج واحدة (صورة أو PDF صفحة 1)")
+    st.subheader("1) ارفع صفحة نموذج واحدة (Template)")
     dpi_t = st.slider("DPI للعرض (Template)", 80, 200, 120, 10, key="dpi_t")
 
     tpl_file = st.file_uploader("Template page (PDF/PNG/JPG)", type=["pdf", "png", "jpg", "jpeg"], key="tpl_file")
 
+    if "tpl_id_roi" not in st.session_state:
+        st.session_state.tpl_id_roi = None
+    if "tpl_blocks" not in st.session_state:
+        st.session_state.tpl_blocks = []
+
     if tpl_file:
         pages = load_pages(tpl_file.getvalue(), tpl_file.name, dpi=dpi_t, first_page=1, last_page=1)
         tpl_img = pages[0]
-        base_w, base_h = tpl_img.size  # PIL: (w,h)
+        base_w, base_h = tpl_img.size
 
         st.write(f"Template image size: {base_w} x {base_h}")
 
-        # Settings
         colA, colB, colC = st.columns([1, 1, 1])
         with colA:
             mode = st.radio("ماذا ترسم الآن؟", ["ID ROI (كود الطالب)", "Q Block (بلوك أسئلة)"], horizontal=False)
@@ -251,50 +278,45 @@ with tab1:
         with colC:
             choices_default = st.radio("عدد الخيارات الافتراضي", [4, 5], horizontal=True)
 
-        st.markdown("### ارسم مستطيل/مربعات على الصورة (اسحب بالماوس)")
+        st.markdown("### ارسم مستطيلات على الصورة (اسحب بالماوس)")
+        safe_img = cloud_safe_image(tpl_img)
 
         canvas_result = st_canvas(
             fill_color="rgba(255, 0, 0, 0.08)",
             stroke_width=2,
             stroke_color="red",
-            background_image=tpl_img,
+            background_image=safe_img,   # ✅ Cloud-safe
             update_streamlit=True,
-            height=base_h,
-            width=base_w,
+            height=safe_img.size[1],
+            width=safe_img.size[0],
             drawing_mode="rect",
             key="canvas_tpl",
         )
 
         rects = rects_from_canvas(canvas_result.json_data)
 
-        # Session storage
-        if "tpl_id_roi" not in st.session_state:
-            st.session_state.tpl_id_roi = None
-        if "tpl_blocks" not in st.session_state:
-            st.session_state.tpl_blocks = []  # list of dict
-
         st.markdown("---")
-        st.subheader("2) تحويل المستطيلات إلى عناصر Template")
+        st.subheader("2) تحويل آخر مستطيل إلى عنصر")
 
         if rects:
-            st.write(f"عدد المستطيلات المرسومة الآن: {len(rects)}")
             latest = rects[-1]
+            st.write("آخر مستطيل:", latest)
 
             if mode == "ID ROI (كود الطالب)":
                 if st.button("✅ اجعل آخر مستطيل = منطقة كود الطالب"):
                     st.session_state.tpl_id_roi = latest
                     st.success(f"تم تعيين ID ROI = {latest}")
-
             else:
                 c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
                 with c1:
-                    block_name = st.text_input("اسم البلوك", value=f"Block{len(st.session_state.tpl_blocks)+1}")
+                    block_name = st.text_input("اسم البلوك", value=f"Block{len(st.session_state.tpl_blocks) + 1}")
                 with c2:
                     q_start = st.number_input("من سؤال", min_value=1, value=1, step=1, key="q_start_tmp")
                 with c3:
                     q_end = st.number_input("إلى سؤال", min_value=1, value=20, step=1, key="q_end_tmp")
                 with c4:
-                    rows = st.number_input("عدد الصفوف داخل البلوك", min_value=1, value=max(1, q_end-q_start+1), step=1)
+                    rows = st.number_input("عدد الصفوف داخل البلوك", min_value=1,
+                                           value=max(1, int(q_end) - int(q_start) + 1), step=1)
 
                 if st.button("➕ أضف آخر مستطيل كـ Q Block"):
                     st.session_state.tpl_blocks.append({
@@ -306,24 +328,23 @@ with tab1:
                     })
                     st.success(f"تمت إضافة بلوك: {block_name} ROI={latest} Q={q_start}-{q_end} rows={rows}")
 
-        # Show current template
         st.markdown("---")
-        st.subheader("3) محتوى Template الحالي")
+        st.subheader("3) Template الحالي")
         st.write("ID ROI:", st.session_state.tpl_id_roi)
-        st.write("Blocks:", st.session_state.tpl_blocks)
+        st.write("Q Blocks:", st.session_state.tpl_blocks)
 
-        if st.button("🧹 مسح جميع البلوكات (ليس ID)"):
-            st.session_state.tpl_blocks = []
-            st.success("تم مسح البلوكات")
+        cX, cY = st.columns([1, 1])
+        with cX:
+            if st.button("🧹 مسح جميع البلوكات"):
+                st.session_state.tpl_blocks = []
+                st.success("تم مسح البلوكات")
+        with cY:
+            if st.button("🧹 مسح ID ROI"):
+                st.session_state.tpl_id_roi = None
+                st.success("تم مسح ID ROI")
 
-        if st.button("🧹 مسح ID ROI"):
-            st.session_state.tpl_id_roi = None
-            st.success("تم مسح ID ROI")
-
-        # Save template JSON
         st.markdown("---")
-        st.subheader("4) حفظ Template (JSON)")
-
+        st.subheader("4) تحميل template.json")
         can_save = (st.session_state.tpl_id_roi is not None) and (len(st.session_state.tpl_blocks) > 0)
 
         if not can_save:
@@ -346,16 +367,16 @@ with tab1:
                     } for b in st.session_state.tpl_blocks
                 ]
             }
-
             tpl_bytes = json.dumps(tpl_dict, ensure_ascii=False, indent=2).encode("utf-8")
-            st.download_button("⬇️ تحميل template.json", data=tpl_bytes, file_name="template.json", mime="application/json")
-            st.success("احفظ template.json — ستستخدمه في تبويب التصحيح")
+            st.download_button("⬇️ تحميل template.json", data=tpl_bytes,
+                               file_name="template.json", mime="application/json")
+            st.success("احفظ template.json ثم انتقل للتبويب الثاني للتصحيح")
 
 # =========================
 # TAB 2: Grading
 # =========================
 with tab2:
-    st.subheader("1) ارفع Template (template.json)")
+    st.subheader("1) ارفع template.json")
     tpl_json_file = st.file_uploader("template.json", type=["json"], key="tpl_json_file")
 
     tpl: Optional[Template] = None
@@ -382,16 +403,16 @@ with tab2:
 
     st.markdown("---")
     st.subheader("2) إعدادات التصحيح")
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
     with col1:
-        dpi_g = st.slider("DPI تحويل PDF (تصحيح)", 80, 200, 120, 10, key="dpi_g")
+        dpi_g = st.slider("DPI تحويل PDF (تصحيح)", 80, 220, 140, 10, key="dpi_g")
     with col2:
         choices = st.radio("عدد الخيارات", [4, 5], horizontal=True, index=0)
     with col3:
         start_page = st.number_input("Start page", min_value=1, value=1, step=1)
     with col4:
-        end_page = st.number_input("End page", min_value=1, value=100, step=1)
+        end_page = st.number_input("End page", min_value=1, value=50, step=1)
 
     st.markdown("**نطاقات التصحيح (اختياري)**")
     cA, cB = st.columns([1, 1])
@@ -403,7 +424,7 @@ with tab2:
     theory_ranges = parse_ranges(theory_txt)
     practical_ranges = parse_ranges(practical_txt)
 
-    st.markdown("**حساسية القراءة** (لو كود الطالب يطلع غلط قلل ratio)")
+    st.markdown("**حساسية القراءة** (لتحسين قراءة الكود والببل)")
     cI, cJ, cK, cL = st.columns([1, 1, 1, 1])
     with cI:
         id_blank_thr = st.slider("ID blank thr", 0.01, 0.40, 0.06, 0.01)
@@ -428,14 +449,19 @@ with tab2:
         if "student_code" not in df.columns or "student_name" not in df.columns:
             st.error("Roster لازم يحتوي عمودين: student_code و student_name")
             st.stop()
-        df["student_code"] = df["student_code"].astype(str).str.strip().apply(lambda x: x.zfill(4))
+
+        # Important: keep leading zeros
+        df["student_code"] = df["student_code"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        # Default to 4 digits if your code length is 4; change if needed:
+        df["student_code"] = df["student_code"].apply(lambda x: x.zfill(4))
         df["student_name"] = df["student_name"].astype(str).str.strip()
         roster = dict(zip(df["student_code"], df["student_name"]))
         st.success(f"✅ Loaded roster: {len(roster)}")
 
     debug = st.checkbox("Debug: عرض قصّ ID + بلوكات أول ورقة", True)
 
-    if st.button("🚀 ابدأ التصحيح", disabled=(tpl is None)):
+    disabled_run = (tpl is None)
+    if st.button("🚀 ابدأ التصحيح", disabled=disabled_run):
         if tpl is None:
             st.error("ارفع template.json أولاً")
             st.stop()
@@ -446,22 +472,23 @@ with tab2:
             st.error("End page لازم >= Start page")
             st.stop()
 
-        # ---- Key (page 1)
+        # ---- Answer Key page 1
         key_pages = load_pages(key_file.getvalue(), key_file.name, dpi=dpi_g, first_page=1, last_page=1)
         key_img = key_pages[0]
         key_thr = preprocess(pil_to_bgr(key_img))
+
         kw, kh = key_img.size
         tpl_key = template_for_page(tpl, kw, kh)
-
-        # choices
         use_choices = int(choices) if choices else tpl.choices_default
 
         key_ans = read_answers(key_thr, tpl_key, use_choices, ans_blank_thr, ans_min_ratio)
 
         # ---- Student pages
         if sheets_file.name.lower().endswith(".pdf"):
-            pages = load_pages(sheets_file.getvalue(), sheets_file.name, dpi=dpi_g,
-                               first_page=int(start_page), last_page=int(end_page))
+            pages = load_pages(
+                sheets_file.getvalue(), sheets_file.name,
+                dpi=dpi_g, first_page=int(start_page), last_page=int(end_page)
+            )
         else:
             pages = [Image.open(io.BytesIO(sheets_file.getvalue()))]
 
@@ -477,11 +504,7 @@ with tab2:
             tpl_p = template_for_page(tpl, pw, ph)
 
             code, code_status = read_student_code(thr, tpl_p, id_blank_thr, id_min_ratio)
-
-            # name mapping only if code clean
-            name = ""
-            if "?" not in code:
-                name = roster.get(code, "")
+            name = roster.get(code, "") if "?" not in code else ""
 
             stu_ans = read_answers(thr, tpl_p, use_choices, ans_blank_thr, ans_min_ratio)
             score = compute_score(key_ans, stu_ans, theory_ranges, practical_ranges)
@@ -489,10 +512,11 @@ with tab2:
             if debug and i == 1:
                 st.markdown("### 🔎 Debug (First Student Page)")
                 x, y, w, h = tpl_p.id_roi
-                st.image(thr[y:y+h, x:x+w], caption=f"ID ROI | code={code} | status={code_status}", clamp=True)
-                for bi, b in enumerate(tpl_p.q_blocks, 1):
+                st.image(thr[y:y + h, x:x + w], caption=f"ID ROI | code={code} | status={code_status}", clamp=True)
+                for b in tpl_p.q_blocks:
                     x, y, w, h = b.roi
-                    st.image(thr[y:y+h, x:x+w], caption=f"{b.name}: Q{b.q_start}-{b.q_end}", clamp=True)
+                    st.image(thr[y:y + h, x:x + w], caption=f"{b.name}: Q{b.q_start}-{b.q_end}", clamp=True)
+
                 st.write("Key sample:", {k: key_ans[k] for k in sorted(key_ans)[:10]})
                 st.write("Student sample:", {k: stu_ans[k] for k in sorted(stu_ans)[:10]})
 
@@ -500,7 +524,7 @@ with tab2:
                 "sheet_index": sheet_index,
                 "student_code": code,
                 "student_name": name,
-                "score": score,
+                "score": int(score),
                 "id_status": ",".join(code_status)
             })
 
