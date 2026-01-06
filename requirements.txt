@@ -1,7 +1,8 @@
-streamlit
-opencv-python-headless
+streamlit==1.52.2
 numpy
 pandas
 openpyxl
-pdf2image
 pillow
+pdf2image
+opencv-python-headless
+streamlit-drawable-canvas
