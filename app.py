@@ -24,7 +24,8 @@ class QBlock:
     h: int
     start_q: int
     end_q: int
-    rows: int  # questions vertically
+    rows: int  # عدد الأسئلة عموديًا داخل البلوك
+
 
 @dataclass
 class TemplateConfig:
@@ -45,9 +46,11 @@ def pdf_or_image_to_pages(file_bytes: bytes, filename: str, dpi: int = 200) -> L
         return convert_from_bytes(file_bytes, dpi=dpi)
     return [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
 
+
 def pil_to_bgr(img: Image.Image) -> np.ndarray:
     arr = np.array(img.convert("RGB"))
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
 
 def preprocess_threshold(img_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -60,8 +63,10 @@ def preprocess_threshold(img_bgr: np.ndarray) -> np.ndarray:
     )
     return thr
 
+
 def score_cell(bin_img: np.ndarray) -> int:
     return int(np.sum(bin_img > 0))
+
 
 def pick_one(scores: List[Tuple[str, int]], min_fill: int, min_ratio: float):
     scores_sorted = sorted(scores, key=lambda x: x[1], reverse=True)
@@ -73,6 +78,7 @@ def pick_one(scores: List[Tuple[str, int]], min_fill: int, min_ratio: float):
     if second_score > 0 and (top_score / (second_score + 1e-6)) < min_ratio:
         return "!", "DOUBLE"
     return top_label, "OK"
+
 
 def parse_ranges(txt: str) -> List[Tuple[int, int]]:
     if not txt or not txt.strip():
@@ -91,10 +97,12 @@ def parse_ranges(txt: str) -> List[Tuple[int, int]]:
             out.append((x, x))
     return out
 
+
 def in_ranges(q: int, ranges: List[Tuple[int, int]]) -> bool:
     if not ranges:
         return True
     return any(a <= q <= b for a, b in ranges)
+
 
 def clamp_roi(x, y, w, h, W, H):
     x = max(0, min(int(x), W - 1))
@@ -103,7 +111,12 @@ def clamp_roi(x, y, w, h, W, H):
     h = max(1, min(int(h), H - y))
     return x, y, w, h
 
+
 def rect_from_canvas_obj(obj) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Object shape from streamlit-drawable-canvas:
+    left, top, width, height
+    """
     try:
         x = float(obj.get("left", 0))
         y = float(obj.get("top", 0))
@@ -115,14 +128,15 @@ def rect_from_canvas_obj(obj) -> Optional[Tuple[int, int, int, int]]:
     except Exception:
         return None
 
+
 def map_canvas_rect_to_image(rect_canvas, canvas_wh, image_wh):
-    """Scale rectangle drawn on canvas (cw,ch) to image coords (iw,ih)."""
     x, y, w, h = rect_canvas
     cw, ch = canvas_wh
     iw, ih = image_wh
     sx = iw / float(cw)
     sy = ih / float(ch)
     return int(x * sx), int(y * sy), int(w * sx), int(h * sy)
+
 
 def scale_roi(roi, src_wh, dst_wh):
     (x, y, w, h) = roi
@@ -134,7 +148,7 @@ def scale_roi(roi, src_wh, dst_wh):
 
 
 # ----------------------------
-# OMR readers
+# OMR Readers
 # ----------------------------
 def read_student_code(thr: np.ndarray, cfg: TemplateConfig, min_fill=250, min_ratio=1.25) -> str:
     x, y, w, h = cfg.id_roi
@@ -158,6 +172,7 @@ def read_student_code(thr: np.ndarray, cfg: TemplateConfig, min_fill=250, min_ra
         digits.append("" if d in ["?", "!"] else d)
 
     return "".join(digits).strip()
+
 
 def read_answers_block(thr: np.ndarray, block: QBlock, choices: int, min_fill=180, min_ratio=1.25):
     letters = "ABCDE"[:choices]
@@ -184,6 +199,7 @@ def read_answers_block(thr: np.ndarray, block: QBlock, choices: int, min_fill=18
         q += 1
     return out
 
+
 def read_all_answers(thr: np.ndarray, cfg: TemplateConfig, choices: int, min_fill_q: int, min_ratio: float):
     all_ans = {}
     for b in cfg.q_blocks:
@@ -192,7 +208,7 @@ def read_all_answers(thr: np.ndarray, cfg: TemplateConfig, choices: int, min_fil
 
 
 # ----------------------------
-# Session
+# Session State
 # ----------------------------
 if "id_roi" not in st.session_state:
     st.session_state.id_roi = None
@@ -202,16 +218,18 @@ if "cfg" not in st.session_state:
     st.session_state.cfg = None
 if "template_size" not in st.session_state:
     st.session_state.template_size = None
+if "canvas_key" not in st.session_state:
+    st.session_state.canvas_key = "canvas_v1"
 
 
 # ----------------------------
 # UI
 # ----------------------------
 st.set_page_config(page_title="OMR BubbleSheet (Remark-style)", layout="wide")
-st.title("✅ تصحيح ببل شيت — واجهة مثل Remark (تحديد المناطق بالماوس)")
+st.title("✅ تصحيح ببل شيت — تحديد المناطق بالماوس (مثل Remark)")
 
 with st.expander("0) إعدادات عامة", expanded=True):
-    dpi = st.slider("DPI لتحويل PDF (أعلى = أدق لكن أثقل)", 120, 260, 200, 10)
+    dpi = st.slider("DPI لتحويل PDF", 120, 260, 200, 10)
     choices = st.radio("عدد الخيارات لكل سؤال", [4, 5], horizontal=True)
     strict_mode = st.checkbox("وضع صارم: BLANK/DOUBLE = خطأ", value=True)
 
@@ -235,50 +253,58 @@ if template_file:
     left, right = st.columns([2, 1], gap="large")
 
     with right:
-        draw_mode = st.radio("ماذا سترسم الآن؟", ["ID ROI (كود الطالب)", "Q Block (بلوك أسئلة)"], index=0)
+        st.markdown("### وضع الرسم")
+        draw_mode = st.radio("اختر ما سترسمه الآن", ["ID ROI (كود الطالب)", "Q Block (بلوك أسئلة)"], index=0)
 
         id_digits = st.number_input("عدد خانات كود الطالب", 2, 30, 4, 1)
         id_rows = st.number_input("عدد صفوف الأرقام (عادة 10)", 5, 15, 10, 1)
 
         st.markdown("### إعداد Q Block")
-        start_q = st.number_input("Start Q", 1, 1000, 1)
-        end_q = st.number_input("End Q", 1, 1000, 20)
-        rows_in_block = st.number_input("Rows داخل البلوك", 1, 300, 20)
-
-        if st.button("🧹 مسح ID + Blocks"):
-            st.session_state.id_roi = None
-            st.session_state.q_blocks = []
-            st.session_state.cfg = None
-            st.success("تم المسح")
+        start_q = st.number_input("Start Q", 1, 2000, 1)
+        end_q = st.number_input("End Q", 1, 2000, 20)
+        rows_in_block = st.number_input("Rows داخل البلوك", 1, 400, 20)
 
         st.markdown("---")
+
+        colx, coly = st.columns(2)
+        with colx:
+            if st.button("🧹 مسح ID + Blocks"):
+                st.session_state.id_roi = None
+                st.session_state.q_blocks = []
+                st.session_state.cfg = None
+                st.success("تم المسح")
+
+        with coly:
+            if st.button("🧽 مسح رسومات الكانفس فقط"):
+                # تغيير key يعيد تهيئة الكانفس بالكامل
+                st.session_state.canvas_key = f"canvas_{np.random.randint(1, 10**9)}"
+                st.success("تم مسح رسومات الكانفس")
+
+        st.markdown("### ما تم حفظه")
         st.write("ID ROI:", st.session_state.id_roi)
         st.write("Q Blocks:", len(st.session_state.q_blocks))
         if st.session_state.q_blocks:
             st.json([asdict(b) for b in st.session_state.q_blocks])
 
     with left:
-        st.markdown(f"**حجم الصورة:** {Wt} × {Ht}")
-
-        # عرض الصورة
+        st.markdown(f"**حجم صورة الـTemplate:** {Wt} × {Ht}")
         st.image(template_img, caption="Template", use_container_width=True)
 
-        # Canvas فارغ بنفس أبعاد عرض ثابتة (نختار عرض 989 مثل مثالكم أو تلقائي)
+        st.warning("✍️ الرسم يتم على المربع الأبيض (Canvas) أدناه. اسحب بالماوس لرسم مستطيل.")
+
         canvas_w = st.slider("Canvas width (لا تغيّره بعد ما ترسم)", 700, 1400, min(1000, Wt), 10)
         canvas_h = int(canvas_w * (Ht / Wt))
 
-        st.info("✍️ ارسم مستطيل/مستطيلات على الكانفس ثم سيُحفظ آخر مستطيل حسب وضع الرسم.")
-
         canvas = st_canvas(
-            fill_color="rgba(255, 0, 0, 0.12)",
-            stroke_width=2,
-            stroke_color="red",
-            background_color="rgba(0,0,0,0)",
+            fill_color="rgba(255, 0, 0, 0.15)",
+            stroke_width=3,
+            stroke_color="#ff0000",
+            background_color="rgba(255,255,255,1)",  # ✅ خلفية بيضاء تجعل الرسم واضح ويشتغل
             update_streamlit=True,
             height=canvas_h,
             width=canvas_w,
             drawing_mode="rect",
-            key="canvas_no_bg",
+            key=st.session_state.canvas_key,
         )
 
         # حفظ آخر مستطيل
@@ -286,7 +312,7 @@ if template_file:
             last = canvas.json_data["objects"][-1]
             rc = rect_from_canvas_obj(last)
             if rc:
-                # تحويل من canvas -> image coords
+                # تحويل من canvas coords -> image coords
                 ri = map_canvas_rect_to_image(rc, (canvas_w, canvas_h), (Wt, Ht))
                 x, y, w, h = clamp_roi(*ri, Wt, Ht)
 
@@ -298,7 +324,6 @@ if template_file:
                     st.session_state.q_blocks.append(qb)
                     st.success(f"✅ إضافة Q Block: {qb.start_q}-{qb.end_q}")
 
-    # بناء cfg
     if st.session_state.id_roi and len(st.session_state.q_blocks) > 0:
         st.session_state.cfg = TemplateConfig(
             template_w=Wt,
@@ -326,7 +351,8 @@ if roster_file:
     if "student_code" not in df_r.columns or "student_name" not in df_r.columns:
         st.error("لازم الأعمدة: student_code و student_name")
     else:
-        roster_map = dict(zip(df_r["student_code"].astype(str).str.strip(), df_r["student_name"].astype(str).str.strip()))
+        roster_map = dict(zip(df_r["student_code"].astype(str).str.strip(),
+                              df_r["student_name"].astype(str).str.strip()))
         st.success(f"تم تحميل {len(roster_map)} طالب")
 
 st.divider()
