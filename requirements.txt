@@ -1,8 +1,8 @@
 streamlit
+streamlit-drawable-canvas
 opencv-python-headless
 numpy
 pandas
 openpyxl
 pdf2image
 pillow
-streamlit-drawable-canvas-fix
