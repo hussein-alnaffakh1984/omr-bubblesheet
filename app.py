@@ -1,3 +1,10 @@
+# app.py
+# OMR Bubble Sheet (Remark-style) — Streamlit Community Cloud
+# ✅ رسم مستطيل يدوي لتحديد: (1) منطقة كود الطالب ID ROI  (2) بلوكات الأسئلة Q Blocks
+# ✅ يدعم 4 أو 5 خيارات
+# ✅ يدعم نطاقات (نظري + عملي) أو نطاق واحد
+# ✅ يقرأ: sheet_index + student_code + student_name + score  ويصدر Excel
+
 import io
 import re
 import json
@@ -8,41 +15,52 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pdf2image import convert_from_bytes
 from PIL import Image
-
+from pdf2image import convert_from_bytes
 from streamlit_drawable_canvas import st_canvas
 
 
 # =========================
-# Helpers
+# Config models
 # =========================
-def load_pages(file_bytes: bytes, filename: str) -> List[Image.Image]:
-    name = filename.lower()
-    if name.endswith(".pdf"):
-        # dpi منخفض نسبيًا لتسريع السحابة (ممكن ترفعه لاحقًا إذا احتجت دقة أعلى)
-        return convert_from_bytes(file_bytes, dpi=200)
-    return [Image.open(io.BytesIO(file_bytes))]
+@dataclass
+class QBlock:
+    x: int
+    y: int
+    w: int
+    h: int
+    start_q: int
+    end_q: int
+    rows: int
 
-def pil_to_cv(img: Image.Image) -> np.ndarray:
-    arr = np.array(img.convert("RGB"))
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+@dataclass
+class TemplateConfig:
+    # original-image coordinates (not resized)
+    id_roi: Tuple[int, int, int, int] = (0, 0, 10, 10)  # x,y,w,h
+    id_digits: int = 4
+    id_rows: int = 10
+    q_blocks: List[QBlock] = None
 
-def preprocess(img_bgr: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    thr = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        35, 10
-    )
-    return thr
+    def to_dict(self):
+        d = asdict(self)
+        d["q_blocks"] = [asdict(b) for b in (self.q_blocks or [])]
+        return d
 
+    @staticmethod
+    def from_dict(d):
+        cfg = TemplateConfig()
+        cfg.id_roi = tuple(d.get("id_roi", cfg.id_roi))
+        cfg.id_digits = int(d.get("id_digits", cfg.id_digits))
+        cfg.id_rows = int(d.get("id_rows", cfg.id_rows))
+        qb = d.get("q_blocks", [])
+        cfg.q_blocks = [QBlock(**b) for b in qb]
+        return cfg
+
+
+# =========================
+# Helpers: parsing ranges
+# =========================
 def parse_ranges(txt: str) -> List[Tuple[int, int]]:
-    """
-    "1-40,45-60,70" -> [(1,40),(45,60),(70,70)]
-    """
     if not txt or not txt.strip():
         return []
     out = []
@@ -59,339 +77,441 @@ def parse_ranges(txt: str) -> List[Tuple[int, int]]:
 
 def in_ranges(q: int, ranges: List[Tuple[int, int]]) -> bool:
     if not ranges:
-        return True  # إذا لم تحدد نطاق: صحح كل الأسئلة
+        return True
     return any(a <= q <= b for a, b in ranges)
 
-def rect_from_canvas_obj(obj: dict) -> Tuple[int, int, int, int]:
-    # Fabric.js object
-    x = int(obj.get("left", 0))
-    y = int(obj.get("top", 0))
-    w = int(obj.get("width", 0) * obj.get("scaleX", 1))
-    h = int(obj.get("height", 0) * obj.get("scaleY", 1))
-    return x, y, w, h
 
-def clamp_rect(x, y, w, h, W, H):
-    x = max(0, min(x, W-1))
-    y = max(0, min(y, H-1))
-    w = max(1, min(w, W-x))
-    h = max(1, min(h, H-y))
-    return x, y, w, h
+# =========================
+# Helpers: PDF/Image loading
+# =========================
+def load_pages(file_bytes: bytes, filename: str, dpi: int = 200) -> List[Image.Image]:
+    name = filename.lower()
+    if name.endswith(".pdf"):
+        pages = convert_from_bytes(file_bytes, dpi=dpi)
+        return [p.convert("RGB") for p in pages]
+    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    return [img]
+
+def resize_keep_ratio(img: Image.Image, target_w: int) -> Image.Image:
+    img = img.convert("RGB")
+    w, h = img.size
+    if w <= target_w:
+        return img
+    new_h = int(h * (target_w / w))
+    return img.resize((target_w, new_h), Image.LANCZOS)
+
+def pil_to_cv(img: Image.Image) -> np.ndarray:
+    arr = np.array(img.convert("RGB"))
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+def preprocess(img_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    thr = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        35, 10
+    )
+    return thr
+
+def score_cell(bin_img: np.ndarray) -> int:
+    return int(np.sum(bin_img > 0))
+
+def pick_one(scores, min_fill, min_ratio):
+    # scores: [(label, fill_pixels), ...]
+    scores = sorted(scores, key=lambda x: x[1], reverse=True)
+    top_c, top_s = scores[0]
+    second_s = scores[1][1] if len(scores) > 1 else 0
+
+    if top_s < min_fill:
+        return "?", "BLANK"
+    if second_s > 0 and (top_s / (second_s + 1e-6)) < min_ratio:
+        return "!", "DOUBLE"
+    return top_c, "OK"
 
 
 # =========================
-# OMR scoring (robust using ratios)
+# OMR readers using config
 # =========================
-def cell_fill_ratio(bin_img: np.ndarray) -> float:
-    # نسبة البيكسلات البيضاء في الصورة الثنائية (THRESH_BINARY_INV)
-    # كلما زادت = ظلل أكثر
-    area = bin_img.shape[0] * bin_img.shape[1]
-    if area <= 0:
-        return 0.0
-    filled = float(np.count_nonzero(bin_img))
-    return filled / float(area)
+def crop(thr: np.ndarray, roi: Tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = roi
+    x = max(0, x); y = max(0, y)
+    return thr[y:y+h, x:x+w]
 
-def pick_one_by_ratio(ratios: List[Tuple[str, float]], min_fill: float, min_ratio: float):
-    ratios = sorted(ratios, key=lambda x: x[1], reverse=True)
-    top_c, top_r = ratios[0]
-    second_r = ratios[1][1] if len(ratios) > 1 else 0.0
-
-    if top_r < min_fill:
-        return "?", "BLANK", top_r, second_r
-    if second_r > 0 and (top_r / (second_r + 1e-9)) < min_ratio:
-        return "!", "DOUBLE", top_r, second_r
-    return top_c, "OK", top_r, second_r
-
-
-@dataclass
-class QBlock:
-    x: int
-    y: int
-    w: int
-    h: int
-    start_q: int
-    end_q: int
-    rows: int
-
-@dataclass
-class TemplateConfig:
-    # canvas/template base size
-    base_w: int
-    base_h: int
-
-    # ID ROI
-    id_roi: Tuple[int, int, int, int]  # x,y,w,h
-    id_digits: int
-    id_rows: int  # غالبًا 10 (0..9)
-
-    # blocks
-    q_blocks: List[QBlock]
-
-def resize_to_base(img_bgr: np.ndarray, base_w: int, base_h: int) -> np.ndarray:
-    return cv2.resize(img_bgr, (base_w, base_h), interpolation=cv2.INTER_AREA)
-
-def read_student_code(thr: np.ndarray, cfg: TemplateConfig,
-                      min_fill: float = 0.20, min_ratio: float = 1.25) -> Tuple[str, List[dict]]:
-    """
-    يقرأ كود الطالب من شبكة (id_rows × id_digits)
-    min_fill: نسبة تعبئة دنيا
-    """
+def read_student_code(thr: np.ndarray, cfg: TemplateConfig, min_fill=250, min_ratio=1.25) -> str:
     x, y, w, h = cfg.id_roi
-    H, W = thr.shape[:2]
-    x, y, w, h = clamp_rect(x, y, w, h, W, H)
-    roi = thr[y:y+h, x:x+w]
+    roi = crop(thr, (x, y, w, h))
 
-    rows = cfg.id_rows
-    cols = cfg.id_digits
-    ch = h // rows
-    cw = w // cols
+    rows, cols = cfg.id_rows, cfg.id_digits
+    if rows <= 0 or cols <= 0 or roi.size == 0:
+        return ""
+
+    ch = max(1, roi.shape[0] // rows)
+    cw = max(1, roi.shape[1] // cols)
 
     digits = []
-    debug = []
     for c in range(cols):
-        ratios = []
+        scores = []
         for r in range(rows):
             cell = roi[r*ch:(r+1)*ch, c*cw:(c+1)*cw]
-            ratios.append((str(r), cell_fill_ratio(cell)))
-        d, stt, top, sec = pick_one_by_ratio(ratios, min_fill=min_fill, min_ratio=min_ratio)
-        debug.append({"digit_index": c, "status": stt, "top": top, "second": sec})
-        digits.append("" if d in ["?","!"] else d)
+            scores.append((str(r), score_cell(cell)))
+        d, stt = pick_one(scores, min_fill, min_ratio)
+        digits.append("" if d in ["?", "!"] else d)
+    return "".join(digits)
 
-    return "".join(digits), debug
-
-def read_answers(thr: np.ndarray, cfg: TemplateConfig, choices: int,
-                 min_fill: float = 0.12, min_ratio: float = 1.25) -> Tuple[Dict[int, Tuple[str, str]], List[dict]]:
+def read_answers(thr: np.ndarray, cfg: TemplateConfig, choices: int, min_fill=180, min_ratio=1.25) -> Dict[int, Tuple[str, str]]:
     letters = "ABCDE"[:choices]
-    out: Dict[int, Tuple[str, str]] = {}
-    dbg: List[dict] = []
+    out = {}
 
-    H, W = thr.shape[:2]
-    for b in cfg.q_blocks:
-        x, y, w, h = clamp_rect(b.x, b.y, b.w, b.h, W, H)
-        roi = thr[y:y+h, x:x+w]
-        rows = max(1, b.rows)
-        rh = h // rows
-        cw = w // choices
+    for blk in (cfg.q_blocks or []):
+        roi = crop(thr, (blk.x, blk.y, blk.w, blk.h))
+        if roi.size == 0:
+            continue
 
-        q = b.start_q
+        rows = max(1, int(blk.rows))
+        rh = max(1, roi.shape[0] // rows)
+        cw = max(1, roi.shape[1] // choices)
+
+        q = int(blk.start_q)
+        end_q = int(blk.end_q)
+
         for r in range(rows):
-            if q > b.end_q:
+            if q > end_q:
                 break
-            ratios = []
+            scores = []
             for c in range(choices):
                 cell = roi[r*rh:(r+1)*rh, c*cw:(c+1)*cw]
-                ratios.append((letters[c], cell_fill_ratio(cell)))
-            a, stt, top, sec = pick_one_by_ratio(ratios, min_fill=min_fill, min_ratio=min_ratio)
+                scores.append((letters[c], score_cell(cell)))
+            a, stt = pick_one(scores, min_fill, min_ratio)
             out[q] = (a, stt)
-            dbg.append({"q": q, "status": stt, "top": top, "second": sec})
             q += 1
 
-    return out, dbg
+    return out
 
 
 # =========================
-# Streamlit UI
+# Streamlit App
 # =========================
-st.set_page_config(page_title="OMR BubbleSheet (Remark-style)", layout="wide")
-st.title("✅ OMR BubbleSheet — تحديد بالماوس + تصحيح + Excel")
+st.set_page_config(page_title="OMR Bubble Sheet (Remark-Style)", layout="wide")
+st.title("✅ تصحيح ببل شيت — Remark-Style (تحديد يدوي + تصحيح)")
 
-# Session state
-if "template_img" not in st.session_state:
-    st.session_state.template_img = None
+# -------------------------
+# State init
+# -------------------------
 if "cfg" not in st.session_state:
-    st.session_state.cfg = None
-if "qblocks_pending" not in st.session_state:
-    st.session_state.qblocks_pending = []
-if "id_roi" not in st.session_state:
-    st.session_state.id_roi = None
+    st.session_state["cfg"] = TemplateConfig(q_blocks=[])
+if "template_bytes" not in st.session_state:
+    st.session_state["template_bytes"] = None
+    st.session_state["template_name"] = None
+if "template_base_size" not in st.session_state:
+    st.session_state["template_base_size"] = None  # (w,h)
+if "last_scale" not in st.session_state:
+    st.session_state["last_scale"] = 1.0
 
-left, right = st.columns([1.4, 1.0], gap="large")
 
-with right:
-    st.subheader("1) رفع نموذج الورقة (Template)")
-    tpl_file = st.file_uploader("PDF/PNG/JPG (صفحة النموذج)", type=["pdf","png","jpg","jpeg"], key="tpl")
+# -------------------------
+# Sidebar: global settings
+# -------------------------
+st.sidebar.header("إعدادات عامة")
+choices = st.sidebar.radio("عدد الخيارات", [4, 5], horizontal=True)
+dpi = st.sidebar.selectbox("DPI للـ PDF (أقل = أسرع)", [150, 200, 250], index=1)
 
-    st.divider()
-    st.subheader("2) إعدادات الكود")
-    id_digits = st.number_input("عدد خانات كود الطالب", 1, 20, 4, 1)
-    id_rows = st.number_input("عدد صفوف أرقام الكود (عادة 10)", 5, 15, 10, 1)
+st.sidebar.divider()
+st.sidebar.subheader("حساسية القراءة (تعديل عند الخطأ)")
+min_fill_id = st.sidebar.slider("min_fill (كود الطالب)", 50, 800, 250, 10)
+min_fill_q  = st.sidebar.slider("min_fill (الأسئلة)",  50, 800, 180, 10)
+min_ratio   = st.sidebar.slider("min_ratio (تمييز مزدوج)", 1.05, 3.0, 1.25, 0.05)
 
-    st.divider()
-    st.subheader("3) إعداد بلوك الأسئلة قبل الحفظ")
-    choices = st.radio("عدد الخيارات (A..)", [4, 5], horizontal=True)
-    start_q = st.number_input("Start Q", 1, 500, 1, 1)
-    end_q = st.number_input("End Q", 1, 500, 20, 1)
-    rows_in_block = st.number_input("Rows داخل البلوك", 1, 300, 20, 1)
+st.sidebar.divider()
+strict = st.sidebar.checkbox("وضع صارم: BLANK/DOUBLE = خطأ", True)
 
-    st.caption("بعد ما ترسم مستطيل (Q Block) اضغط: إضافة بلوك")
 
-    add_block = st.button("➕ إضافة بلوك من آخر مستطيل مرسوم", use_container_width=True)
-    reset_all = st.button("♻️ Reset الكل", use_container_width=True)
+# =========================
+# 1) TEMPLATE + DRAWING
+# =========================
+colL, colR = st.columns([1.35, 1.0], gap="large")
 
-    st.divider()
-    st.subheader("4) التصحيح")
-    roster_file = st.file_uploader("Roster (Excel/CSV) فيه student_code, student_name",
-                                   type=["xlsx","xls","csv"], key="roster")
-    key_file = st.file_uploader("Answer Key (PDF/صورة)", type=["pdf","png","jpg","jpeg"], key="key")
-    sheets_file = st.file_uploader("أوراق الطلاب (PDF متعدد الصفحات أو صور)",
-                                   type=["pdf","png","jpg","jpeg"], key="sheets")
+with colR:
+    st.header("1) رفع نموذج الورقة (Template)")
+    template_file = st.file_uploader("PDF/PNG/JPG (صفحة النموذج)", type=["pdf", "png", "jpg", "jpeg"])
 
-    score_ranges_txt = st.text_input("نطاق التصحيح (مثال: 1-40 أو 1-70,1-25)", value="")
-    strict_mode = st.checkbox("Strict: BLANK/DOUBLE = خطأ", value=True)
+    if template_file is not None:
+        st.session_state["template_bytes"] = template_file.getvalue()
+        st.session_state["template_name"] = template_file.name
 
-    go_grade = st.button("🚀 ابدأ التصحيح", type="primary", use_container_width=True)
-
-if reset_all:
-    st.session_state.template_img = None
-    st.session_state.cfg = None
-    st.session_state.qblocks_pending = []
-    st.session_state.id_roi = None
-    st.rerun()
-
-with left:
-    st.subheader("واجهة التحديد (ارسم مستطيل على الورقة)")
-
-    if not tpl_file:
-        st.info("ارفع Template أولًا من الجهة اليمنى.")
+    if st.session_state["template_bytes"] is None:
+        st.info("⬅️ ارفع ملف النموذج حتى يظهر على اليسار وتبدأ التحديد.")
         st.stop()
 
-    pages = load_pages(tpl_file.getvalue(), tpl_file.name)
-    tpl = pages[0]
-    st.session_state.template_img = tpl
+    st.subheader("2) إعدادات الكود")
+    cfg: TemplateConfig = st.session_state["cfg"]
+    cfg.id_digits = int(st.number_input("عدد خانات كود الطالب", 1, 12, int(cfg.id_digits)))
+    cfg.id_rows = int(st.number_input("عدد صفوف أرقام الكود (عادة 10)", 5, 12, int(cfg.id_rows)))
 
-    base_w, base_h = tpl.size  # PIL: (W,H)
+    st.subheader("3) إعداد بلوكات الأسئلة قبل الحفظ")
+    start_q = int(st.number_input("Start Q", 1, 500, 1))
+    end_q   = int(st.number_input("End Q", 1, 500, 60))
+    rows_in_block = int(st.number_input("Rows داخل البلوك", 1, 200, 20))
 
-    canvas_w = st.slider("Canvas width (كلما زاد أسرع/أبطأ حسب جهازك)", 700, 1800, min(1200, base_w), 50)
-    scale = canvas_w / float(base_w)
-    canvas_h = int(base_h * scale)
+    st.caption("💡 ارسم مستطيل على الصورة (يسار) ثم اضغط زر الإضافة المناسب.")
 
-    draw_mode = st.radio("ماذا تحدد الآن؟", ["ID ROI (كود الطالب)", "Q Block (بلوك أسئلة)"], horizontal=True)
 
-    # عرض canvas مع background image
+with colL:
+    st.header("واجهة التحديد (ارسم مستطيل على الورقة)")
+
+    # Load base image (first page)
+    pages = load_pages(st.session_state["template_bytes"], st.session_state["template_name"], dpi=dpi)
+    base_img = pages[0].convert("RGB")
+    base_w, base_h = base_img.size
+    st.session_state["template_base_size"] = (base_w, base_h)
+
+    canvas_w = st.slider("Canvas width (غيّره حسب جهازك)", 700, 1800, 1250, 50)
+
+    # Resize for canvas
+    bg_img = resize_keep_ratio(base_img, canvas_w)
+    bg_w, bg_h = bg_img.size
+    scale = base_w / bg_w
+    st.session_state["last_scale"] = scale
+
+    st.caption(f"حجم الصورة: الأصل {base_w}×{base_h} | العرض على الكانفاس {bg_w}×{bg_h} | scale={scale:.4f}")
+
+    mode = st.radio("ماذا تحدد الآن؟", ["ID ROI (كود الطالب)", "Q Block (بلوك أسئلة)"], horizontal=True)
+
     canvas_result = st_canvas(
-        fill_color="rgba(255, 0, 0, 0.12)",
-        stroke_width=2,
-        stroke_color="rgba(255, 0, 0, 0.9)",
-        background_image=tpl.resize((canvas_w, canvas_h)),
+        fill_color="rgba(255, 0, 0, 0.20)",
+        stroke_width=3,
+        stroke_color="red",
+        background_color="rgba(0,0,0,0)",
+        background_image=bg_img,
         update_streamlit=True,
-        height=canvas_h,
-        width=canvas_w,
+        height=bg_h,
+        width=bg_w,
         drawing_mode="rect",
-        key="canvas",
+        key="omr_canvas"
     )
 
-    last_rect = None
-    if canvas_result and canvas_result.json_data:
+    # buttons row
+    b1, b2, b3, b4 = st.columns([1,1,1,1])
+    with b1:
+        clear_canvas = st.button("🧹 Clear Canvas")
+    with b2:
+        reset_all = st.button("♻️ Reset الكل (ID + Blocks)")
+    with b3:
+        add_id = st.button("➕ حفظ ID ROI")
+    with b4:
+        add_blk = st.button("➕ إضافة Q Block")
+
+    if clear_canvas:
+        st.session_state["omr_canvas"] = None
+        st.rerun()
+
+    if reset_all:
+        st.session_state["cfg"] = TemplateConfig(q_blocks=[])
+        st.session_state["omr_canvas"] = None
+        st.rerun()
+
+    # extract last drawn rect
+    def get_last_rect():
+        if not canvas_result or not canvas_result.json_data:
+            return None
         objs = canvas_result.json_data.get("objects", [])
-        if objs:
-            last_rect = rect_from_canvas_obj(objs[-1])
+        if not objs:
+            return None
+        obj = objs[-1]
+        # streamlit_drawable_canvas gives: left, top, width, height
+        x = int(obj.get("left", 0))
+        y = int(obj.get("top", 0))
+        w = int(obj.get("width", 0))
+        h = int(obj.get("height", 0))
+        # map to original coordinates
+        X = int(round(x * scale))
+        Y = int(round(y * scale))
+        W = int(round(w * scale))
+        H = int(round(h * scale))
+        return (X, Y, W, H)
 
-    st.write("آخر مستطيل:", last_rect if last_rect else "—")
+    last_rect = get_last_rect()
 
-    if add_block:
+    if add_id:
         if not last_rect:
-            st.warning("ارسم مستطيل أولًا.")
+            st.error("ارسم مستطيل أولاً على منطقة كود الطالب.")
         else:
-            x, y, w, h = last_rect
-            # رجّع الإحداثيات لحجم الصورة الأصلي
-            X = int(x / scale); Y = int(y / scale); W = int(w / scale); H = int(h / scale)
-            if draw_mode.startswith("ID"):
-                st.session_state.id_roi = (X, Y, W, H)
-                st.success(f"تم حفظ ID ROI: {(X,Y,W,H)}")
-            else:
-                st.session_state.qblocks_pending.append(QBlock(
-                    x=X, y=Y, w=W, h=H,
-                    start_q=int(start_q), end_q=int(end_q), rows=int(rows_in_block)
-                ))
-                st.success(f"تمت إضافة QBlock: ({start_q}..{end_q})")
+            cfg = st.session_state["cfg"]
+            cfg.id_roi = last_rect
+            st.session_state["cfg"] = cfg
+            st.success(f"تم حفظ ID ROI: {cfg.id_roi}")
 
-    st.divider()
-    st.subheader("المحفوظ حاليًا")
-    st.write("ID ROI:", st.session_state.id_roi)
-    st.write("Q Blocks:", [asdict(b) for b in st.session_state.qblocks_pending])
+    if add_blk:
+        if not last_rect:
+            st.error("ارسم مستطيل أولاً على بلوك الأسئلة.")
+        else:
+            cfg = st.session_state["cfg"]
+            qb = QBlock(
+                x=last_rect[0], y=last_rect[1], w=last_rect[2], h=last_rect[3],
+                start_q=start_q, end_q=end_q, rows=rows_in_block
+            )
+            cfg.q_blocks = (cfg.q_blocks or []) + [qb]
+            st.session_state["cfg"] = cfg
+            st.success(f"تمت إضافة Q Block #{len(cfg.q_blocks)}")
 
-    if st.button("💾 حفظ القالب (Template Config)"):
-        if not st.session_state.id_roi:
-            st.error("لازم تحدد ID ROI أولًا.")
-            st.stop()
-        if not st.session_state.qblocks_pending:
-            st.error("لازم تضيف على الأقل Q Block واحد.")
-            st.stop()
+    # show current config
+    cfg = st.session_state["cfg"]
+    st.subheader("✅ الإعدادات الحالية (Config)")
+    st.json(cfg.to_dict())
 
-        st.session_state.cfg = TemplateConfig(
-            base_w=base_w,
-            base_h=base_h,
-            id_roi=st.session_state.id_roi,
-            id_digits=int(id_digits),
-            id_rows=int(id_rows),
-            q_blocks=st.session_state.qblocks_pending
-        )
-        st.success("تم حفظ القالب ✅")
+    # export/import config json
+    c1, c2 = st.columns([1,1])
+    with c1:
+        cfg_bytes = json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button("⬇️ تحميل config.json", cfg_bytes, file_name="config.json", mime="application/json")
+    with c2:
+        cfg_upload = st.file_uploader("تحميل config.json (اختياري)", type=["json"])
+        if cfg_upload is not None:
+            try:
+                d = json.loads(cfg_upload.getvalue().decode("utf-8"))
+                st.session_state["cfg"] = TemplateConfig.from_dict(d)
+                st.success("تم تحميل config.json بنجاح")
+                st.rerun()
+            except Exception as e:
+                st.error(f"فشل تحميل config.json: {e}")
 
-    if st.session_state.cfg:
-        cfg_json = json.dumps(asdict(st.session_state.cfg), ensure_ascii=False, indent=2)
-        st.download_button("تحميل config.json", cfg_json.encode("utf-8"), "config.json", "application/json")
+
+st.divider()
 
 
 # =========================
-# Grading
+# 2) GRADING
 # =========================
-if go_grade:
-    if not st.session_state.cfg:
-        st.error("لازم تحفظ القالب أولًا (Template Config).")
+st.header("✅ التصحيح الفعلي")
+
+g1, g2, g3 = st.columns([1,1,1], gap="large")
+
+with g1:
+    st.subheader("A) ملف الطلاب (Roster)")
+    roster_file = st.file_uploader("Excel/CSV: student_code, student_name", type=["xlsx", "xls", "csv"], key="roster")
+with g2:
+    st.subheader("B) Answer Key")
+    key_file = st.file_uploader("PDF صفحة واحدة أو صورة", type=["pdf", "png", "jpg", "jpeg"], key="key")
+with g3:
+    st.subheader("C) أوراق الطلاب")
+    sheets_file = st.file_uploader("PDF متعدد الصفحات أو صور", type=["pdf", "png", "jpg", "jpeg"], key="sheets")
+
+st.subheader("نطاق الأسئلة التي تُحسب في الدرجة")
+range_mode = st.radio("طريقة النطاق", ["نطاق واحد", "نظري + عملي"], horizontal=True)
+
+if range_mode == "نطاق واحد":
+    all_txt = st.text_input("النطاق (مثال: 1-70 أو 1-40, 45-60)", "1-60")
+    theory_ranges = parse_ranges(all_txt)
+    practical_ranges = []
+else:
+    theory_txt = st.text_input("نطاق النظري", "1-60")
+    practical_txt = st.text_input("نطاق العملي (اختياري)", "")
+    theory_ranges = parse_ranges(theory_txt)
+    practical_ranges = parse_ranges(practical_txt)
+
+st.caption("ملاحظة: إذا تركت النطاق فارغًا لن يحسب شيء. اكتب نطاقًا صحيحًا.")
+
+run_btn = st.button("🚀 ابدأ التصحيح الآن", type="primary")
+
+def load_roster(file) -> Dict[str, str]:
+    if file is None:
+        return {}
+    name = file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    # required columns
+    if "student_code" not in df.columns or "student_name" not in df.columns:
+        raise ValueError("الملف يجب أن يحتوي عمودين: student_code و student_name")
+    codes = df["student_code"].astype(str).str.strip()
+    names = df["student_name"].astype(str).str.strip()
+    return dict(zip(codes, names))
+
+def normalize_code(code: str, digits: int) -> str:
+    code = (code or "").strip()
+    # keep digits only
+    code2 = re.sub(r"\D+", "", code)
+    if digits > 0 and code2:
+        code2 = code2.zfill(digits)
+    return code2
+
+if run_btn:
+    cfg: TemplateConfig = st.session_state["cfg"]
+
+    # quick validation
+    if cfg.id_roi[2] <= 10 or cfg.id_roi[3] <= 10:
+        st.error("حدد ID ROI بشكل صحيح أولًا (حجم أكبر من 10×10).")
         st.stop()
-    if not (roster_file and key_file and sheets_file):
+    if not cfg.q_blocks or len(cfg.q_blocks) == 0:
+        st.error("أضف على الأقل Q Block واحد للأسئلة.")
+        st.stop()
+    if roster_file is None or key_file is None or sheets_file is None:
         st.error("ارفع Roster + Answer Key + أوراق الطلاب.")
         st.stop()
-
-    # roster
-    if roster_file.name.lower().endswith(("xlsx", "xls")):
-        df_roster = pd.read_excel(roster_file)
-    else:
-        df_roster = pd.read_csv(roster_file)
-
-    df_roster.columns = [c.strip().lower() for c in df_roster.columns]
-    if "student_code" not in df_roster.columns or "student_name" not in df_roster.columns:
-        st.error("ملف roster لازم يحتوي عمودين: student_code و student_name")
+    if not theory_ranges and not practical_ranges:
+        st.error("اكتب نطاق أسئلة ليتم حساب الدرجة.")
         st.stop()
 
-    roster = dict(zip(df_roster["student_code"].astype(str), df_roster["student_name"].astype(str)))
+    # load roster
+    try:
+        roster = load_roster(roster_file)
+        st.success(f"تم تحميل roster: {len(roster)} طالب")
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-    cfg: TemplateConfig = st.session_state.cfg
+    # read answer key
+    key_pages = load_pages(key_file.getvalue(), key_file.name, dpi=dpi)
+    key_thr = preprocess(pil_to_cv(key_pages[0]))
+    key_ans = read_answers(key_thr, cfg, choices=choices, min_fill=min_fill_q, min_ratio=min_ratio)
 
-    # answer key
-    key_pages = load_pages(key_file.getvalue(), key_file.name)
-    key_bgr = resize_to_base(pil_to_cv(key_pages[0]), cfg.base_w, cfg.base_h)
-    key_thr = preprocess(key_bgr)
-    key_ans, key_dbg = read_answers(key_thr, cfg, choices)
+    if len(key_ans) == 0:
+        st.error("لم أستطع قراءة Answer Key (تحقق من Q Blocks أو الحساسية min_fill).")
+        st.stop()
 
-    # student sheets
-    sheet_pages = load_pages(sheets_file.getvalue(), sheets_file.name)
-    score_ranges = parse_ranges(score_ranges_txt)
+    # load student pages
+    pages = load_pages(sheets_file.getvalue(), sheets_file.name, dpi=dpi)
+    st.info(f"عدد صفحات الطلاب: {len(pages)}")
 
+    prog = st.progress(0)
     results = []
-    progress = st.progress(0)
-    details = []
+    debug_rows = []
 
-    for i, pg in enumerate(sheet_pages, start=1):
-        img_bgr = resize_to_base(pil_to_cv(pg), cfg.base_w, cfg.base_h)
-        thr = preprocess(img_bgr)
+    for i, pg in enumerate(pages, 1):
+        thr = preprocess(pil_to_cv(pg))
 
-        code, code_dbg = read_student_code(thr, cfg)
-        name = roster.get(str(code), "")
+        raw_code = read_student_code(thr, cfg, min_fill=min_fill_id, min_ratio=min_ratio)
+        code = normalize_code(raw_code, cfg.id_digits)
+        name = roster.get(code, "")
 
-        stu_ans, stu_dbg = read_answers(thr, cfg, choices)
+        stu_ans = read_answers(thr, cfg, choices=choices, min_fill=min_fill_q, min_ratio=min_ratio)
 
+        # scoring
         score = 0
-        total = 0
+        total_counted = 0
 
-        for q, (ka, _) in key_ans.items():
-            if not in_ranges(q, score_ranges):
-                continue
-            total += 1
-            sa, stt = stu_ans.get(q, ("?", "BLANK"))
+        for q, (ka, ka_state) in key_ans.items():
+            sa, sa_state = stu_ans.get(q, ("?", "MISSING"))
 
-            if strict_mode and stt in ["BLANK", "DOUBLE"]:
+            count_this = False
+            if theory_ranges and in_ranges(q, theory_ranges):
+                count_this = True
+            if practical_ranges and in_ranges(q, practical_ranges):
+                count_this = True
+
+            if not count_this:
                 continue
+
+            total_counted += 1
+
+            if strict:
+                # strict: only OK answers count
+                if sa_state != "OK":
+                    continue
+            # compare
             if sa == ka:
                 score += 1
 
@@ -400,24 +520,33 @@ if go_grade:
             "student_code": code,
             "student_name": name,
             "score": score,
-            "total": total
         })
 
-        # اختياري: سجل التفاصيل لأكثر المشاكل
-        details.append({
-            "sheet_index": i,
-            "student_code": code,
-            "code_debug": code_dbg[:],
-        })
+        # optional debug: show unread codes
+        if code == "" or name == "":
+            debug_rows.append({
+                "sheet_index": i,
+                "raw_code": raw_code,
+                "normalized_code": code,
+                "name_found": bool(name),
+            })
 
-        progress.progress(int(i / len(sheet_pages) * 100))
+        prog.progress(int(i / len(pages) * 100))
 
-    out = pd.DataFrame(results)
+    out_df = pd.DataFrame(results)
 
-    st.success("✅ تم التصحيح وإنشاء النتائج")
-    st.dataframe(out, use_container_width=True)
+    st.subheader("📌 النتائج")
+    st.dataframe(out_df, use_container_width=True)
 
+    # export excel
     buf = io.BytesIO()
-    out.to_excel(buf, index=False)
-    st.download_button("⬇️ تحميل results.xlsx", buf.getvalue(), "results.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        out_df.to_excel(writer, index=False, sheet_name="results")
+        if debug_rows:
+            pd.DataFrame(debug_rows).to_excel(writer, index=False, sheet_name="debug")
+    st.download_button("⬇️ تحميل النتائج Excel", buf.getvalue(), "results.xlsx")
+
+    st.success("تمت العملية ✅")
+
+    if debug_rows:
+        st.warning("بعض الأكواد/الأسماء لم تُقرأ أو لم تُطابق roster. راجع ورقة debug داخل Excel.")
