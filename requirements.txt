@@ -1,5 +1,5 @@
 streamlit==1.52.2
-streamlit-drawable-canvas==0.9.3
+streamlit-image-coordinates==0.1.6
 opencv-python-headless
 numpy
 pandas
