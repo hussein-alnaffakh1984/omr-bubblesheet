@@ -1,14 +1,12 @@
-# app.py
-# ============================================================
-# Hybrid OMR (Auto-Learn from Answer Key) + Smart X-ignore
-# - Auto-detect ID grid (4x10) and Questions grid (N x (2/4/5))
-# - Robust alignment (ORB + Homography)
-# - Smart rule:
-#     If bubble has X mark => ignore it
-#     If multiple filled => pick most filled
-#     If only X-filled exist => treat as blank/cancelled
-# - Shows extracted Answer Key BEFORE grading (for confirmation)
-# ============================================================
+# -*- coding: utf-8 -*-
+"""
+Hybrid OMR (Circles) + Smart Rules (X-cancel) - Auto Template
+✅ Detects bubbles even if empty (HoughCircles)
+✅ Auto-detects ID grid (4x10) vs Questions grid (2/4/5 choices, variable rows)
+✅ Handles: "X on one choice + fill another" => choose filled only
+✅ Shows extracted Answer Key BEFORE grading
+Streamlit 1.52+ (uses width="stretch")
+"""
 
 import io
 import math
@@ -24,746 +22,718 @@ from pdf2image import convert_from_bytes
 
 
 # -----------------------------
-# Utilities
+# Data models
 # -----------------------------
-
-def pil_from_upload(file) -> Image.Image:
-    data = file.getvalue()
-    name = (file.name or "").lower()
-    if name.endswith(".pdf"):
-        pages = convert_from_bytes(data, dpi=int(st.session_state.get("dpi", 300)))
-        if not pages:
-            raise ValueError("لم يتم قراءة صفحات PDF.")
-        return pages[0].convert("RGB")
-    return Image.open(io.BytesIO(data)).convert("RGB")
-
-
-def pdf_all_pages_bytes(file_bytes: bytes, dpi: int) -> List[Image.Image]:
-    pages = convert_from_bytes(file_bytes, dpi=dpi)
-    return [p.convert("RGB") for p in pages]
-
-
-def to_bgr(pil_img: Image.Image) -> np.ndarray:
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
-
-def gray(img_bgr: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-
-def adaptive_bin_inv(g: np.ndarray) -> np.ndarray:
-    g2 = cv2.GaussianBlur(g, (3, 3), 0)
-    return cv2.adaptiveThreshold(
-        g2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 31, 7
-    )
-
-
-def safe_int(x) -> int:
-    try:
-        return int(x)
-    except:
-        return 0
-
-
-# -----------------------------
-# Template model
-# -----------------------------
-
 @dataclass
 class Grid:
-    centers: List[Tuple[float, float]]     # (x, y) list
-    cols_x: List[float]                    # sorted x centers for columns
-    rows_y: List[float]                    # sorted y centers for rows
-    n_cols: int
-    n_rows: int
-
+    cols_x: List[float]          # sorted x centers
+    rows_y: List[float]          # sorted y centers
+    bbox: Tuple[int, int, int, int]  # x1,y1,x2,y2
+    bubble_r: float              # crop radius
+    kind: str                    # "ID" or "Q"
+    choices: Optional[List[str]] = None  # for Q grid
 
 @dataclass
 class Template:
-    key_size: Tuple[int, int]              # (w, h)
-    id_grid: Grid                          # 4 x 10
-    q_grid: Grid                           # (2/4/5) x N
-    q_choices: int                         # 2 or 4 or 5
-    q_count: int                           # N
-    key_ref_gray: np.ndarray               # for alignment
+    width: int
+    height: int
+    id_grid: Grid
+    q_grid: Grid
+    num_choices: int
+    num_questions: int
 
 
 # -----------------------------
-# Circle detection
+# Utils: file -> image
 # -----------------------------
-
-def find_circle_centers(img_bgr: np.ndarray,
-                        min_area: int = 120,
-                        max_area: int = 9000,
-                        min_circ: float = 0.30) -> List[Tuple[float, float, float]]:
-    """
-    Returns list of (cx, cy, radius_est) for circular contours.
-    Uses contour circularity filter (works better than Hough in many scans).
-    """
-    g = gray(img_bgr)
-    b = adaptive_bin_inv(g)
-
-    # remove small noise
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    b = cv2.morphologyEx(b, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    out = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < min_area or area > max_area:
-            continue
-        peri = cv2.arcLength(c, True)
-        if peri <= 1e-6:
-            continue
-        circ = (4.0 * math.pi * area) / (peri * peri)
-        if circ < min_circ:
-            continue
-        (x, y), r = cv2.minEnclosingCircle(c)
-        out.append((float(x), float(y), float(r)))
-    return out
+def load_first_page(file_bytes: bytes, filename: str, dpi: int = 300) -> Image.Image:
+    if filename.lower().endswith(".pdf"):
+        pages = convert_from_bytes(file_bytes, dpi=dpi)
+        if not pages:
+            raise ValueError("PDF فارغ أو لم يتم تحويله.")
+        return pages[0].convert("RGB")
+    return Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
 
-def cluster_1d(values: List[float], tol: float) -> List[List[float]]:
-    """Simple 1D clustering by sorting and grouping if gap <= tol."""
-    if not values:
+def bgr_from_pil(img: Image.Image) -> np.ndarray:
+    rgb = np.array(img)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+# -----------------------------
+# Core: circle detection
+# -----------------------------
+def detect_circles_hough(img_bgr: np.ndarray,
+                         dp: float = 1.2,
+                         min_dist: int = 22,
+                         param1: int = 120,
+                         param2: int = 26,
+                         min_r: int = 10,
+                         max_r: int = 40) -> List[Tuple[float, float, float]]:
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (5, 5), 0)
+
+    circles = cv2.HoughCircles(
+        g, cv2.HOUGH_GRADIENT,
+        dp=dp, minDist=min_dist,
+        param1=param1, param2=param2,
+        minRadius=min_r, maxRadius=max_r
+    )
+
+    out: List[Tuple[float, float, float]] = []
+    if circles is not None:
+        for x, y, r in np.round(circles[0]).astype(int):
+            out.append((float(x), float(y), float(r)))
+
+    # إزالة تكرارات المراكز القريبة
+    merged: List[Tuple[float, float, float]] = []
+    for x, y, r in out:
+        ok = True
+        for mx, my, mr in merged:
+            if (x - mx) ** 2 + (y - my) ** 2 < 10 ** 2:
+                ok = False
+                break
+        if ok:
+            merged.append((x, y, r))
+    return merged
+
+
+def median_spacing(vals: List[float]) -> float:
+    if len(vals) < 2:
+        return 30.0
+    s = np.sort(np.array(vals, dtype=np.float32))
+    dif = np.diff(s)
+    dif = dif[dif > 1e-6]
+    if len(dif) == 0:
+        return 30.0
+    return float(np.median(dif))
+
+
+def cluster_1d_sorted(vals: List[float], gap: float) -> List[List[float]]:
+    if not vals:
         return []
-    v = sorted(values)
-    groups = [[v[0]]]
-    for x in v[1:]:
-        if abs(x - groups[-1][-1]) <= tol:
-            groups[-1].append(x)
+    s = sorted(vals)
+    groups = [[s[0]]]
+    for v in s[1:]:
+        if abs(v - groups[-1][-1]) <= gap:
+            groups[-1].append(v)
         else:
-            groups.append([x])
+            groups.append([v])
     return groups
 
 
-def pick_grid_from_centers(centers_xy: List[Tuple[float, float]],
-                           expected_rows: Optional[int],
-                           expected_cols_candidates: List[int],
-                           tol_x: float,
-                           tol_y: float) -> Tuple[int, int, List[float], List[float], Dict]:
+def robust_centers_1d(vals: List[float], expected: Optional[int] = None) -> List[float]:
     """
-    Decide grid shape by clustering x and y.
-    Returns (n_rows, n_cols, rows_y, cols_x, debug)
+    تجميع x أو y إلى مراكز أعمدة/صفوف بدون sklearn.
     """
-    xs = [c[0] for c in centers_xy]
-    ys = [c[1] for c in centers_xy]
+    if len(vals) < 3:
+        return sorted(vals)
 
-    gx = cluster_1d(xs, tol_x)
-    gy = cluster_1d(ys, tol_y)
+    sp = median_spacing(vals)
+    gap = max(12.0, sp * 0.6)
+    groups = cluster_1d_sorted(vals, gap=gap)
+    centers = [float(np.median(g)) for g in groups if len(g) >= 2]  # تجاهل الضوضاء
 
-    cols_x = [float(np.median(g)) for g in gx]
-    rows_y = [float(np.median(g)) for g in gy]
+    # إذا كان expected معروف، حاول تقليم/دمج بسيط
+    centers = sorted(centers)
+    if expected is not None and len(centers) != expected:
+        # fallback: cv2.kmeans على 1D
+        xs = np.array(vals, dtype=np.float32).reshape(-1, 1)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.01)
+        _, _, c = cv2.kmeans(xs, expected, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+        centers = sorted([float(v[0]) for v in c])
+    return centers
 
-    # Sometimes over-splitting happens; we pick best candidate by closest count
+
+def circles_in_column(circles: List[Tuple[float, float, float]], col_x: float, tol: float) -> List[Tuple[float, float, float]]:
+    return [c for c in circles if abs(c[0] - col_x) <= tol]
+
+
+def fit_grid_bbox(cols_x: List[float], rows_y: List[float], pad: float = 2.2, r: float = 18.0) -> Tuple[int, int, int, int]:
+    x1 = int(min(cols_x) - pad * r)
+    x2 = int(max(cols_x) + pad * r)
+    y1 = int(min(rows_y) - pad * r)
+    y2 = int(max(rows_y) + pad * r)
+    return x1, y1, x2, y2
+
+
+# -----------------------------
+# Find ID grid (4 cols x 10 rows)
+# -----------------------------
+def find_id_grid(circles: List[Tuple[float, float, float]], img_shape: Tuple[int, int]) -> Grid:
+    h, w = img_shape[:2]
+    xs = [c[0] for c in circles]
+    ys = [c[1] for c in circles]
+    rs = [c[2] for c in circles]
+    base_r = float(np.median(rs)) if rs else 18.0
+
+    # مراكز أعمدة محتملة كثيرة
+    x_centers = robust_centers_1d(xs, expected=None)
+    if len(x_centers) < 4:
+        raise ValueError("دوائر قليلة لا تسمح باكتشاف كود الطالب.")
+
+    # نجرب كل توليفة 4 أعمدة ونبحث عن التي تعطي 10 صفوف متناسقة
     best = None
-    for ncols in expected_cols_candidates:
-        if len(cols_x) < ncols:
+    x_centers_sorted = sorted(x_centers)
+
+    # tolerance للأعمدة
+    tol_x = max(12.0, base_r * 0.9)
+
+    for i in range(len(x_centers_sorted) - 3):
+        cols = x_centers_sorted[i:i+4]
+
+        # اجمع دوائر هذه الأعمدة
+        picked = []
+        for cx in cols:
+            picked.extend(circles_in_column(circles, cx, tol=tol_x))
+
+        if len(picked) < 4 * 8:
             continue
-        # pick the densest ncols columns (by member count)
-        col_counts = sorted([(len(gx[i]), cols_x[i]) for i in range(len(gx))], reverse=True)
-        chosen_cols = sorted([x for _, x in col_counts[:ncols]])
-        # recompute rows based on points close to these columns
-        pts = [(x, y) for (x, y) in centers_xy if min(abs(x - cx) for cx in chosen_cols) <= tol_x]
-        y_groups = cluster_1d([p[1] for p in pts], tol_y)
-        cand_rows = [float(np.median(g)) for g in y_groups]
-        nrows = len(cand_rows)
 
-        if expected_rows is not None:
-            score = abs(nrows - expected_rows) * 10 + abs(len(chosen_cols) - ncols)
-        else:
-            score = abs(len(chosen_cols) - ncols)
+        # صفوف من y
+        rows = robust_centers_1d([c[1] for c in picked], expected=10)
+        if len(rows) != 10:
+            continue
 
-        if best is None or score < best[0]:
-            best = (score, nrows, ncols, cand_rows, chosen_cols, pts)
+        # قياس جودة: كم دائرة تقع قرب تقاطعات الشبكة
+        tol_y = max(12.0, base_r * 1.0)
+        score = 0
+        for cx in cols:
+            for ry in rows:
+                # هل يوجد دائرة قرب (cx, ry) ؟
+                ok = False
+                for (x, y, r) in picked:
+                    if abs(x - cx) <= tol_x and abs(y - ry) <= tol_y:
+                        ok = True
+                        break
+                score += 1 if ok else 0
+
+        # شرط: يجب أن يغطي أغلب 40 تقاطع
+        if score < 32:
+            continue
+
+        # تفضيل: ID غالباً كتلة طولية واضحة (ارتفاع كبير) وموقعها ليس داخل الأسئلة
+        bbox = fit_grid_bbox(cols, rows, r=base_r)
+        x1, y1, x2, y2 = bbox
+        area = (x2 - x1) * (y2 - y1)
+
+        # هدفنا أعلى score ثم أصغر area (لأن ID كتلة أصغر من الأسئلة)
+        key = (score, -area)
+        if best is None or key > best[0]:
+            best = (key, cols, rows, bbox, base_r)
 
     if best is None:
-        return 0, 0, [], [], {"reason": "no grid candidate fits"}
+        raise ValueError("لم أستطع تحديد شبكة كود الطالب 4×10. ارفع DPI أو حسّن وضوح الورقة.")
 
-    _, nrows, ncols, rows_y2, cols_x2, pts2 = best
-    dbg = {
-        "raw_cols": len(cols_x),
-        "raw_rows": len(rows_y),
-        "picked_cols": cols_x2,
-        "picked_rows": rows_y2,
-        "used_pts": len(pts2)
-    }
-    return nrows, ncols, rows_y2, cols_x2, dbg
+    _, cols, rows, bbox, r = best
+    return Grid(cols_x=cols, rows_y=rows, bbox=bbox, bubble_r=r, kind="ID")
 
 
-def split_id_vs_questions(all_centers: List[Tuple[float, float, float]], img_h: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-    """
-    Split by Y: top cluster => ID, bottom cluster => questions.
-    Works well for your sheet: ID at upper right, questions lower left.
-    """
-    pts = [(x, y) for (x, y, _) in all_centers]
-    ys = np.array([p[1] for p in pts], dtype=np.float32)
-    if len(ys) < 10:
-        return [], []
-    # Otsu-like split by median
-    mid = float(np.median(ys))
-    top = [(x, y) for (x, y) in pts if y < mid]
-    bot = [(x, y) for (x, y) in pts if y >= mid]
+# -----------------------------
+# Remove circles inside bbox
+# -----------------------------
+def filter_out_bbox(circles: List[Tuple[float, float, float]], bbox: Tuple[int, int, int, int]) -> List[Tuple[float, float, float]]:
+    x1, y1, x2, y2 = bbox
+    out = []
+    for c in circles:
+        if x1 <= c[0] <= x2 and y1 <= c[1] <= y2:
+            continue
+        out.append(c)
+    return out
 
-    # If split is wrong (ID is smaller cluster), prefer smaller cluster as ID
-    if len(top) > len(bot):
-        # choose smaller as ID
-        id_pts, q_pts = (bot, top)
+
+# -----------------------------
+# Find Questions grid (k cols in {2,4,5}, rows variable)
+# -----------------------------
+def find_q_grid(circles: List[Tuple[float, float, float]], img_shape: Tuple[int, int], k_candidates=(2,4,5)) -> Tuple[Grid, int]:
+    h, w = img_shape[:2]
+    xs = [c[0] for c in circles]
+    ys = [c[1] for c in circles]
+    rs = [c[2] for c in circles]
+    base_r = float(np.median(rs)) if rs else 18.0
+
+    if len(circles) < 30:
+        raise ValueError("دوائر الأسئلة قليلة جداً. تأكد أنك رفعت صفحة الأسئلة/الأنسر الصحيحة أو ارفع DPI.")
+
+    best = None
+
+    for k in k_candidates:
+        # KMeans 1D على X (بدون sklearn) بواسطة cv2.kmeans
+        data = np.array(xs, dtype=np.float32).reshape(-1, 1)
+        if len(data) < k * 6:
+            continue
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.01)
+        compactness, labels, centers_x = cv2.kmeans(
+            data, k, None, criteria, 6, cv2.KMEANS_PP_CENTERS
+        )
+        cols = sorted([float(v[0]) for v in centers_x])
+
+        # استبعاد حلول غير منطقية (أعمدة قريبة جداً)
+        dif = np.diff(cols)
+        if len(dif) and float(np.min(dif)) < max(18.0, base_r * 1.2):
+            continue
+
+        # احسب صفوف من Y على كامل الدوائر (لكن مع فلترة بسيطة: قرب الأعمدة)
+        tol_x = max(12.0, base_r * 1.0)
+        picked = []
+        for cx in cols:
+            picked.extend(circles_in_column(circles, cx, tol=tol_x))
+
+        if len(picked) < k * 6:
+            continue
+
+        # rows: تجميع Y تلقائياً
+        rows_guess = robust_centers_1d([c[1] for c in picked], expected=None)
+        # صفوف أسئلة لازم تكون >=5
+        if len(rows_guess) < 5:
+            continue
+
+        # حدد عدد الأسئلة (rows) من توزيع Y: نأخذ "مراكز" بعد clustering بدون expected
+        # ولتحسين الثبات: إذا rows كبيرة جداً بسبب ضوضاء، استعمل expected قريب من (len(picked)/k)
+        est = int(round(len(picked)/k))
+        if est >= 5 and est <= 200 and abs(len(rows_guess) - est) > 8:
+            # إعادة تقدير بـ kmeans على Y
+            ydata = np.array([c[1] for c in picked], dtype=np.float32).reshape(-1, 1)
+            criteria2 = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.01)
+            _, _, cy = cv2.kmeans(ydata, est, None, criteria2, 3, cv2.KMEANS_PP_CENTERS)
+            rows_guess = sorted([float(v[0]) for v in cy])
+
+        # bbox
+        bbox = fit_grid_bbox(cols, rows_guess, r=base_r)
+
+        # قياس جودة: كثافة تقاطعات موجودة
+        tol_y = max(12.0, base_r * 1.0)
+        hit = 0
+        total = len(cols) * len(rows_guess)
+        # لا نحسب كل التقاطعات لو كان العدد كبير جداً (لتسريع)
+        step = 1 if total <= 300 else max(1, total // 300)
+        idx = 0
+        for cx in cols:
+            for ry in rows_guess:
+                idx += 1
+                if idx % step != 0:
+                    continue
+                ok = False
+                for (x, y, r) in picked:
+                    if abs(x - cx) <= tol_x and abs(y - ry) <= tol_y:
+                        ok = True
+                        break
+                hit += 1 if ok else 0
+
+        # score: hit ratio - compactness penalty
+        hit_ratio = hit / max(1, (total/step))
+        score = hit_ratio - (float(compactness) / (1e7))
+
+        if best is None or score > best[0]:
+            best = (score, cols, rows_guess, bbox, base_r, k)
+
+    if best is None:
+        raise ValueError("فشل اكتشاف شبكة الأسئلة (2/4/5). ارفع DPI أو تأكد أن الصفحة كاملة بدون قص.")
+
+    score, cols, rows, bbox, r, k = best
+
+    # تقدير bubble_r من تباعد الأعمدة
+    if len(cols) >= 2:
+        col_spacing = float(np.median(np.diff(cols)))
+        bubble_r = float(np.clip(col_spacing * 0.33, 10.0, 40.0))
     else:
-        id_pts, q_pts = (top, bot)
+        bubble_r = r
 
-    return id_pts, q_pts
+    choices = list("ABCDE")[:k]
+    return Grid(cols_x=cols, rows_y=rows, bbox=bbox, bubble_r=bubble_r, kind="Q", choices=choices), k
 
 
 # -----------------------------
-# Alignment (ORB + Homography)
+# Preprocess for fill + X
 # -----------------------------
+def crop_roi(gray: np.ndarray, cx: float, cy: float, r: float) -> np.ndarray:
+    h, w = gray.shape[:2]
+    x1 = int(max(0, cx - r))
+    x2 = int(min(w, cx + r))
+    y1 = int(max(0, cy - r))
+    y2 = int(min(h, cy + r))
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros((1,1), dtype=np.uint8)
+    return gray[y1:y2, x1:x2]
 
-def align_to_key(img_bgr: np.ndarray, key_gray: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
+
+def fill_ratio(gray_roi: np.ndarray) -> float:
     """
-    Align student image to key reference using ORB features.
-    Returns warped BGR of size (w,h).
+    نسبة التظليل داخل الدائرة (تقريبياً)
     """
-    w, h = out_size
-    g = gray(img_bgr)
-
-    orb = cv2.ORB_create(2500)
-    kp1, des1 = orb.detectAndCompute(g, None)
-    kp2, des2 = orb.detectAndCompute(key_gray, None)
-
-    if des1 is None or des2 is None or len(kp1) < 20 or len(kp2) < 20:
-        return cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA)
-
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    matches = bf.knnMatch(des1, des2, k=2)
-
-    good = []
-    for m, n in matches:
-        if m.distance < 0.75 * n.distance:
-            good.append(m)
-
-    if len(good) < 20:
-        return cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA)
-
-    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-
-    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    if H is None:
-        return cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA)
-
-    warped = cv2.warpPerspective(img_bgr, H, (w, h))
-    return warped
-
-
-# -----------------------------
-# Bubble scoring + X detection
-# -----------------------------
-
-def crop_cell(bin_img: np.ndarray, cx: float, cy: float, r: float, pad: float = 1.35) -> np.ndarray:
-    h, w = bin_img.shape[:2]
-    rr = max(6, int(r * pad))
-    x1 = max(0, int(cx) - rr)
-    y1 = max(0, int(cy) - rr)
-    x2 = min(w, int(cx) + rr)
-    y2 = min(h, int(cy) + rr)
-    return bin_img[y1:y2, x1:x2]
-
-
-def fill_ratio(cell_bin: np.ndarray) -> float:
-    if cell_bin.size == 0:
+    if gray_roi.size < 25:
         return 0.0
-    # focus inner area to avoid circle border
-    h, w = cell_bin.shape[:2]
-    mh = int(h * 0.25)
-    mw = int(w * 0.25)
-    inner = cell_bin[mh:h - mh, mw:w - mw]
+
+    # binarize: foreground = dark ink
+    g = cv2.GaussianBlur(gray_roi, (3,3), 0)
+    b = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                              cv2.THRESH_BINARY_INV, 21, 7)
+
+    h, w = b.shape[:2]
+    # inner region (avoid circle border)
+    mh = int(h * 0.22)
+    mw = int(w * 0.22)
+    inner = b[mh:h-mh, mw:w-mw]
     if inner.size == 0:
         return 0.0
-    return float(np.sum(inner > 0) / inner.size)
+    return float(np.mean(inner > 0))
 
 
-def x_mark_score(cell_bin: np.ndarray) -> float:
+def x_cancel_score(gray_roi: np.ndarray) -> float:
     """
-    Detect X using edges + HoughLinesP.
-    Returns score ~ how likely X exists (higher => more X).
+    يحاول اكتشاف وجود X داخل الفقاعة (خطين قطريين).
+    نستخدم Canny + HoughLinesP ونحسب عدد خطوط مائلة واضحة.
     """
-    if cell_bin.size == 0:
+    if gray_roi.size < 25:
         return 0.0
 
-    # edges on binary (already inv), use Canny on uint8
-    img = (cell_bin > 0).astype(np.uint8) * 255
-    edges = cv2.Canny(img, 50, 150)
+    g = cv2.GaussianBlur(gray_roi, (3,3), 0)
+    edges = cv2.Canny(g, 60, 160)
 
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=20,
-                            minLineLength=max(10, int(min(cell_bin.shape) * 0.45)),
-                            maxLineGap=5)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=18,
+                            minLineLength=max(10, int(min(gray_roi.shape)*0.55)),
+                            maxLineGap=6)
     if lines is None:
         return 0.0
 
-    # count diagonal-ish long lines
     diag = 0
-    for (x1, y1, x2, y2) in lines[:, 0]:
+    for l in lines[:,0,:]:
+        x1,y1,x2,y2 = l
         dx = x2 - x1
         dy = y2 - y1
-        if abs(dx) < 3:
-            continue
-        slope = dy / (dx + 1e-9)
-        if 0.6 < abs(slope) < 1.8:
-            length = math.hypot(dx, dy)
-            if length >= max(12, int(min(cell_bin.shape) * 0.55)):
-                diag += 1
+        ang = abs(math.degrees(math.atan2(dy, dx)))
+        # diagonal near 45 or 135
+        if 25 <= ang <= 65 or 115 <= ang <= 155:
+            diag += 1
 
-    # Two diagonals usually => X
+    # score scaled
     return float(diag)
 
 
-def choose_answer(cells_bin: List[np.ndarray],
-                  labels: List[str],
-                  blank_thr: float,
-                  double_gap: float,
-                  x_thr: float) -> Dict:
+def pick_answer_for_row(fills: List[float], x_scores: List[float], choices: List[str],
+                        blank_thr: float = 0.16,
+                        double_gap: float = 1.35,
+                        x_thr: float = 1.0) -> Dict:
     """
-    Smart choice:
-      - Compute fill per option
-      - Compute X score per option
-      - Ignore options with X score >= x_thr
-      - Pick max fill if >= blank_thr
-      - If two top fills close => DOUBLE
+    Rules:
+    - If a choice has X (x_score>=x_thr), treat it as cancelled unless it's the only marked one.
+    - Pick highest fill among NOT-cancelled.
+    - If highest < blank_thr => BLANK
+    - If second is close => DOUBLE
     """
-    fills = [fill_ratio(c) for c in cells_bin]
-    xs = [x_mark_score(c) for c in cells_bin]
+    n = len(fills)
+    idx_sorted = sorted(range(n), key=lambda i: fills[i], reverse=True)
 
-    valid = [i for i in range(len(labels)) if xs[i] < x_thr]
-    if not valid:
-        return {"answer": "?", "status": "BLANK", "fills": fills, "x": xs}
+    # mark cancelled
+    cancelled = [xs >= x_thr for xs in x_scores]
 
-    # pick best among valid
-    valid_sorted = sorted(valid, key=lambda i: fills[i], reverse=True)
-    top = valid_sorted[0]
+    # candidate indices: not cancelled
+    candidates = [i for i in idx_sorted if not cancelled[i]]
+
+    # if all cancelled, fallback to normal highest fill
+    if not candidates:
+        candidates = idx_sorted[:]
+
+    top = candidates[0]
     top_fill = fills[top]
-    second_fill = fills[valid_sorted[1]] if len(valid_sorted) > 1 else 0.0
+    second = candidates[1] if len(candidates) > 1 else None
+    second_fill = fills[second] if second is not None else 0.0
 
     if top_fill < blank_thr:
-        return {"answer": "?", "status": "BLANK", "fills": fills, "x": xs}
+        return {"answer": "?", "status": "BLANK", "fills": fills, "x": x_scores, "cancelled": cancelled}
 
-    if second_fill >= blank_thr and (top_fill - second_fill) < double_gap:
-        return {"answer": "!", "status": "DOUBLE", "fills": fills, "x": xs}
+    # double check
+    if second is not None and second_fill >= blank_thr:
+        ratio = top_fill / (second_fill + 1e-9)
+        if ratio < double_gap:
+            return {"answer": "!", "status": "DOUBLE", "fills": fills, "x": x_scores, "cancelled": cancelled}
 
-    return {"answer": labels[top], "status": "OK", "fills": fills, "x": xs}
-
-
-# -----------------------------
-# Build template from Answer Key
-# -----------------------------
-
-def learn_template_from_key(key_bgr: np.ndarray,
-                            debug: bool,
-                            min_area: int,
-                            max_area: int,
-                            min_circ: float) -> Tuple[Template, Dict]:
-    """
-    Learn:
-      - ID grid: must be 4 cols x 10 rows
-      - Question grid: cols in {2,4,5}, rows = question count
-    """
-    h, w = key_bgr.shape[:2]
-    centers = find_circle_centers(key_bgr, min_area=min_area, max_area=max_area, min_circ=min_circ)
-    if len(centers) < 30:
-        raise ValueError("عدد الفقاعات المكتشفة قليل جداً. ارفع DPI أو حسّن وضوح الصورة.")
-
-    id_pts, q_pts = split_id_vs_questions(centers, h)
-
-    # If split failed, fallback: pick ID by searching for 4x10 grid anywhere
-    dbg = {"centers_total": len(centers), "split_id": len(id_pts), "split_q": len(q_pts)}
-
-    # tolerance based on page size
-    tol_x = w * 0.015
-    tol_y = h * 0.015
-
-    # --- ID grid (expected 10 rows, 4 cols)
-    id_rows, id_cols, id_rows_y, id_cols_x, id_dbg = pick_grid_from_centers(
-        id_pts, expected_rows=10, expected_cols_candidates=[4],
-        tol_x=tol_x, tol_y=tol_y
-    )
-
-    # if still not 10x4, try alternative: search in all points
-    if not (id_rows == 10 and id_cols == 4):
-        id_rows, id_cols, id_rows_y, id_cols_x, id_dbg = pick_grid_from_centers(
-            [(x, y) for (x, y, _) in centers], expected_rows=10, expected_cols_candidates=[4],
-            tol_x=tol_x, tol_y=tol_y
-        )
-
-    if not (id_rows == 10 and id_cols == 4):
-        raise ValueError("فشل تحديد شبكة كود الطالب (يجب أن تكون 4 أعمدة × 10 صفوف).")
-
-    # collect id centers that fall near id col/row
-    def nearest_idx(v, arr):
-        return int(np.argmin([abs(v - a) for a in arr]))
-
-    id_centers = []
-    for (x, y, r) in centers:
-        if min(abs(x - cx) for cx in id_cols_x) <= tol_x and min(abs(y - ry) for ry in id_rows_y) <= tol_y:
-            id_centers.append((x, y))
-
-    # --- Question grid (cols candidates 2/4/5)
-    # Use q_pts if reasonable, else all (minus id region)
-    q_base = q_pts if len(q_pts) >= 20 else [(x, y) for (x, y, _) in centers]
-
-    q_rows, q_cols, q_rows_y, q_cols_x, q_dbg = pick_grid_from_centers(
-        q_base, expected_rows=None, expected_cols_candidates=[2, 4, 5],
-        tol_x=tol_x, tol_y=tol_y
-    )
-    # sanity: questions shouldn't be 4x10 (already ID). Need rows >= 5.
-    if q_cols not in (2, 4, 5) or q_rows < 5:
-        # try all centers but excluding those close to ID columns+rows area
-        q2 = []
-        for (x, y, _) in centers:
-            # exclude ID points by proximity
-            if min(abs(x - cx) for cx in id_cols_x) <= tol_x and min(abs(y - ry) for ry in id_rows_y) <= tol_y:
-                continue
-            q2.append((x, y))
-        q_rows, q_cols, q_rows_y, q_cols_x, q_dbg = pick_grid_from_centers(
-            q2, expected_rows=None, expected_cols_candidates=[2, 4, 5],
-            tol_x=tol_x, tol_y=tol_y
-        )
-
-    if q_cols not in (2, 4, 5) or q_rows < 5:
-        raise ValueError("فشل تحديد شبكة الأسئلة. تأكد أن صفحة الـ Key واضحة وكاملة.")
-
-    # Build grids
-    key_g = gray(key_bgr)
-
-    id_grid = Grid(
-        centers=id_centers,
-        cols_x=sorted(id_cols_x),
-        rows_y=sorted(id_rows_y),
-        n_cols=4, n_rows=10
-    )
-
-    # question centers near q col/row
-    q_centers = []
-    for (x, y, r) in centers:
-        if min(abs(x - cx) for cx in q_cols_x) <= tol_x and min(abs(y - ry) for ry in q_rows_y) <= tol_y:
-            q_centers.append((x, y))
-
-    q_grid = Grid(
-        centers=q_centers,
-        cols_x=sorted(q_cols_x),
-        rows_y=sorted(q_rows_y),
-        n_cols=int(q_cols),
-        n_rows=int(q_rows)
-    )
-
-    tmpl = Template(
-        key_size=(w, h),
-        id_grid=id_grid,
-        q_grid=q_grid,
-        q_choices=int(q_cols),
-        q_count=int(q_rows),
-        key_ref_gray=key_g
-    )
-
-    dbg.update({
-        "id_rows": id_rows, "id_cols": id_cols,
-        "q_rows": q_rows, "q_cols": q_cols,
-        "id_dbg": id_dbg,
-        "q_dbg": q_dbg,
-    })
-
-    return tmpl, dbg
-
-
-def overlay_debug(key_bgr: np.ndarray, tmpl: Template) -> np.ndarray:
-    img = key_bgr.copy()
-    # ID: red
-    for cx in tmpl.id_grid.cols_x:
-        cv2.line(img, (int(cx), 0), (int(cx), img.shape[0] - 1), (0, 0, 255), 2)
-    for ry in tmpl.id_grid.rows_y:
-        cv2.circle(img, (int(tmpl.id_grid.cols_x[0]), int(ry)), 4, (0, 0, 255), -1)
-
-    # Q: blue vertical lines + green points
-    for cx in tmpl.q_grid.cols_x:
-        cv2.line(img, (int(cx), 0), (int(cx), img.shape[0] - 1), (255, 0, 0), 2)
-    for (x, y) in tmpl.q_grid.centers:
-        cv2.circle(img, (int(x), int(y)), 5, (0, 255, 0), 2)
-
-    return img
+    return {"answer": choices[top], "status": "OK", "fills": fills, "x": x_scores, "cancelled": cancelled}
 
 
 # -----------------------------
-# Extract key answers / student ID / student answers
+# Read ID + Q answers using template
 # -----------------------------
-
-def read_id_from_sheet(sheet_bgr_aligned: np.ndarray, tmpl: Template,
-                       blank_thr: float, double_gap: float, x_thr: float,
-                       bubble_r: float = 28.0) -> str:
-    b = adaptive_bin_inv(gray(sheet_bgr_aligned))
+def read_id(img_bgr: np.ndarray, id_grid: Grid, debug: bool = False) -> str:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     digits = []
-    labels = [str(i) for i in range(10)]  # rows represent digits 0..9
-
-    # Each column is a digit. For each digit column, choose one row (0..9).
-    for col_i, cx in enumerate(tmpl.id_grid.cols_x):
-        cells = []
-        for row_i, ry in enumerate(tmpl.id_grid.rows_y):
-            cell = crop_cell(b, cx, ry, bubble_r)
-            cells.append(cell)
-
-        res = choose_answer(cells, labels, blank_thr, double_gap, x_thr)
-        # If OK => digit, else X
-        digits.append(res["answer"] if res["status"] == "OK" else "X")
-
+    # 10 rows -> digits 0..9
+    digit_choices = [str(i) for i in range(10)]
+    for cx in id_grid.cols_x:
+        fills = []
+        xs = []
+        for ry in id_grid.rows_y:
+            roi = crop_roi(gray, cx, ry, id_grid.bubble_r)
+            fills.append(fill_ratio(roi))
+            xs.append(x_cancel_score(roi))
+        # للـ ID: لا نطبق إلغاء X بقوة، فقط أعلى fill
+        idx = int(np.argmax(np.array(fills)))
+        if fills[idx] < 0.14:
+            digits.append("X")
+        else:
+            digits.append(digit_choices[idx])
     return "".join(digits)
 
 
-def extract_answers_from_sheet(sheet_bgr_aligned: np.ndarray, tmpl: Template,
-                               blank_thr: float, double_gap: float, x_thr: float,
-                               bubble_r: float = 28.0) -> Dict[int, Dict]:
-    b = adaptive_bin_inv(gray(sheet_bgr_aligned))
+def read_answers(img_bgr: np.ndarray, q_grid: Grid,
+                 blank_thr: float, double_gap: float, x_thr: float) -> Dict[int, Dict]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    answers: Dict[int, Dict] = {}
+    choices = q_grid.choices or list("ABCD")
 
-    choices = ["A", "B", "C", "D", "E"][:tmpl.q_choices]
-    out = {}
+    # rows are ordered top->bottom, question numbers start at 1
+    qnum = 1
+    for ry in q_grid.rows_y:
+        fills = []
+        xs = []
+        for cx in q_grid.cols_x:
+            roi = crop_roi(gray, cx, ry, q_grid.bubble_r)
+            fills.append(fill_ratio(roi))
+            xs.append(x_cancel_score(roi))
+        res = pick_answer_for_row(
+            fills, xs, choices=choices,
+            blank_thr=blank_thr, double_gap=double_gap, x_thr=x_thr
+        )
+        answers[qnum] = res
+        qnum += 1
+    return answers
 
-    for q_idx, ry in enumerate(tmpl.q_grid.rows_y, start=1):
-        cells = []
-        for cx in tmpl.q_grid.cols_x:
-            cell = crop_cell(b, cx, ry, bubble_r)
-            cells.append(cell)
 
-        res = choose_answer(cells, choices, blank_thr, double_gap, x_thr)
-        out[q_idx] = res
+# -----------------------------
+# Overlay drawing
+# -----------------------------
+def overlay_debug(img_bgr: np.ndarray, tmpl: Template) -> np.ndarray:
+    out = img_bgr.copy()
+
+    # draw ID grid (red)
+    x1,y1,x2,y2 = tmpl.id_grid.bbox
+    cv2.rectangle(out, (x1,y1), (x2,y2), (0,0,255), 3)
+    for cx in tmpl.id_grid.cols_x:
+        cv2.line(out, (int(cx), 0), (int(cx), out.shape[0]), (0,0,255), 2)
+
+    # draw Q grid (green + blue columns)
+    x1,y1,x2,y2 = tmpl.q_grid.bbox
+    cv2.rectangle(out, (x1,y1), (x2,y2), (0,255,0), 3)
+    for cx in tmpl.q_grid.cols_x:
+        cv2.line(out, (int(cx), 0), (int(cx), out.shape[0]), (255,0,0), 2)
+    for ry in tmpl.q_grid.rows_y:
+        cv2.circle(out, (int(tmpl.q_grid.cols_x[0]), int(ry)), 3, (0,255,0), -1)
 
     return out
 
 
-def build_answer_key_from_key_image(key_bgr: np.ndarray, tmpl: Template,
-                                    blank_thr: float, double_gap: float, x_thr: float) -> Dict[int, str]:
-    ans = extract_answers_from_sheet(key_bgr, tmpl, blank_thr, double_gap, x_thr)
-    # only OK are considered true answers
-    key = {}
-    for q, res in ans.items():
-        if res["status"] == "OK":
-            key[q] = res["answer"]
-    return key
-
-
 # -----------------------------
-# Roster loader
+# Roster loading
 # -----------------------------
-
-def load_roster(uploaded) -> Dict[str, str]:
-    if uploaded is None:
+def load_roster(file) -> Dict[str, str]:
+    if file is None:
         return {}
-    name = (uploaded.name or "").lower()
-    if name.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(uploaded)
+    name = file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(file)
     else:
-        df = pd.read_csv(uploaded)
-
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-
-    # flexible column mapping
-    possible_code = ["student_code", "code", "id", "studentid", "student_id"]
-    possible_name = ["student_name", "name", "student", "fullname", "full_name"]
-
-    code_col = next((c for c in possible_code if c in df.columns), None)
-    name_col = next((c for c in possible_name if c in df.columns), None)
-
-    if code_col is None or name_col is None:
-        raise ValueError("ملف الطلاب يجب أن يحتوي عمود كود وعمود اسم (مثل: student_code, student_name).")
-
-    codes = df[code_col].astype(str).str.strip()
-    names = df[name_col].astype(str).str.strip()
+        df = pd.read_excel(file)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    if "student_code" not in df.columns or "student_name" not in df.columns:
+        raise ValueError("ملف الطلاب يجب أن يحتوي عمودين: student_code و student_name")
+    codes = df["student_code"].astype(str).str.strip()
+    names = df["student_name"].astype(str).str.strip()
     return dict(zip(codes, names))
 
 
 # -----------------------------
-# Streamlit UI
+# Streamlit App
 # -----------------------------
-
 def main():
-    st.set_page_config(page_title="Hybrid OMR + Smart X", layout="wide")
+    st.set_page_config(page_title="Hybrid OMR + AI Rules", layout="wide")
+    st.title("✅ Hybrid OMR + AI Rules (Auto Template)")
+    st.caption("يكتشف كود الطالب والأسئلة تلقائياً (بدون تعيين يدوي) + قاعدة إلغاء X")
 
-    st.title("✅ Hybrid OMR + AI Rules (Smart X) — تدريب تلقائي من الـ Answer Key")
-
-    # Settings
-    st.session_state.setdefault("dpi", 300)
-
-    with st.expander("⚙️ إعدادات عامة", expanded=True):
-        dpi = st.selectbox("DPI للـ PDF", [200, 250, 300, 350, 400], index=2)
-        st.session_state["dpi"] = dpi
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            min_area = st.number_input("min_area", 50, 5000, 120, 10)
-            max_area = st.number_input("max_area", 500, 30000, 9000, 100)
-        with c2:
-            min_circ = st.slider("min_circularity", 0.10, 0.95, 0.34, 0.01)
-        with c3:
-            blank_thr = st.slider("Blank fill threshold", 0.01, 0.40, 0.14, 0.01)
-            double_gap = st.slider("Double gap threshold (فرق الفقاعتين)", 0.00, 0.20, 0.03, 0.01)
-            x_thr = st.slider("X threshold (عدد خطوط X)", 0.0, 5.0, 1.0, 0.5)
-
-        debug = st.checkbox("Debug (عرض التفاصيل)", value=True)
-
-    st.markdown("---")
-
-    cA, cB, cC = st.columns(3)
-    with cA:
-        roster_file = st.file_uploader("📋 ملف الطلاب (Excel/CSV)", type=["xlsx", "xls", "csv"])
-    with cB:
-        key_file = st.file_uploader("🔑 Answer Key (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
-    with cC:
-        sheets_file = st.file_uploader("📄 أوراق الطلاب (PDF/صورة) — يمكن PDF متعدد الصفحات", type=["pdf", "png", "jpg", "jpeg"])
-
-    st.markdown("---")
-
-    # Step 1: Train
-    st.subheader("1) 📌 تدريب تلقائي من الـ Answer Key")
-    train_btn = st.button("🧠 تدريب/إعادة تدريب من Answer Key", type="primary")
-
+    # session state
     if "template" not in st.session_state:
-        st.session_state["template"] = None
+        st.session_state.template = None
     if "answer_key" not in st.session_state:
-        st.session_state["answer_key"] = None
+        st.session_state.answer_key = None
 
-    if train_btn:
+    # uploads
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        roster_file = st.file_uploader("📋 ملف الطلاب (Excel/CSV) - student_code, student_name", type=["xlsx","xls","csv"])
+    with c2:
+        key_file = st.file_uploader("🔑 Answer Key (PDF/صورة)", type=["pdf","png","jpg","jpeg"])
+    with c3:
+        sheets_file = st.file_uploader("🧾 أوراق الطلاب (PDF/صورة)", type=["pdf","png","jpg","jpeg"])
+
+    dpi = st.selectbox("DPI للـ PDF", [200, 250, 300, 350, 400], index=2)
+    debug = st.checkbox("Debug", value=True)
+
+    st.divider()
+
+    # thresholds
+    st.subheader("Thresholds (Fill + X)")
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        blank_thr = st.slider("Blank fill threshold", 0.05, 0.35, 0.16, 0.01)
+    with t2:
+        double_gap = st.slider("Double gap ratio", 1.05, 2.00, 1.35, 0.05)
+    with t3:
+        x_thr = st.slider("X cancel score threshold", 0.0, 3.0, 1.0, 0.1)
+
+    st.divider()
+
+    # TRAIN button (from key)
+    train_col1, train_col2 = st.columns([1,2])
+    with train_col1:
+        do_train = st.button("🎯 تدريب/إعادة تدريب من Answer Key", type="primary")
+    with train_col2:
+        st.info("التدريب يثبت القالب (Template). تغيير السلايدر لا يعيد التدريب إلا إذا ضغطت الزر.")
+
+    if do_train:
         if key_file is None:
-            st.error("ارفع ملف الـ Answer Key أولاً.")
+            st.error("ارفع Answer Key أولاً.")
         else:
             try:
-                key_pil = pil_from_upload(key_file)
-                key_bgr = to_bgr(key_pil)
+                key_img = load_first_page(key_file.getvalue(), key_file.name, dpi=dpi)
+                key_bgr = bgr_from_pil(key_img)
 
-                tmpl, dbg = learn_template_from_key(
-                    key_bgr, debug=debug,
-                    min_area=int(min_area), max_area=int(max_area), min_circ=float(min_circ)
+                circles = detect_circles_hough(
+                    key_bgr,
+                    dp=1.2, min_dist=22,
+                    param1=120, param2=26,  # إذا ما يكشف كفاية: 24
+                    min_r=10, max_r=40
                 )
-                st.session_state["template"] = tmpl
 
-                # Extract answer key (BEFORE grading show it)
-                answer_key = build_answer_key_from_key_image(key_bgr, tmpl, blank_thr, double_gap, x_thr)
-                st.session_state["answer_key"] = answer_key
+                if len(circles) < 40:
+                    raise ValueError("عدد الدوائر المكتشفة قليل جداً. جرّب DPI أعلى أو قلّل param2 (مثلاً 24).")
 
-                st.success("✅ التدريب نجح.")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("عدد الأسئلة المكتشف", str(tmpl.q_count))
-                c2.metric("عدد الخيارات المكتشف", str(tmpl.q_choices))
-                c3.metric("خانات كود الطالب", "4")
-                c4.metric("صفوف كود الطالب", "10")
+                # 1) ID grid
+                id_grid = find_id_grid(circles, key_bgr.shape)
+
+                # 2) Q grid from remaining circles
+                remaining = filter_out_bbox(circles, id_grid.bbox)
+                q_grid, k = find_q_grid(remaining, key_bgr.shape, k_candidates=(2,4,5))
+
+                # Build template
+                tmpl = Template(
+                    width=key_bgr.shape[1],
+                    height=key_bgr.shape[0],
+                    id_grid=id_grid,
+                    q_grid=q_grid,
+                    num_choices=k,
+                    num_questions=len(q_grid.rows_y)
+                )
+                st.session_state.template = tmpl
+
+                # Extract Answer Key (from key page itself)
+                key_answers = read_answers(key_bgr, tmpl.q_grid, blank_thr, double_gap, x_thr)
+                # Only keep OK answers (and also keep DOUBLE/BLANK for review)
+                extracted = {}
+                for q, r in key_answers.items():
+                    extracted[q] = r["answer"]
+
+                st.session_state.answer_key = extracted
+
+                st.success(f"✅ التدريب نجح | خيارات={tmpl.num_choices} | أسئلة={tmpl.num_questions} | ID=4×10")
 
                 if debug:
-                    st.caption(f"Debug: {dbg}")
+                    ov = overlay_debug(key_bgr, tmpl)
+                    st.image(cv2.cvtColor(ov, cv2.COLOR_BGR2RGB), caption="Overlay: ID=أحمر | أعمدة الخيارات=أزرق | صندوق الأسئلة=أخضر", width="stretch")
 
-                # Show overlay
-                over = overlay_debug(key_bgr, tmpl)
-                st.image(cv2.cvtColor(over, cv2.COLOR_BGR2RGB), caption="Overlay (أحمر=كود، أزرق=أعمدة خيارات، أخضر=مراكز أسئلة)")
-
-                # Show extracted Answer Key clearly
-                st.subheader("🔎 Answer Key المستخرج (راجعه قبل التصحيح)")
-                st.json({str(k): v for k, v in answer_key.items()})
-
-                # download extracted answer key
-                dfk = pd.DataFrame([{"question": k, "answer": v} for k, v in answer_key.items()])
-                buf = io.BytesIO()
-                dfk.to_csv(buf, index=False, encoding="utf-8-sig")
-                st.download_button("⬇️ تنزيل Answer Key (CSV)", buf.getvalue(), file_name="answer_key_extracted.csv", mime="text/csv")
+                # Show Answer Key before grading
+                st.subheader("🔎 Answer Key المستخرج (تأكد قبل التصحيح)")
+                dfk = pd.DataFrame([{"Q": q, "Key": a} for q, a in extracted.items()])
+                st.dataframe(dfk, width="stretch", height=380)
 
             except Exception as e:
-                st.error(f"❌ فشل التدريب التلقائي: {e}")
-                if debug:
-                    import traceback
-                    st.code(traceback.format_exc())
+                st.error(f"❌ فشل التدريب: {e}")
 
-    st.markdown("---")
+    st.divider()
 
-    # Step 2: Grade
-    st.subheader("2) ✅ التصحيح")
-    grade_btn = st.button("🚀 ابدأ التصحيح", disabled=(st.session_state["template"] is None or st.session_state["answer_key"] is None))
-
-    if grade_btn:
+    # GRADING
+    st.subheader("✅ التصحيح")
+    if st.button("🚀 ابدأ التصحيح", type="primary"):
+        if st.session_state.template is None or st.session_state.answer_key is None:
+            st.error("لازم تدريب ناجح أولاً من Answer Key.")
+            return
         if roster_file is None:
-            st.error("ارفع ملف الطلاب (Roster) أولاً.")
+            st.error("ارفع ملف الطلاب أولاً.")
             return
         if sheets_file is None:
-            st.error("ارفع أوراق الطلاب أولاً.")
+            st.error("ارفع ورقة الطالب/الطلاب أولاً.")
             return
 
         try:
             roster = load_roster(roster_file)
-            tmpl: Template = st.session_state["template"]
-            answer_key: Dict[int, str] = st.session_state["answer_key"]
+            tmpl: Template = st.session_state.template
+            answer_key: Dict[int, str] = st.session_state.answer_key
 
-            # Load student pages
-            sheets_name = (sheets_file.name or "").lower()
-            if sheets_name.endswith(".pdf"):
-                pages = pdf_all_pages_bytes(sheets_file.getvalue(), dpi=int(st.session_state["dpi"]))
-            else:
-                pages = [Image.open(io.BytesIO(sheets_file.getvalue())).convert("RGB")]
+            # Load student sheet image
+            sheet_img = load_first_page(sheets_file.getvalue(), sheets_file.name, dpi=dpi)
+            sheet_bgr = bgr_from_pil(sheet_img)
 
-            results = []
-            with st.spinner("⏳ جاري التصحيح..."):
-                for idx, p in enumerate(pages, start=1):
-                    student_bgr = to_bgr(p)
+            # NOTE: نفترض نفس الأبعاد (مثل Remark) - لو اختلاف بسيط نعمل resize إلى قالب التدريب
+            sheet_bgr = cv2.resize(sheet_bgr, (tmpl.width, tmpl.height), interpolation=cv2.INTER_AREA)
 
-                    # align
-                    aligned = align_to_key(student_bgr, tmpl.key_ref_gray, tmpl.key_size)
+            # Read ID + answers
+            student_id = read_id(sheet_bgr, tmpl.id_grid)
+            student_name = roster.get(str(student_id).strip(), "غير موجود")
 
-                    # read id
-                    sid = read_id_from_sheet(aligned, tmpl, blank_thr, double_gap, x_thr)
-                    sname = roster.get(str(sid).strip(), "غير موجود")
+            student_answers = read_answers(sheet_bgr, tmpl.q_grid, blank_thr, double_gap, x_thr)
 
-                    # read answers
-                    student_ans = extract_answers_from_sheet(aligned, tmpl, blank_thr, double_gap, x_thr)
+            # Score
+            correct = 0
+            total = min(tmpl.num_questions, len(answer_key))
+            details = []
+            for q in range(1, total+1):
+                key_a = answer_key.get(q, "?")
+                stu = student_answers.get(q, {"answer": "?"})
+                stu_a = stu["answer"]
+                ok = (stu_a == key_a)
+                correct += 1 if ok else 0
+                details.append({
+                    "Q": q,
+                    "Key": key_a,
+                    "Student": stu_a,
+                    "Status": stu.get("status",""),
+                    "Correct": "✓" if ok else "✗"
+                })
 
-                    correct = 0
-                    total = len(answer_key)
+            pct = (correct / total * 100) if total else 0.0
 
-                    for q, corr in answer_key.items():
-                        res = student_ans.get(q, {"answer": "?", "status": "BLANK"})
-                        if res["status"] == "OK" and res["answer"] == corr:
-                            correct += 1
+            st.success(f"✅ تم التصحيح | ID={student_id} | الاسم={student_name} | النتيجة={correct}/{total} ({pct:.1f}%)")
 
-                    perc = (correct / total * 100.0) if total else 0.0
+            if debug:
+                ov2 = overlay_debug(sheet_bgr, tmpl)
+                st.image(cv2.cvtColor(ov2, cv2.COLOR_BGR2RGB), caption="Overlay على ورقة الطالب", width="stretch")
 
-                    results.append({
-                        "sheet_index": idx,
-                        "student_code": sid,
-                        "student_name": sname,
-                        "score": correct,
-                        "total_questions": total,
-                        "percentage": round(perc, 2)
-                    })
+            st.subheader("📋 تفاصيل الإجابات")
+            dfd = pd.DataFrame(details)
+            st.dataframe(dfd, width="stretch", height=420)
 
-            dfres = pd.DataFrame(results)
-            st.success("✅ اكتمل التصحيح.")
-            st.dataframe(dfres, width="stretch", height=300)
+            # Export Excel
+            out_df = pd.DataFrame([{
+                "student_code": student_id,
+                "student_name": student_name,
+                "score": correct,
+                "total": total,
+                "percentage": pct
+            }])
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                out_df.to_excel(writer, index=False, sheet_name="summary")
+                dfd.to_excel(writer, index=False, sheet_name="details")
 
-            # export excel
-            out = io.BytesIO()
-            dfres.to_excel(out, index=False, engine="openpyxl")
             st.download_button(
                 "⬇️ تحميل النتائج (Excel)",
-                out.getvalue(),
+                data=buf.getvalue(),
                 file_name="results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch"
             )
 
         except Exception as e:
-            st.error(f"❌ حدث خطأ أثناء التصحيح: {e}")
-            if debug:
-                import traceback
-                st.code(traceback.format_exc())
-
-    # Helpful note
-    st.markdown("---")
-    st.info(
-        "ملاحظة مهمة:\n"
-        "إذا كانت ورقة الطالب مائلة جدًا أو مصورة بزاوية قوية، المحاذاة قد تضعف.\n"
-        "أفضل نتيجة: تصوير/سكنر واضح + الصفحة كاملة + DPI 300 أو أكثر."
-    )
+            st.error(f"❌ خطأ أثناء التصحيح: {e}")
 
 
 if __name__ == "__main__":
