@@ -19,10 +19,11 @@ def read_bytes(f):
         try: return f.read()
         except: return b""
 
-def load_pages(file_bytes, filename, dpi=200):  # Lower DPI for speed
-    """Load pages with memory management"""
+def load_pages(file_bytes, filename, dpi=150):  # Lower DPI: 150 instead of 200
+    """Load pages with aggressive memory management"""
     if filename.lower().endswith(".pdf"):
-        pages = convert_from_bytes(file_bytes, dpi=dpi)
+        # Process in smaller chunks
+        pages = convert_from_bytes(file_bytes, dpi=dpi, fmt='jpeg', jpegopt={'quality': 85, 'optimize': True})
         return [p.convert("RGB") for p in pages]
     return [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
 
@@ -313,32 +314,39 @@ def main():
         💡 **للأعداد الكبيرة (500-700 طالب):**
         
         **الطريقة الموصى بها:**
-        1. قسّم PDF الكبير لملفات أصغر (50-100 ورقة لكل ملف)
+        1. قسّم PDF الكبير لملفات أصغر (**30-50 ورقة لكل ملف** - مهم!)
         2. ارفع ملف واحد في كل مرة
-        3. عالج 20-30 ورقة في كل دفعة
+        3. عالج 10-20 ورقة في كل دفعة
         4. النتائج تتجمع تلقائياً
         
-        **مثال:** 500 طالب
-        - الملف 1: أوراق 1-100 (10 دفعات × 10 أوراق)
-        - الملف 2: أوراق 101-200
-        - إلخ...
+        ⚠️ **لتجنب Memory Error:**
+        - لا ترفع ملفات أكبر من 50 صفحة
+        - استخدم batch size صغير (10-20)
+        - لو ظهر خطأ memory: اضغط "Reboot" وأعد المحاولة بملفات أصغر
         
-        **الوقت المتوقع:** 5-7 ملفات × 5 دقائق = 30-35 دقيقة
+        **مثال:** 500 طالب
+        - قسّم لـ 10 ملفات (50 ورقة لكل ملف)
+        - كل ملف: 5 دفعات × 10 أوراق = 3 دقائق
+        - الإجمالي: 30 دقيقة ✅
+        
+        **الوقت المتوقع:** 10 ملفات × 3 دقائق = 30 دقيقة
         **التكلفة:** 500 × $0.003 = $1.50
         """)
         
         sheets = st.file_uploader(
-            "ارفع ملف PDF (موصى به: 50-100 ورقة)",
+            "ارفع ملف PDF (⚠️ **أقصى حد: 50 صفحة**)",
             type=["pdf"],
             accept_multiple_files=False,
             key="sheets"
         )
         
+        st.warning("⚠️ **حد الذاكرة:** لا ترفع ملفات أكبر من 50 صفحة! قسّم الملفات الكبيرة أولاً.")
+        
         col1, col2 = st.columns(2)
         with col1:
-            batch_size = st.slider("📦 Batch size", 5, 50, 20)
+            batch_size = st.slider("📦 Batch size", 5, 20, 10, help="للذاكرة المحدودة: استخدم 10 أو أقل")
         with col2:
-            auto_continue = st.checkbox("🔄 Auto-continue", value=True, help="استمر تلقائياً للدفعة التالية")
+            auto_continue = st.checkbox("🔄 Auto-continue", value=False, help="⚠️ أطفئه لو في مشاكل ذاكرة")
         
         st.markdown("---")
         st.subheader("🔍 إدارة التكرارات")
@@ -400,10 +408,23 @@ def main():
                             continue
                         
                         page = pages[i]
+                        
+                        # Convert and compress immediately
                         bgr = pil_to_bgr(page)
                         img = bgr_to_bytes(bgr)
                         
+                        # Free memory immediately
+                        del page
+                        del bgr
+                        
                         res = analyze_with_ai(img, api_key, False)
+                        
+                        # Free image bytes
+                        del img
+                        
+                        # Force garbage collection every 10 pages
+                        if (i - current) % 10 == 0:
+                            gc.collect()
                         
                         if not res.success or not res.student_code:
                             st.warning(f"⚠️ Page {i+1}: Failed to read")
@@ -471,7 +492,13 @@ def main():
                     
                     st.session_state.current_file_idx = end
                     
-                    # Force garbage collection
+                    # Aggressive memory cleanup
+                    if end >= total:
+                        # File complete - clear everything
+                        del st.session_state.current_file_pages
+                        del st.session_state.current_file_idx
+                        gc.collect()
+                    
                     gc.collect()
                     
                     st.success(f"✅ Processed {processed_count} pages")
@@ -479,10 +506,8 @@ def main():
                     if end >= total:
                         st.balloons()
                         st.success("🎉 File complete!")
-                        del st.session_state.current_file_pages
-                        del st.session_state.current_file_idx
                     elif auto_continue:
-                        time.sleep(1)
+                        time.sleep(0.5)
                         st.rerun()
             else:
                 st.success("File complete! Upload next file or go to Results.")
