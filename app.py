@@ -74,10 +74,72 @@ def analyze_with_ai(image_bytes, api_key, is_answer_key=True):
             prompt = """اقرأ ورقة الطالب واعطني JSON:
 {"student_code": "1013", "answers": {"1": "C", ...}, "confidence": "high"}
 
-ملاحظات:
-- الكود: فقط الأرقام المظللة (4-10 أرقام)
-- X يلغي الفقاعة تماماً
-- أكثر من فقاعة: اختر الأكثر قتامة"""
+⚠️ **قواعد قراءة الإجابات (بالترتيب):**
+
+**القاعدة 1 - X يلغي الفقاعة (أولوية قصوى!):**
+```
+Q1: [●X] A [●] B [ ] C [ ] D
+     ملغية  صحيح
+→ A عليها X = ملغية تماماً!
+→ الإجابة: B ✅
+```
+
+**القاعدة 2 - فقاعة واحدة مظللة بدون X:**
+```
+Q2: [ ] A [●] B [ ] C [ ] D
+→ الإجابة: B ✅
+```
+
+**القاعدة 3 - أكثر من فقاعة بدون X (خطأ طالب):**
+```
+Q3: [●●] A [●] B [ ] C [ ] D
+     أكثر   أقل
+     قتامة  قتامة
+→ قارن القتامة
+→ الإجابة: A (الأكثر قتامة)
+→ Note: "Q3: multiple marks - selected darkest"
+```
+
+**القاعدة 4 - لا فقاعة مظللة:**
+```
+Q4: [ ] A [ ] B [ ] C [ ] D
+→ الإجابة: "?"
+```
+
+**⚠️ أمثلة حرجة للتأكد:**
+
+```
+مثال 1:
+Q5: [●X] A [●] B [●X] C [ ] D
+     ملغ    ✓   ملغ
+→ A ملغية (X)
+→ C ملغية (X)
+→ الإجابة: B ✅
+
+مثال 2:
+Q6: [●X] A [●●] B [●] C [ ] D
+     ملغ    أكثر   أقل
+→ A ملغية (X)
+→ بين B و C: B أكثر قتامة
+→ الإجابة: B ✅
+
+مثال 3:
+Q7: [X] A [●] B [●] C [ ] D
+    ملغ   ✓    ✓
+→ A ملغية (حتى لو غير مظللة)
+→ بين B و C: نفس القتامة
+→ الإجابة: B (الأولى) ✅
+```
+
+**⚠️ خوارزمية المعالجة:**
+1. اقرأ كل فقاعات السؤال
+2. احذف أي فقاعة عليها X (مظللة أو لا!)
+3. من الفقاعات المتبقية (بدون X):
+   - واحدة مظللة → هذه الإجابة
+   - أكثر من واحدة → اختر الأكثر قتامة
+   - لا شيء → "?"
+
+**الكود: فقط الأرقام المظللة (4-10 رقم)**"""
         
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -264,6 +326,12 @@ def main():
         
         batch_size = st.select_slider("📦 Batch size", options=[5,10,15,20], value=10)
         
+        col1, col2 = st.columns(2)
+        with col1:
+            skip_duplicates = st.checkbox("🚫 Skip duplicates", value=True, help="تجاهل الأكواد المكررة")
+        with col2:
+            fast_mode = st.checkbox("⚡ Fast mode", value=False, help="أسرع لكن قد يتعب النظام")
+        
         if sheets and not st.session_state.pages_data:
             if st.button("🔍 Prepare files"):
                 with st.spinner("Loading files..."):
@@ -301,7 +369,9 @@ def main():
                         bgr = pil_to_bgr(page)
                         img = bgr_to_bytes(bgr)
                         
-                        time.sleep(0.2)
+                        # Conditional delay based on mode
+                        if not fast_mode:
+                            time.sleep(0.2)
                         
                         res = analyze_with_ai(img, api_key, False)
                         if not res.success or not res.student_code:
@@ -317,6 +387,13 @@ def main():
                         if not student:
                             st.warning(f"⚠️ Page {i+1}: Code {code} not found")
                             continue
+                        
+                        # Check for duplicates (if enabled)
+                        if skip_duplicates:
+                            already_graded = any(r.detected_code == code for r in st.session_state.results)
+                            if already_graded:
+                                st.info(f"ℹ️ Page {i+1}: Code {code} ({student.name}) already graded - skipping")
+                                continue
                         
                         score, tot, details = grade_student(res.answers, st.session_state.answer_key)
                         pct = (score/tot*100) if tot > 0 else 0
