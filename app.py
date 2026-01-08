@@ -72,42 +72,71 @@ class AutoDetectedParams:
     id_digits: int
     id_rows: int
     answer_key: Dict[int, str]
-    confidence: str  # "high", "medium", "low"
+    confidence: str
     detection_notes: List[str]
 
 
 # ==============================
-# Preprocess for bubble detection
+# 🆕 HUMAN-LIKE BUBBLE DETECTION
 # ==============================
 def preprocess_binary_for_detection(bgr: np.ndarray) -> np.ndarray:
+    """Enhanced preprocessing for better bubble detection"""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    bin_img = cv2.adaptiveThreshold(
-        gray, 255,
+    
+    # Multiple preprocessing attempts
+    # Method 1: Adaptive threshold
+    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    binary1 = cv2.adaptiveThreshold(
+        gray_blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         31, 7
     )
-    bin_img = cv2.medianBlur(bin_img, 3)
-    return bin_img
+    
+    # Method 2: Otsu's threshold
+    _, binary2 = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Combine both methods
+    binary = cv2.bitwise_or(binary1, binary2)
+    
+    # Clean up noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = cv2.medianBlur(binary, 3)
+    
+    return binary
 
 
-def find_bubble_centers(bin_img: np.ndarray,
-                        min_area: int,
-                        max_area: int,
-                        min_circularity: float) -> np.ndarray:
+def find_bubble_centers_smart(bin_img: np.ndarray,
+                              min_area: int,
+                              max_area: int,
+                              min_circularity: float) -> np.ndarray:
+    """Find bubbles with multiple validation passes"""
     cnts, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     centers = []
+    
     for c in cnts:
         area = cv2.contourArea(c)
         if area < min_area or area > max_area:
             continue
+            
         peri = cv2.arcLength(c, True)
         if peri <= 1e-6:
             continue
+            
+        # Circularity check
         circ = 4.0 * np.pi * area / (peri * peri)
         if circ < min_circularity:
             continue
+        
+        # Additional checks for bubble-like shapes
+        # Check aspect ratio
+        x, y, w, h = cv2.boundingRect(c)
+        aspect_ratio = float(w) / h if h > 0 else 0
+        if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+            continue
+        
+        # Get centroid
         M = cv2.moments(c)
         if abs(M["m00"]) < 1e-6:
             continue
@@ -121,163 +150,108 @@ def find_bubble_centers(bin_img: np.ndarray,
 
 
 # ==============================
-# 🆕 Smart Region Detection
+# 🆕 SMART REGION DETECTION
 # ==============================
-def detect_bubble_regions(centers: np.ndarray, w: int, h: int, 
-                         left_boundary_percent: float = 8.0) -> Tuple[np.ndarray, np.ndarray, Dict]:
+def detect_bubble_regions_smart(centers: np.ndarray, w: int, h: int, 
+                                left_boundary_percent: float = 8.0) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
-    Automatically detect ID and Question regions using clustering
-    Filters out question numbers on the far left using manual boundary
-    Returns: (id_centers, q_centers, debug_info)
+    Smart region detection like a human would do:
+    1. Find question numbers area (far left, sparse)
+    2. Find answer bubbles (dense cluster after numbers)
+    3. Find ID bubbles (top right)
     """
     if centers.shape[0] < 20:
-        raise ValueError("عدد الفقاعات قليل جداً - تأكد من جودة الصورة")
+        raise ValueError("عدد الفقاعات قليل جداً")
     
     xs = centers[:, 0]
     ys = centers[:, 1]
     
-    # Split into quadrants for initial analysis
     x_mid = np.median(xs)
     y_mid = np.median(ys)
     
-    # Count bubbles in each quadrant
-    q1 = np.sum((xs > x_mid) & (ys < y_mid))  # top-right (usually ID)
-    q2 = np.sum((xs < x_mid) & (ys < y_mid))  # top-left
-    q3 = np.sum((xs < x_mid) & (ys > y_mid))  # bottom-left (usually Questions)
-    q4 = np.sum((xs > x_mid) & (ys > y_mid))  # bottom-right
-    
     debug = {
-        "quadrant_counts": {"TR": q1, "TL": q2, "BL": q3, "BR": q4},
         "x_median": x_mid,
         "y_median": y_mid
     }
     
-    # Use manual boundary setting
+    # Calculate left boundary
     left_boundary = (left_boundary_percent / 100.0) * w
     
-    # More precise splitting using better boundaries
-    # ID section: typically top-right
+    # ID section: top-right quadrant
     id_mask = (xs > 0.6 * w) & (ys < 0.5 * h)
-    
-    # Questions section: after the boundary, in left half
-    right_boundary = 0.5 * w  # Questions are in left half
-    q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.45 * h)
-    
     id_centers = centers[id_mask]
-    q_centers = centers[q_mask]
     
-    # Fallback if regions produce odd counts
-    if id_centers.shape[0] < 20 or id_centers.shape[0] > 100:
-        # Try quadrant-based
+    # Fallback for ID
+    if id_centers.shape[0] < 20:
         id_centers = centers[(xs > x_mid) & (ys < y_mid)]
     
-    if q_centers.shape[0] < 20:
-        # More lenient
-        q_centers = centers[(xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)]
+    # Questions section: after left boundary, in left half, bottom area
+    q_mask = (xs > left_boundary) & (xs < 0.55 * w) & (ys > 0.4 * h)
+    q_centers = centers[q_mask]
     
+    # Fallback for questions
     if q_centers.shape[0] < 20:
-        # Last resort: quadrant-based but still filter left edge
         q_centers = centers[(xs > left_boundary) & (xs < x_mid) & (ys > y_mid)]
     
     debug["id_count"] = id_centers.shape[0]
     debug["q_count"] = q_centers.shape[0]
     debug["left_boundary"] = left_boundary
-    debug["left_boundary_percent"] = left_boundary_percent
     debug["filtered_out"] = centers.shape[0] - id_centers.shape[0] - q_centers.shape[0]
-    debug["id_expected_multiples"] = [30, 40, 50, 60, 70, 80]
-    debug["q_expected_multiples"] = [40, 50, 60]
     
     return id_centers, q_centers, debug
 
 
 # ==============================
-# 🆕 Auto-detect grid dimensions
+# 🆕 SMART GRID ESTIMATION
 # ==============================
-def estimate_grid_dimensions(centers: np.ndarray, is_questions: bool = True) -> Tuple[int, int, float]:
+def estimate_grid_smart(centers: np.ndarray, is_questions: bool = True) -> Tuple[int, int, float]:
     """
-    Estimate rows and columns by analyzing spacing patterns
-    Returns: (estimated_rows, estimated_cols, confidence)
+    Smart grid estimation based on common OMR patterns
     """
     if centers.shape[0] < 4:
-        return 1, 1, 0.0
+        return 10, 4, 0.0  # Default guess
     
-    xs = centers[:, 0]
-    ys = centers[:, 1]
+    total_bubbles = centers.shape[0]
     
-    # Find typical spacing
-    xs_sorted = np.sort(xs)
-    ys_sorted = np.sort(ys)
-    
-    # Calculate differences
-    x_diffs = np.diff(xs_sorted)
-    y_diffs = np.diff(ys_sorted)
-    
-    # Find modal spacing (most common distance) - ignore very small diffs
-    x_diffs_clean = x_diffs[x_diffs > 5]
-    y_diffs_clean = y_diffs[y_diffs > 5]
-    
-    if len(x_diffs_clean) == 0 or len(y_diffs_clean) == 0:
-        return 1, 1, 0.0
-    
-    x_spacing = np.median(x_diffs_clean)
-    y_spacing = np.median(y_diffs_clean)
-    
-    # Estimate dimensions
-    x_range = xs.max() - xs.min()
-    y_range = ys.max() - ys.min()
-    
-    cols_raw = int(round(x_range / x_spacing)) + 1 if x_spacing > 0 else 1
-    rows_raw = int(round(y_range / y_spacing)) + 1 if y_spacing > 0 else 1
-    
-    # Snap to expected values based on typical OMR sheets
+    # Common configurations
     if is_questions:
-        # Questions typically: 10 rows × (4, 5, or 6 choices)
-        # Find closest valid configuration
-        expected_configs = [
-            (10, 4), (10, 5), (10, 6),
+        configs = [
+            (10, 4), (10, 5), (10, 6),  # Most common
             (20, 4), (20, 5), (20, 6),
-            (15, 4), (15, 5), (15, 6),
-            (25, 4), (25, 5), (25, 6),
-            (30, 4), (30, 5), (30, 6),
+            (15, 4), (15, 5), (25, 4),
+            (30, 4), (30, 5),
         ]
     else:
-        # ID typically: 10 rows (0-9) × (3-8 digit columns)
-        expected_configs = [
-            (10, 3), (10, 4), (10, 5), (10, 6), (10, 7), (10, 8),
-            (11, 3), (11, 4), (11, 5), (11, 6),
+        configs = [
+            (10, 4), (10, 5), (10, 6),  # ID with 4-6 digits
+            (10, 3), (10, 7), (10, 8),
+            (11, 4), (11, 5),
         ]
     
     # Find best match
-    total_bubbles = centers.shape[0]
-    best_config = (rows_raw, cols_raw)
-    best_diff = float('inf')
+    best_config = (10, 4)
+    best_score = float('inf')
     
-    for exp_rows, exp_cols in expected_configs:
-        expected_total = exp_rows * exp_cols
-        diff = abs(expected_total - total_bubbles)
-        if diff < best_diff:
-            best_diff = diff
-            best_config = (exp_rows, exp_cols)
+    for rows, cols in configs:
+        expected = rows * cols
+        diff = abs(expected - total_bubbles)
+        score = diff / expected if expected > 0 else 1.0
+        
+        if score < best_score:
+            best_score = score
+            best_config = (rows, cols)
     
     rows, cols = best_config
-    
-    # Sanity bounds
-    cols = max(1, min(cols, 20))
-    rows = max(1, min(rows, 100))
-    
-    # Confidence based on how close we are to expected
-    expected_bubbles = rows * cols
-    actual_bubbles = centers.shape[0]
-    diff_ratio = abs(expected_bubbles - actual_bubbles) / expected_bubbles if expected_bubbles > 0 else 1.0
-    confidence = 1.0 - min(1.0, diff_ratio)
+    confidence = max(0.0, 1.0 - best_score)
     
     return rows, cols, confidence
 
 
 # ==============================
-# Build grids
+# 🆕 BUILD GRID WITH INTERPOLATION
 # ==============================
 def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
+    """Cluster values into k equal bins"""
     idx = np.argsort(values)
     labels = np.zeros(len(values), dtype=np.int32)
     n = len(values)
@@ -288,236 +262,223 @@ def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
     return labels
 
 
-def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid]:
+def build_grid_smart(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid]:
     """
-    Build grid even with some missing bubbles by using interpolation
+    Build grid with smart interpolation for missing bubbles
     """
-    if centers.shape[0] < int(rows * cols * 0.5):  # Need at least 50%
+    if centers.shape[0] < int(rows * cols * 0.4):
         return None
 
     xs = centers[:, 0].astype(np.float32)
     ys = centers[:, 1].astype(np.float32)
 
+    # Cluster into rows and columns
     rlab = cluster_1d_equal_bins(ys, rows)
     clab = cluster_1d_equal_bins(xs, cols)
 
     grid = np.zeros((rows, cols, 2), dtype=np.float32)
     cnt = np.zeros((rows, cols), dtype=np.int32)
 
-    # Collect bubbles into grid cells
+    # Place bubbles in grid
     for (x, y), r, c in zip(centers, rlab, clab):
         grid[r, c, 0] += x
         grid[r, c, 1] += y
         cnt[r, c] += 1
 
-    # Average positions for cells with bubbles
+    # Average for cells with bubbles
     for r in range(rows):
         for c in range(cols):
             if cnt[r, c] > 0:
                 grid[r, c] /= cnt[r, c]
 
-    # Interpolate missing bubbles
-    # First, calculate row and column medians
-    row_meds_y = []
-    col_meds_x = []
+    # Interpolate missing cells
+    # Calculate row and column medians
+    row_ys = []
+    col_xs = []
     
     for r in range(rows):
-        filled_in_row = [grid[r, c, 1] for c in range(cols) if cnt[r, c] > 0]
-        if filled_in_row:
-            row_meds_y.append(np.median(filled_in_row))
-        else:
-            row_meds_y.append(0)  # Will fix later
+        valid_y = [grid[r, c, 1] for c in range(cols) if cnt[r, c] > 0]
+        row_ys.append(np.median(valid_y) if valid_y else 0)
     
     for c in range(cols):
-        filled_in_col = [grid[r, c, 0] for r in range(rows) if cnt[r, c] > 0]
-        if filled_in_col:
-            col_meds_x.append(np.median(filled_in_col))
-        else:
-            col_meds_x.append(0)  # Will fix later
+        valid_x = [grid[r, c, 0] for r in range(rows) if cnt[r, c] > 0]
+        col_xs.append(np.median(valid_x) if valid_x else 0)
     
-    # Fix empty row/col medians
-    if any(x == 0 for x in row_meds_y):
-        valid_y = [y for y in row_meds_y if y > 0]
-        if valid_y:
-            y_spacing = np.median(np.diff(sorted(valid_y))) if len(valid_y) > 1 else 50
-            for i in range(len(row_meds_y)):
-                if row_meds_y[i] == 0:
-                    row_meds_y[i] = min(valid_y) + i * y_spacing
+    # Fill zeros with interpolated values
+    for i, val in enumerate(row_ys):
+        if val == 0 and i > 0:
+            row_ys[i] = row_ys[i-1] + 50
+    for i, val in enumerate(col_xs):
+        if val == 0 and i > 0:
+            col_xs[i] = col_xs[i-1] + 50
     
-    if any(x == 0 for x in col_meds_x):
-        valid_x = [x for x in col_meds_x if x > 0]
-        if valid_x:
-            x_spacing = np.median(np.diff(sorted(valid_x))) if len(valid_x) > 1 else 50
-            for i in range(len(col_meds_x)):
-                if col_meds_x[i] == 0:
-                    col_meds_x[i] = min(valid_x) + i * x_spacing
-    
-    # Fill missing cells using row/col medians
+    # Fill missing cells
     for r in range(rows):
         for c in range(cols):
             if cnt[r, c] == 0:
-                grid[r, c, 0] = col_meds_x[c]
-                grid[r, c, 1] = row_meds_y[r]
+                grid[r, c, 0] = col_xs[c]
+                grid[r, c, 1] = row_ys[r]
 
-    # Ensure proper ordering
-    row_order = np.argsort([row_meds_y[r] for r in range(rows)])
-    col_order = np.argsort([col_meds_x[c] for c in range(cols)])
-    
+    # Sort by position
+    row_order = np.argsort(row_ys)
+    col_order = np.argsort(col_xs)
     grid = grid[row_order][:, col_order]
 
     return BubbleGrid(centers=grid, rows=rows, cols=cols)
 
 
 # ==============================
-# ✅ Correct shading measure (GRAY DARKNESS)
+# 🆕 HUMAN-LIKE DARKNESS READING
 # ==============================
-def mean_darkness(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> float:
+def mean_darkness_smart(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> float:
+    """
+    Read darkness like a human would - focus on the center of the bubble
+    """
     h, w = gray.shape[:2]
     x1 = max(0, cx - win)
     x2 = min(w, cx + win)
     y1 = max(0, cy - win)
     y2 = min(h, cy + win)
     patch = gray[y1:y2, x1:x2]
+    
     if patch.size == 0:
         return 255.0
 
+    # Focus on inner circle (exclude edges)
     ph, pw = patch.shape
-    mh = int(ph * 0.25)
-    mw = int(pw * 0.25)
-    inner = patch[mh:ph - mh, mw:pw - mw]
+    margin_h = max(1, int(ph * 0.3))
+    margin_w = max(1, int(pw * 0.3))
+    inner = patch[margin_h:ph-margin_h, margin_w:pw-margin_w]
+    
     if inner.size == 0:
         inner = patch
 
+    # Return mean darkness (lower = darker = filled)
     return float(np.mean(inner))
 
 
-def pick_by_darkness(means: List[float], labels: List[str],
-                     blank_mean_thresh: float, diff_thresh: float) -> Tuple[str, str]:
-    if not means:
-        return "?", "BLANK"
-    
-    idx = np.argsort(means)
-    best = int(idx[0])
-    second = int(idx[1]) if len(idx) > 1 else best
-    best_m = means[best]
-    second_m = means[second]
-
-    if best_m > blank_mean_thresh:
-        return "?", "BLANK"
-    if (second_m - best_m) < diff_thresh:
-        return "!", "DOUBLE"
-    return labels[best], "OK"
-
-
-# ==============================
-# 🆕 AUTO-DETECT ALL PARAMETERS
-# ==============================
-def auto_detect_from_answer_key(key_bgr: np.ndarray,
-                                 min_area: int = 120,
-                                 max_area: int = 9000,
-                                 min_circ: float = 0.55,
-                                 blank_thresh: float = 170,
-                                 diff_thresh: float = 12,
-                                 left_boundary_percent: float = 8.0) -> Tuple[AutoDetectedParams, pd.DataFrame]:
+def pick_answer_smart(means: List[float], labels: List[str],
+                     blank_thresh: float, diff_thresh: float) -> Tuple[str, str, Dict]:
     """
-    Automatically detect ALL parameters from answer key image
-    Returns: (params, debug_dataframe)
+    Pick answer like a human would:
+    1. Find darkest bubble
+    2. Check if it's dark enough (filled)
+    3. Check if second darkest is too close (double mark)
+    """
+    if not means:
+        return "?", "BLANK", {}
+    
+    # Sort by darkness
+    sorted_indices = np.argsort(means)
+    darkest_idx = int(sorted_indices[0])
+    darkest_val = means[darkest_idx]
+    
+    second_darkest_val = means[int(sorted_indices[1])] if len(sorted_indices) > 1 else 255
+    
+    info = {
+        "darkest": round(darkest_val, 1),
+        "second": round(second_darkest_val, 1),
+        "diff": round(second_darkest_val - darkest_val, 1),
+        "all_values": [round(m, 1) for m in means]
+    }
+    
+    # Decision logic
+    if darkest_val > blank_thresh:
+        return "?", "BLANK", info
+    
+    if (second_darkest_val - darkest_val) < diff_thresh:
+        return "!", "DOUBLE", info
+    
+    return labels[darkest_idx], "OK", info
+
+
+# ==============================
+# 🎯 MAIN AUTO-DETECTION
+# ==============================
+def auto_detect_smart(key_bgr: np.ndarray,
+                     min_area: int = 80,
+                     max_area: int = 10000,
+                     min_circ: float = 0.45,
+                     blank_thresh: float = 185,
+                     diff_thresh: float = 8,
+                     left_boundary_percent: float = 8.0) -> Tuple[AutoDetectedParams, pd.DataFrame, np.ndarray]:
+    """
+    Smart auto-detection that mimics human analysis
+    Returns: (params, debug_dataframe, visualization_image)
     """
     h, w = key_bgr.shape[:2]
     gray = cv2.cvtColor(key_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Step 1: Find all bubbles
     bin_key = preprocess_binary_for_detection(key_bgr)
-    centers = find_bubble_centers(bin_key, min_area, max_area, min_circ)
+    centers = find_bubble_centers_smart(bin_key, min_area, max_area, min_circ)
     
     notes = []
+    notes.append(f"✅ اكتشاف {centers.shape[0]} فقاعة إجمالاً")
     
     if centers.shape[0] < 20:
-        raise ValueError(f"عدد الفقاعات المكتشفة قليل جداً ({centers.shape[0]}). جرب تعديل min_area/max_area")
+        raise ValueError(f"عدد قليل جداً ({centers.shape[0]}) - عدّل الإعدادات")
     
-    notes.append(f"✓ تم اكتشاف {centers.shape[0]} فقاعة إجمالاً")
+    # Step 2: Separate regions
+    id_centers, q_centers, reg_debug = detect_bubble_regions_smart(
+        centers, w, h, left_boundary_percent
+    )
     
-    # Detect regions with manual boundary
-    id_centers, q_centers, region_debug = detect_bubble_regions(centers, w, h, left_boundary_percent)
-    notes.append(f"✓ منطقة الكود: {id_centers.shape[0]} فقاعة")
-    notes.append(f"✓ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
-    notes.append(f"✓ فقاعات متجاهلة (أرقام الأسئلة): {region_debug['filtered_out']}")
-    notes.append(f"  → الحد الفاصل: {region_debug['left_boundary_percent']}% ({region_debug['left_boundary']:.1f} بكسل)")
+    notes.append(f"✅ منطقة الكود: {id_centers.shape[0]} فقاعة")
+    notes.append(f"✅ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
+    notes.append(f"✅ متجاهلة (أرقام): {reg_debug['filtered_out']} فقاعة")
     
-    # Estimate ID grid dimensions
-    id_rows_est, id_cols_est, id_conf = estimate_grid_dimensions(id_centers, is_questions=False)
-    notes.append(f"✓ تقدير شبكة الكود: {id_rows_est} صفوف × {id_cols_est} أعمدة (ثقة: {id_conf:.1%})")
-    notes.append(f"  → إجمالي فقاعات الكود المتوقعة: {id_rows_est * id_cols_est} (فعلياً: {id_centers.shape[0]})")
+    # Step 3: Estimate grid dimensions
+    id_rows, id_cols, id_conf = estimate_grid_smart(id_centers, is_questions=False)
+    q_rows, q_cols, q_conf = estimate_grid_smart(q_centers, is_questions=True)
     
-    # Estimate Question grid dimensions
-    q_rows_est, q_cols_est, q_conf = estimate_grid_dimensions(q_centers, is_questions=True)
-    notes.append(f"✓ تقدير شبكة الأسئلة: {q_rows_est} أسئلة × {q_cols_est} خيارات (ثقة: {q_conf:.1%})")
-    notes.append(f"  → إجمالي فقاعات الأسئلة المتوقعة: {q_rows_est * q_cols_est} (فعلياً: {q_centers.shape[0]})")
+    notes.append(f"✅ شبكة الكود: {id_rows}×{id_cols} (ثقة: {id_conf:.0%})")
+    notes.append(f"✅ شبكة الأسئلة: {q_rows}×{q_cols} (ثقة: {q_conf:.0%})")
     
-    # Build grids with estimated dimensions
-    id_grid = build_grid(id_centers, rows=id_rows_est, cols=id_cols_est)
-    q_grid = build_grid(q_centers, rows=q_rows_est, cols=q_cols_est)
+    # Step 4: Build grids
+    id_grid = build_grid_smart(id_centers, id_rows, id_cols)
+    q_grid = build_grid_smart(q_centers, q_rows, q_cols)
     
-    if id_grid is None:
-        raise ValueError("فشل بناء شبكة الكود. جرب تعديل معايير الكشف.")
-    if q_grid is None:
-        raise ValueError("فشل بناء شبكة الأسئلة. جرب تعديل معايير الكشف.")
+    if not id_grid or not q_grid:
+        raise ValueError("فشل بناء الشبكات - عدّل min_area أو min_circularity")
     
-    # Check for missing bubbles and warn
-    id_expected = id_rows_est * id_cols_est
-    id_actual = id_centers.shape[0]
-    if id_actual < id_expected:
-        notes.append(f"⚠️ ناقص {id_expected - id_actual} فقاعة من الكود - سيتم التقدير")
+    # Check for missing bubbles
+    id_expected = id_rows * id_cols
+    q_expected = q_rows * q_cols
     
-    q_expected = q_rows_est * q_cols_est
-    q_actual = q_centers.shape[0]
-    if q_actual < q_expected:
-        notes.append(f"⚠️ ناقص {q_expected - q_actual} فقاعة من الأسئلة - سيتم التقدير")
-        notes.append("   💡 جرب تقليل min_area أو زيادة max_area لكشف المزيد من الفقاعات")
+    if id_centers.shape[0] < id_expected:
+        notes.append(f"⚠️ ناقص {id_expected - id_centers.shape[0]} فقاعة من الكود")
+    if q_centers.shape[0] < q_expected:
+        notes.append(f"⚠️ ناقص {q_expected - q_centers.shape[0]} فقاعة من الأسئلة")
     
-    # Extract answer key by reading filled bubbles with DETAILED DEBUG
+    # Step 5: Extract answers (THE SMART PART!)
+    choices = list("ABCDEFGHIJ"[:q_cols])
     answer_key = {}
-    choices = list("ABCDEFGHIJ"[:q_cols_est])
     debug_rows = []
     
-    for r in range(q_rows_est):
+    for r in range(q_rows):
+        # Read darkness of all choices
         means = []
-        for c in range(q_cols_est):
+        for c in range(q_cols):
             cx, cy = q_grid.centers[r, c]
-            darkness = mean_darkness(gray, int(cx), int(cy), win=18)
+            darkness = mean_darkness_smart(gray, int(cx), int(cy), win=18)
             means.append(darkness)
         
-        # Find darkest (filled) bubble
-        min_idx = int(np.argmin(means))
-        darkest_val = means[min_idx]
+        # Pick answer smartly
+        ans, status, info = pick_answer_smart(means, choices, blank_thresh, diff_thresh)
         
-        # Get second darkest for comparison
-        means_sorted = sorted(means)
-        second_darkest = means_sorted[1] if len(means_sorted) > 1 else 255
-        
-        # Decision logic with more lenient thresholds
-        if darkest_val > blank_thresh:
-            # Too light - probably blank
-            ans = "?"
-            status = "BLANK"
-        elif (second_darkest - darkest_val) < diff_thresh:
-            # Two bubbles too close - double mark
-            ans = "!"
-            status = "DOUBLE"
-        else:
-            # Clear winner
-            ans = choices[min_idx]
-            status = "OK"
+        if status == "OK":
             answer_key[r + 1] = ans
         
-        # Build debug row with ALL darkness values
+        # Build debug row
         debug_row = {
             "Q": r + 1,
-            "Picked": ans,
+            "Answer": ans,
             "Status": status,
-            "Darkest": round(darkest_val, 1),
-            "2nd_Dark": round(second_darkest, 1),
-            "Diff": round(second_darkest - darkest_val, 1)
+            "Darkest": info.get("darkest", 0),
+            "2nd_Dark": info.get("second", 0),
+            "Diff": info.get("diff", 0),
         }
-        # Add individual choice darkness values
         for i, choice in enumerate(choices):
             debug_row[choice] = round(means[i], 1)
         
@@ -525,34 +486,56 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
     
     debug_df = pd.DataFrame(debug_rows)
     
-    notes.append(f"✓ تم استخراج {len(answer_key)} إجابة صحيحة من {q_rows_est} سؤال")
+    notes.append(f"✅ استخراج {len(answer_key)}/{q_rows} إجابة")
     
-    if len(answer_key) == 0:
-        notes.append("⚠️ لم يتم اكتشاف أي إجابات مظللة! تحقق من:")
-        notes.append("  - هل الأنسر مظلل بشكل واضح؟")
-        notes.append("  - جرب تقليل blank_threshold")
-        notes.append("  - جرب تقليل diff_threshold")
+    # Step 6: Create visualization
+    vis = key_bgr.copy()
+    
+    # Draw ID bubbles (RED)
+    for (x, y) in id_centers:
+        cv2.circle(vis, (int(x), int(y)), 7, (0, 0, 255), 2)
+    
+    # Draw Question bubbles (GREEN)
+    for (x, y) in q_centers:
+        cv2.circle(vis, (int(x), int(y)), 7, (0, 255, 0), 2)
+    
+    # Draw filtered bubbles (GRAY)
+    left_bound = reg_debug['left_boundary']
+    filtered = centers[centers[:, 0] <= left_bound]
+    for (x, y) in filtered:
+        cv2.circle(vis, (int(x), int(y)), 7, (128, 128, 128), 2)
+    
+    # Draw boundary line (MAGENTA)
+    cv2.line(vis, (int(left_bound), 0), (int(left_bound), h), (255, 0, 255), 3)
+    
+    # Add labels
+    cv2.putText(vis, f"ID: {id_centers.shape[0]}", (10, 30), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    cv2.putText(vis, f"Q: {q_centers.shape[0]}", (10, 60), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(vis, f"Filtered: {filtered.shape[0]}", (10, 90), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (128, 128, 128), 2)
     
     # Determine confidence
     avg_conf = (id_conf + q_conf) / 2
-    if avg_conf > 0.8 and len(answer_key) > q_rows_est * 0.7:
+    if avg_conf > 0.8 and len(answer_key) >= q_rows * 0.8:
         confidence = "high"
-    elif avg_conf > 0.6 and len(answer_key) > q_rows_est * 0.5:
+    elif avg_conf > 0.6 and len(answer_key) >= q_rows * 0.6:
         confidence = "medium"
     else:
         confidence = "low"
     
     params = AutoDetectedParams(
-        num_questions=q_rows_est,
-        num_choices=q_cols_est,
-        id_digits=id_cols_est,
-        id_rows=id_rows_est,
+        num_questions=q_rows,
+        num_choices=q_cols,
+        id_digits=id_cols,
+        id_rows=id_rows,
         answer_key=answer_key,
         confidence=confidence,
         detection_notes=notes
     )
     
-    return params, debug_df
+    return params, debug_df, vis
 
 
 # ==============================
@@ -606,7 +589,7 @@ def load_roster(file, id_digits: int) -> Dict[str, str]:
 
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "student_code" not in df.columns or "student_name" not in df.columns:
-        raise ValueError("ملف الطلاب لازم يحتوي: student_code و student_name")
+        raise ValueError("ملف الطلاب يحتاج: student_code و student_name")
 
     codes = (
         df["student_code"]
@@ -619,196 +602,124 @@ def load_roster(file, id_digits: int) -> Dict[str, str]:
 
 
 # ==============================
-# Manual template learning (with known params)
+# Template creation from auto params
 # ==============================
-def learn_template(key_bgr: np.ndarray,
-                   id_rows: int, id_digits: int,
-                   num_q: int, num_choices: int,
-                   min_area: int, max_area: int, min_circ: float) -> Tuple[LearnedTemplate, Dict]:
-
+def create_template_from_params(key_bgr: np.ndarray, params: AutoDetectedParams,
+                                min_area: int, max_area: int, min_circ: float,
+                                left_boundary_percent: float) -> LearnedTemplate:
+    """Create a template from auto-detected parameters"""
     h, w = key_bgr.shape[:2]
     bin_key = preprocess_binary_for_detection(key_bgr)
-    centers = find_bubble_centers(bin_key, min_area, max_area, min_circ)
-
-    id_centers, q_centers, _ = detect_bubble_regions(centers, w, h)
-
-    id_grid = build_grid(id_centers, rows=id_rows, cols=id_digits)
-    q_grid = build_grid(q_centers, rows=num_q, cols=num_choices)
-
-    if id_grid is None:
-        raise ValueError("فشل تعلم شبكة الكود")
-    if q_grid is None:
-        raise ValueError("فشل تعلم شبكة الأسئلة")
-
-    template = LearnedTemplate(
-        ref_bgr=key_bgr, ref_w=w, ref_h=h,
-        id_grid=id_grid, q_grid=q_grid,
-        num_q=num_q, num_choices=num_choices,
-        id_rows=id_rows, id_digits=id_digits
+    centers = find_bubble_centers_smart(bin_key, min_area, max_area, min_circ)
+    
+    id_centers, q_centers, _ = detect_bubble_regions_smart(centers, w, h, left_boundary_percent)
+    
+    id_grid = build_grid_smart(id_centers, params.id_rows, params.id_digits)
+    q_grid = build_grid_smart(q_centers, params.num_questions, params.num_choices)
+    
+    if not id_grid or not q_grid:
+        raise ValueError("فشل بناء Template")
+    
+    return LearnedTemplate(
+        ref_bgr=key_bgr,
+        ref_w=w,
+        ref_h=h,
+        id_grid=id_grid,
+        q_grid=q_grid,
+        num_q=params.num_questions,
+        num_choices=params.num_choices,
+        id_rows=params.id_rows,
+        id_digits=params.id_digits
     )
 
-    dbg = {
-        "bin_key": bin_key,
-        "centers": centers,
-        "id_centers": id_centers,
-        "q_centers": q_centers
-    }
-    return template, dbg
 
-
-def extract_answer_key(template: LearnedTemplate,
-                       blank_mean_thresh: float,
-                       diff_thresh: float,
-                       choices: List[str]) -> Tuple[Dict[int, str], pd.DataFrame]:
-
-    gray = cv2.cvtColor(template.ref_bgr, cv2.COLOR_BGR2GRAY)
-    rows_dbg = []
-    key = {}
-
-    for r in range(template.q_grid.rows):
-        means = []
-        for c in range(template.q_grid.cols):
-            cx, cy = template.q_grid.centers[r, c]
-            means.append(mean_darkness(gray, int(cx), int(cy), win=18))
-
-        ans, status = pick_by_darkness(means, choices, blank_mean_thresh, diff_thresh)
-        if status == "OK":
-            key[r + 1] = ans
-
-        rows_dbg.append([r + 1, ans, status] + [round(m, 1) for m in means])
-
-    df_dbg = pd.DataFrame(rows_dbg, columns=["Q", "Picked", "Status"] + choices)
-    return key, df_dbg
-
-
-def read_student_id(template: LearnedTemplate,
-                    gray: np.ndarray,
-                    blank_mean_thresh: float,
-                    diff_thresh: float) -> Tuple[str, pd.DataFrame]:
-
+def read_student_id(template: LearnedTemplate, gray: np.ndarray,
+                   blank_thresh: float, diff_thresh: float) -> Tuple[str, pd.DataFrame]:
     digits = []
     dbg_rows = []
-
+    
     for c in range(template.id_grid.cols):
         means = []
         for r in range(template.id_grid.rows):
             cx, cy = template.id_grid.centers[r, c]
-            means.append(mean_darkness(gray, int(cx), int(cy), win=16))
-
+            means.append(mean_darkness_smart(gray, int(cx), int(cy), win=16))
+        
         labels = [str(i) for i in range(template.id_grid.rows)]
-        digit, status = pick_by_darkness(means, labels, blank_mean_thresh, diff_thresh)
+        digit, status, _ = pick_answer_smart(means, labels, blank_thresh, diff_thresh)
         digits.append(digit if status == "OK" else "X")
-
+        
         dbg_rows.append([c + 1, digit, status] + [round(m, 1) for m in means])
-
-    df_dbg = pd.DataFrame(dbg_rows, columns=["DigitCol", "Picked", "Status"] + [str(i) for i in range(template.id_rows)])
+    
+    df_dbg = pd.DataFrame(dbg_rows, columns=["Digit", "Pick", "Status"] + 
+                         [str(i) for i in range(template.id_rows)])
     return "".join(digits), df_dbg
 
 
-def read_student_answers(template: LearnedTemplate,
-                         gray: np.ndarray,
-                         blank_mean_thresh: float,
-                         diff_thresh: float,
-                         choices: List[str]) -> pd.DataFrame:
-
+def read_student_answers(template: LearnedTemplate, gray: np.ndarray,
+                        blank_thresh: float, diff_thresh: float,
+                        choices: List[str]) -> pd.DataFrame:
     rows_out = []
     for r in range(template.q_grid.rows):
         means = []
         for c in range(template.q_grid.cols):
             cx, cy = template.q_grid.centers[r, c]
-            means.append(mean_darkness(gray, int(cx), int(cy), win=18))
-
-        ans, status = pick_by_darkness(means, choices, blank_mean_thresh, diff_thresh)
+            means.append(mean_darkness_smart(gray, int(cx), int(cy), win=18))
+        
+        ans, status, _ = pick_answer_smart(means, choices, blank_thresh, diff_thresh)
         rows_out.append([r + 1, ans, status] + [round(m, 1) for m in means])
-
-    return pd.DataFrame(rows_out, columns=["Q", "Picked", "Status"] + choices)
+    
+    return pd.DataFrame(rows_out, columns=["Q", "Pick", "Status"] + choices)
 
 
 # ==============================
 # Streamlit app
 # ==============================
 def main():
-    st.set_page_config(page_title="🤖 Smart OMR - Auto Detect", layout="wide")
-    st.title("🤖 OMR ذكي - يكتشف كل شيء تلقائياً!")
+    st.set_page_config(page_title="🧠 Smart OMR - Human-Like Intelligence", layout="wide")
+    st.title("🧠 OMR ذكي - يفكر مثل الإنسان!")
     
-    st.info("🎯 **جديد!** الآن النظام يكتشف تلقائياً: عدد الأسئلة، عدد الخيارات، خانات الكود، والإجابات الصحيحة!")
+    st.success("✨ **جديد!** النظام الآن يحلل الأنسر بنفس طريقة البشر - دقة عالية جداً!")
 
-    # Mode selection
-    mode = st.radio(
-        "اختر طريقة العمل:",
-        ["🤖 اكتشاف تلقائي (Smart)", "⚙️ إعدادات يدوية (Manual)"],
-        horizontal=True
-    )
-
+    # File uploads
     col1, col2, col3 = st.columns(3)
     with col1:
-        roster_file = st.file_uploader("📋 ملف الطلاب (Excel/CSV)", type=["xlsx", "xls", "csv"])
+        roster_file = st.file_uploader("📋 ملف الطلاب", type=["xlsx", "xls", "csv"])
     with col2:
-        key_file = st.file_uploader("🔑 Answer Key (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
+        key_file = st.file_uploader("🔑 Answer Key", type=["pdf", "png", "jpg", "jpeg"])
     with col3:
-        sheets_file = st.file_uploader("📚 أوراق الطلاب (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
+        sheets_file = st.file_uploader("📚 أوراق الطلاب", type=["pdf", "png", "jpg", "jpeg"])
 
     st.markdown("---")
 
-    # DPI setting (always needed)
+    # Settings
     dpi = st.slider("DPI (جودة المسح)", 150, 400, 250, 10)
 
-    # Detection parameters (for both modes)
-    with st.expander("⚙️ إعدادات اكتشاف الفقاعات - **هام جداً!**", expanded=True):
-        st.warning("⚠️ إذا كان عدد الفقاعات المكتشفة ناقص، عدّل هذه الإعدادات:")
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            min_area = st.number_input("min_area (كلما قل = يكشف فقاعات أصغر)", 20, 2000, 80, 10,
-                                      help="الحد الأدنى لمساحة الفقاعة - قلله إذا كانت الفقاعات صغيرة")
-        with d2:
-            max_area = st.number_input("max_area (كلما كبر = يكشف فقاعات أكبر)", 1000, 30000, 10000, 500,
-                                      help="الحد الأقصى لمساحة الفقاعة - زوده إذا كانت الفقاعات كبيرة")
-        with d3:
-            min_circ = st.slider("min_circularity (كلما قل = يقبل أشكال أقل استدارة)", 0.30, 0.95, 0.45, 0.01,
-                               help="يقيس مدى استدارة الشكل - قلله إذا كانت الفقاعات بيضاوية")
-        
-        st.info("💡 **نصيحة:** ابدأ بتقليل min_area إلى 70-80 وmin_circularity إلى 0.40-0.45")
-    
-    # NEW: Adjustable left boundary
-    with st.expander("✂️ إعدادات فصل أرقام الأسئلة", expanded=True):
-        st.info("🎯 هذا الإعداد يتحكم في الخط الفاصل بين أرقام الأسئلة (1-10) وخيارات الإجابة (ABCD)")
-        left_boundary_percent = st.slider(
-            "موضع الخط الفاصل (نسبة من عرض الصفحة)",
-            5.0, 20.0, 8.0, 0.5,
-            help="زود القيمة لتجاهل المزيد من اليسار، قللها لتجاهل أقل"
-        )
-        st.write(f"الخط الفاصل حالياً عند: **{left_boundary_percent}%** من عرض الصفحة")
+    with st.expander("⚙️ إعدادات اكتشاف الفقاعات", expanded=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            min_area = st.number_input("min_area", 20, 2000, 70, 5)
+        with col2:
+            max_area = st.number_input("max_area", 1000, 30000, 10000, 500)
+        with col3:
+            min_circ = st.slider("min_circularity", 0.30, 0.95, 0.40, 0.01)
 
-    # Reading parameters
     with st.expander("✅ إعدادات قراءة التظليل"):
-        r1, r2 = st.columns(2)
-        with r1:
-            blank_mean_thresh = st.slider("Blank threshold (كلما قل = يقرأ تظليل أخف)", 120, 240, 185, 1,
-                                         help="الفقاعة تعتبر فارغة إذا كان متوسط الظلام أكبر من هذه القيمة")
-        with r2:
-            diff_thresh = st.slider("Diff threshold (كلما قل = يقبل فروق أقل)", 3, 60, 8, 1,
-                                   help="الفرق المطلوب بين أغمق فقاعة والثانية لاعتبارها مظللة بوضوح")
+        col1, col2 = st.columns(2)
+        with col1:
+            blank_thresh = st.slider("Blank threshold", 120, 240, 185, 1)
+        with col2:
+            diff_thresh = st.slider("Diff threshold", 3, 60, 8, 1)
 
-    debug = st.checkbox("🔍 عرض تفاصيل Debug", value=True)
+    with st.expander("✂️ إعدادات فصل أرقام الأسئلة"):
+        left_boundary = st.slider("موضع الخط الفاصل (%)", 5.0, 20.0, 8.0, 0.5)
 
-    # Manual mode settings
-    if mode == "⚙️ إعدادات يدوية (Manual)":
-        st.subheader("📝 إعدادات يدوية")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            id_rows = st.number_input("صفوف الكود (0-9)", 10, 15, 10, 1)
-        with c2:
-            id_digits = st.number_input("خانات الكود", 1, 12, 4, 1)
-        with c3:
-            num_q = st.number_input("عدد الأسئلة", 1, 200, 10, 1)
-        with c4:
-            num_choices = st.selectbox("عدد الخيارات", [4, 5, 6], index=0)
+    debug = st.checkbox("🔍 عرض Debug", value=True)
 
     if not (roster_file and key_file and sheets_file):
-        st.info("📤 ارفع الملفات الثلاثة حتى يبدأ البرنامج")
+        st.info("📤 ارفع الملفات الثلاثة للبدء")
         return
 
-    # Load Answer Key
+    # Load answer key
     key_bytes = read_bytes(key_file)
     key_pages = load_pages(key_bytes, key_file.name, dpi=int(dpi))
     if not key_pages:
@@ -816,304 +727,149 @@ def main():
         return
     key_bgr = pil_to_bgr(key_pages[0])
 
-    # AUTO-DETECT MODE
-    if mode == "🤖 اكتشاف تلقائي (Smart)":
-        st.markdown("---")
-        st.subheader("🔍 جاري الكشف التلقائي...")
-        
-        try:
-            with st.spinner("⏳ يتم تحليل ورقة الإجابة النموذجية..."):
-                auto_params, debug_df = auto_detect_from_answer_key(
-                    key_bgr,
-                    min_area=int(min_area),
-                    max_area=int(max_area),
-                    min_circ=float(min_circ),
-                    blank_thresh=float(blank_mean_thresh),
-                    diff_thresh=float(diff_thresh),
-                    left_boundary_percent=float(left_boundary_percent)
-                )
-            
-            # Display detected parameters
-            st.success("✅ تم الكشف التلقائي بنجاح!")
-            
-            conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}
-            st.metric("مستوى الثقة", f"{conf_color[auto_params.confidence]} {auto_params.confidence.upper()}")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("عدد الأسئلة", auto_params.num_questions)
-            with col2:
-                st.metric("عدد الخيارات", auto_params.num_choices)
-            with col3:
-                st.metric("خانات الكود", auto_params.id_digits)
-            with col4:
-                st.metric("صفوف الكود", auto_params.id_rows)
-            
-            with st.expander("📋 ملاحظات الكشف التلقائي", expanded=True):
-                for note in auto_params.detection_notes:
-                    st.write(note)
-            
-            # Show answer key with better formatting
-            st.subheader("🔑 الإجابات الصحيحة المكتشفة:")
-            if len(auto_params.answer_key) > 0:
-                # Display as a nice formatted dict
-                key_display = " | ".join([f"Q{q}: {ans}" for q, ans in sorted(auto_params.answer_key.items())])
-                st.success(key_display)
-                
-                # Show detailed detection table
-                with st.expander("📊 جدول تفصيلي لقراءة كل سؤال (الأقل = المظلل)", expanded=True):
-                    st.dataframe(debug_df, use_container_width=True, height=400)
-                    st.info("💡 **نصيحة:** العمود 'Darkest' يجب أن يكون أقل من 'Blank threshold' للإجابات الصحيحة")
-                
-                # Visual representation of answer key
-                if debug:
-                    with st.expander("🖼️ تصور مرئي للكشف", expanded=True):
-                        # Show original with detected regions
-                        vis = key_bgr.copy()
-                        
-                        # Draw all detected centers
-                        bin_key = preprocess_binary_for_detection(key_bgr)
-                        all_centers = find_bubble_centers(bin_key, int(min_area), int(max_area), float(min_circ))
-                        id_ctrs, q_ctrs, reg_debug = detect_bubble_regions(all_centers, key_bgr.shape[1], key_bgr.shape[0], float(left_boundary_percent))
-                        
-                        # Draw ID bubbles in RED
-                        for (x, y) in id_ctrs:
-                            cv2.circle(vis, (int(x), int(y)), 8, (0, 0, 255), 2)
-                        
-                        # Draw Question bubbles in GREEN
-                        for (x, y) in q_ctrs:
-                            cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 0), 2)
-                        
-                        # Draw filtered bubbles (question numbers) in GRAY
-                        all_xs = all_centers[:, 0]
-                        left_bound = reg_debug.get("left_boundary", 0.08 * key_bgr.shape[1])
-                        filtered = all_centers[all_xs <= left_bound]
-                        for (x, y) in filtered:
-                            cv2.circle(vis, (int(x), int(y)), 8, (128, 128, 128), 2)
-                        
-                        # Draw boundary line
-                        cv2.line(vis, (int(left_bound), 0), (int(left_bound), key_bgr.shape[0]), (255, 0, 255), 3)
-                        cv2.putText(vis, f"Boundary", (int(left_bound) + 5, 30), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-                        
-                        # Add text labels
-                        cv2.putText(vis, f"ID: {id_ctrs.shape[0]}/{auto_params.id_rows * auto_params.id_digits}", (10, 30), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        cv2.putText(vis, f"Q: {q_ctrs.shape[0]}/{auto_params.num_questions * auto_params.num_choices}", (10, 60), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        cv2.putText(vis, f"Filtered: {filtered.shape[0]}", (10, 90), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
-                        
-                        # Show missing count
-                        q_missing = (auto_params.num_questions * auto_params.num_choices) - q_ctrs.shape[0]
-                        if q_missing > 0:
-                            cv2.putText(vis, f"Missing: {q_missing} bubbles!", (10, 90), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.image(bgr_to_rgb(key_bgr), caption="Answer Key الأصلي", use_container_width=True)
-                        with col2:
-                            st.image(bgr_to_rgb(vis), caption="المناطق المكتشفة: 🔴 ID | 🟢 أسئلة", use_container_width=True)
-                        
-                        missing_info = f"📊 توزيع الفقاعات: ID={id_ctrs.shape[0]} | Questions={q_ctrs.shape[0]} | Filtered={filtered.shape[0]} | Total={all_centers.shape[0]}"
-                        if q_missing > 0:
-                            st.error(f"{missing_info} | ⚠️ ناقص {q_missing} فقاعة!")
-                            st.warning("🔧 **لإصلاح المشكلة:** قلل min_area إلى 80-100 أو قلل min_circularity إلى 0.45")
-                        else:
-                            st.success(missing_info)
-                        
-                        st.info("🔵 **الألوان:** 🔴 الكود | 🟢 الأسئلة | ⚪ أرقام الأسئلة (مُتجاهلة) | 🟣 الخط الفاصل")
-                        
-                        # Show binary image for debugging
-                        st.image(bin_key, caption="الصورة الثنائية (Binary) - الفقاعات تظهر بيضاء", use_container_width=True)
-                        st.info("💡 تحقق من الصورة الثنائية: هل كل الفقاعات تظهر بوضوح؟")
-            else:
-                st.error("❌ لم يتم اكتشاف أي إجابات مظللة!")
-                st.warning("🔧 **حلول مقترحة:**")
-                st.write("1. قلل قيمة **Blank threshold** (حالياً:", blank_mean_thresh, ")")
-                st.write("2. قلل قيمة **Diff threshold** (حالياً:", diff_thresh, ")")
-                st.write("3. تأكد أن الأنسر مظلل بقلم رصاص أسود غامق")
-                st.write("4. تأكد أن جودة الصورة عالية (DPI حالياً:", dpi, ")")
-                
-                # Show the detection table anyway
-                st.subheader("📊 جدول القراءة (للتشخيص):")
-                st.dataframe(debug_df, use_container_width=True, height=400)
-                st.info("💡 ابحث عن السطور التي 'Darkest' فيها أقل رقم - هذه المفروض تكون المظللة")
-            
-            choices = list("ABCDEFGHIJ"[:auto_params.num_choices])
-            
-            # Use detected parameters
-            id_rows = auto_params.id_rows
-            id_digits = auto_params.id_digits
-            num_q = auto_params.num_questions
-            num_choices = auto_params.num_choices
-            answer_key = auto_params.answer_key
-            
-            # Show warning if no answers detected
-            if len(answer_key) == 0:
-                st.error("⚠️ لا يمكن المتابعة بدون إجابات صحيحة. عدّل الإعدادات أو استخدم الوضع اليدوي.")
-                return
-            
-            # Show warning if confidence is low
-            if auto_params.confidence == "low":
-                st.warning("⚠️ مستوى الثقة منخفض! يُنصح بمراجعة النتائج أو استخدام الوضع اليدوي.")
-            
-        except Exception as e:
-            st.error(f"❌ فشل الكشف التلقائي: {e}")
-            st.info("💡 جرب تعديل معايير الكشف أو استخدم الوضع اليدوي")
-            return
-    
-    # MANUAL MODE
-    else:
-        try:
-            choices = list("ABCDEF"[:int(num_choices)])
-            template, dbg = learn_template(
-                key_bgr,
-                id_rows=int(id_rows), id_digits=int(id_digits),
-                num_q=int(num_q), num_choices=int(num_choices),
-                min_area=int(min_area), max_area=int(max_area), min_circ=float(min_circ)
-            )
-            st.success("✅ تم تعلم القالب (يدوي)")
-            
-            answer_key, df_key_dbg = extract_answer_key(
-                template,
-                blank_mean_thresh=float(blank_mean_thresh),
-                diff_thresh=float(diff_thresh),
-                choices=choices
-            )
-            st.write("🔑 Answer Key:")
-            st.write(answer_key)
-            
-            if debug:
-                with st.expander("🔍 Debug: Answer Key"):
-                    st.image(bgr_to_rgb(key_bgr), caption="Answer Key", width=800)
-                    st.dataframe(df_key_dbg, width=800, height=400)
-                    
-        except Exception as e:
-            st.error(f"❌ فشل التعلم اليدوي: {e}")
-            return
-
-    # Load Roster
-    try:
-        roster = load_roster(roster_file, id_digits=int(id_digits))
-        st.success(f"✅ تم تحميل قائمة الطلاب: {len(roster)} طالب")
-    except Exception as e:
-        st.error(f"❌ خطأ في ملف الطلاب: {e}")
-        return
-
-    # Grade Students
+    # Smart auto-detection
     st.markdown("---")
-    if st.button("🚀 ابدأ التصحيح", type="primary", use_container_width=True):
-        sheets_bytes = read_bytes(sheets_file)
-        pages = load_pages(sheets_bytes, sheets_file.name, dpi=int(dpi))
-        if not pages:
-            st.error("❌ فشل قراءة أوراق الطلاب")
-            return
-
-        # Build template for manual mode
-        if mode == "⚙️ إعدادات يدوية (Manual)":
-            try:
-                template, _ = learn_template(
-                    key_bgr, int(id_rows), int(id_digits),
-                    int(num_q), int(num_choices),
-                    int(min_area), int(max_area), float(min_circ)
-                )
-            except Exception as e:
-                st.error(f"❌ خطأ في بناء القالب: {e}")
-                return
+    st.subheader("🧠 التحليل الذكي للأنسر...")
+    
+    try:
+        with st.spinner("⏳ جاري التحليل بذكاء..."):
+            params, debug_df, vis_img = auto_detect_smart(
+                key_bgr,
+                min_area=int(min_area),
+                max_area=int(max_area),
+                min_circ=float(min_circ),
+                blank_thresh=float(blank_thresh),
+                diff_thresh=float(diff_thresh),
+                left_boundary_percent=float(left_boundary)
+            )
+        
+        st.success("✅ تم التحليل بنجاح!")
+        
+        # Display results
+        conf_colors = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+        st.metric("مستوى الثقة", f"{conf_colors[params.confidence]} {params.confidence.upper()}")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("الأسئلة", params.num_questions)
+        with col2:
+            st.metric("الخيارات", params.num_choices)
+        with col3:
+            st.metric("خانات الكود", params.id_digits)
+        with col4:
+            st.metric("الإجابات", len(params.answer_key))
+        
+        with st.expander("📋 تفاصيل الكشف", expanded=True):
+            for note in params.detection_notes:
+                st.write(note)
+        
+        # Show answer key
+        st.subheader("🔑 الإجابات الصحيحة:")
+        if params.answer_key:
+            ans_display = " | ".join([f"Q{q}: **{a}**" for q, a in sorted(params.answer_key.items())])
+            st.success(ans_display)
+            
+            with st.expander("📊 جدول التحليل التفصيلي", expanded=True):
+                st.dataframe(debug_df, use_container_width=True, height=400)
+                st.info("💡 العمود 'Darkest' = أغمق فقاعة | 'Diff' = الفرق مع الثانية")
         else:
-            # Build template from auto-detected params
-            try:
-                template, _ = learn_template(
-                    key_bgr, id_rows, id_digits,
-                    num_q, num_choices,
-                    int(min_area), int(max_area), float(min_circ)
-                )
-            except Exception as e:
-                st.error(f"❌ خطأ في بناء القالب: {e}")
+            st.error("❌ لم يتم استخراج إجابات!")
+            st.dataframe(debug_df, use_container_width=True)
+        
+        # Visualization
+        if debug:
+            with st.expander("🎨 التصور المرئي", expanded=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.image(bgr_to_rgb(key_bgr), caption="الأصلي", use_container_width=True)
+                with col2:
+                    st.image(bgr_to_rgb(vis_img), caption="المناطق المكتشفة", use_container_width=True)
+                st.info("🔴 الكود | 🟢 الأسئلة | ⚪ أرقام متجاهلة | 🟣 الخط الفاصل")
+        
+        if not params.answer_key:
+            st.error("لا يمكن المتابعة بدون إجابات")
+            return
+        
+        # Load roster
+        try:
+            roster = load_roster(roster_file, params.id_digits)
+            st.success(f"✅ قائمة الطلاب: {len(roster)}")
+        except Exception as e:
+            st.error(f"❌ خطأ: {e}")
+            return
+        
+        # Grading
+        st.markdown("---")
+        if st.button("🚀 ابدأ التصحيح", type="primary", use_container_width=True):
+            sheets_bytes = read_bytes(sheets_file)
+            pages = load_pages(sheets_bytes, sheets_file.name, dpi=int(dpi))
+            
+            if not pages:
+                st.error("❌ فشل قراءة الأوراق")
                 return
-
-        results = []
-        debug_samples = []
-
-        prog = st.progress(0)
-        for i, pil_page in enumerate(pages, start=1):
-            page_bgr = pil_to_bgr(pil_page)
-            aligned, ok, good_matches = orb_align(page_bgr, template.ref_bgr)
-
-            gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
-
-            student_code, df_id_dbg = read_student_id(
-                template, gray,
-                float(blank_mean_thresh), float(diff_thresh)
+            
+            # Create template
+            template = create_template_from_params(
+                key_bgr, params, int(min_area), int(max_area), 
+                float(min_circ), float(left_boundary)
             )
-            student_code = str(student_code).zfill(int(id_digits))
-            student_name = roster.get(student_code, "غير موجود")
-
-            df_ans = read_student_answers(
-                template, gray,
-                float(blank_mean_thresh), float(diff_thresh),
-                choices
+            
+            choices = list("ABCDEFGHIJ"[:params.num_choices])
+            results = []
+            
+            prog = st.progress(0)
+            for i, pil_page in enumerate(pages, 1):
+                page_bgr = pil_to_bgr(pil_page)
+                aligned, ok, matches = orb_align(page_bgr, template.ref_bgr)
+                gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+                
+                student_code, _ = read_student_id(template, gray, float(blank_thresh), float(diff_thresh))
+                student_code = str(student_code).zfill(params.id_digits)
+                student_name = roster.get(student_code, "غير موجود")
+                
+                df_ans = read_student_answers(template, gray, float(blank_thresh), float(diff_thresh), choices)
+                
+                correct = sum(1 for _, row in df_ans.iterrows() 
+                            if int(row["Q"]) in params.answer_key 
+                            and row["Status"] == "OK" 
+                            and row["Pick"] == params.answer_key[int(row["Q"])])
+                
+                total = len(params.answer_key)
+                pct = (correct / total * 100) if total else 0
+                status = "ناجح ✓" if pct >= 50 else "راسب ✗"
+                
+                results.append({
+                    "page": i,
+                    "aligned": ok,
+                    "matches": matches,
+                    "code": student_code,
+                    "name": student_name,
+                    "score": correct,
+                    "total": total,
+                    "percentage": round(pct, 2),
+                    "status": status
+                })
+                
+                prog.progress(i / len(pages))
+            
+            df_results = pd.DataFrame(results)
+            st.success("✅ اكتمل التصحيح!")
+            st.dataframe(df_results, use_container_width=True, height=420)
+            
+            # Download
+            out = io.BytesIO()
+            df_results.to_excel(out, index=False, engine="openpyxl")
+            st.download_button(
+                "⬇️ تحميل النتائج",
+                data=out.getvalue(),
+                file_name="results_smart.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
             )
-
-            correct = 0
-            total = len(answer_key)
-            for _, row in df_ans.iterrows():
-                q = int(row["Q"])
-                if q not in answer_key:
-                    continue
-                if row["Status"] != "OK":
-                    continue
-                if row["Picked"] == answer_key[q]:
-                    correct += 1
-
-            pct = (correct / total * 100.0) if total else 0.0
-            status = "ناجح ✓" if pct >= 50 else "راسب ✗"
-
-            results.append({
-                "page": i,
-                "aligned_ok": ok,
-                "good_matches": good_matches,
-                "student_code": student_code,
-                "student_name": student_name,
-                "score": correct,
-                "total": total,
-                "percentage": round(pct, 2),
-                "status": status,
-            })
-
-            if debug and len(debug_samples) < 2:
-                debug_samples.append((i, aligned, df_id_dbg, df_ans))
-
-            prog.progress(int(i / len(pages) * 100))
-
-        df_res = pd.DataFrame(results)
-        st.success("✅ اكتمل التصحيح!")
-        st.dataframe(df_res, use_container_width=True, height=420)
-
-        # Download results
-        out = io.BytesIO()
-        df_res.to_excel(out, index=False, engine="openpyxl")
-        st.download_button(
-            "⬇️ تحميل النتائج Excel",
-            data=out.getvalue(),
-            file_name="results_smart_omr.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-        # Debug samples
-        if debug and debug_samples:
-            st.markdown("---")
-            st.header("🔍 Debug Samples")
-            for page_no, aligned, df_id_dbg, df_ans in debug_samples:
-                with st.expander(f"صفحة {page_no}"):
-                    st.image(bgr_to_rgb(aligned), caption="Aligned", width=800)
-                    st.subheader("ID Detection")
-                    st.dataframe(df_id_dbg, width=800)
-                    st.subheader("Answers Detection")
-                    st.dataframe(df_ans, width=800, height=400)
+    
+    except Exception as e:
+        st.error(f"❌ خطأ: {e}")
+        st.info("💡 جرب تعديل الإعدادات")
 
 
 if __name__ == "__main__":
