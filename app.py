@@ -7,6 +7,7 @@
 """
 import io
 import base64
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 import cv2
@@ -192,10 +193,26 @@ Q3: [X] A [●] B [ ] C [ ] D
 
 **الحالة 4: أكثر من فقاعة مظللة بدون X:**
 ```
-Q4: [●] A [●] B [ ] C [ ] D
-→ غير واضح - خذ الأولى
-→ الإجابة: A ⚠️
-→ Note: "Q4 has multiple answers"
+Q4: [●●] A [●] B [ ] C [ ] D
+     أكثر   أقل
+     ظلام   ظلام
+→ قارن درجة التظليل
+→ الإجابة: A (الأكثر قتامة) ✅
+```
+
+**⚠️ معايير المقارنة عند وجود أكثر من إجابة:**
+1. **احسب درجة القتامة** لكل فقاعة مظللة
+2. اختر الفقاعة **الأكثر قتامة/تظليلاً**
+3. إذا كانت متساوية، خذ الأولى
+4. أضف ملاحظة: "Q4: multiple answers - selected darkest"
+
+**مثال مقارنة:**
+```
+Q5: [██] A [▓] B [ ] C [ ] D
+    100%  70%
+→ A أكثر قتامة
+→ الإجابة: A ✅
+→ Note: "Q5 had multiple marks - selected darkest (A)"
 ```
 
 **الحالة 5: لا شيء مظلل:**
@@ -632,6 +649,7 @@ def main():
             
             progress = st.progress(0)
             status = st.empty()
+            results_container = st.container()
             
             results = []
             unmatched_codes = []
@@ -663,13 +681,29 @@ def main():
                     # Process EACH page in the file
                     for page_idx, page in enumerate(pages):
                         current_page += 1
-                        status.text(f"📝 صفحة {current_page}/{total_pages} - ملف: {f.name} (صفحة {page_idx+1}/{len(pages)})")
+                        
+                        # Update status frequently to prevent timeout
+                        status.text(f"📝 معالجة صفحة {current_page}/{total_pages}")
                         progress.progress(current_page / total_pages)
+                        
+                        # Small delay to prevent rate limiting
+                        if current_page > 1:
+                            time.sleep(0.5)  # Half second between requests
                         
                         bgr = pil_to_bgr(page)
                         img = bgr_to_bytes(bgr)
                         
+                        status.text(f"🤖 تحليل صفحة {current_page} بالـ AI...")
+                        
                         res = analyze_with_ai(img, api_key, False)
+                        
+                        if not res.success:
+                            st.warning(f"⚠️ صفحة {current_page}: فشل التحليل - {', '.join(res.notes)}")
+                            continue
+                        
+                        if not res.student_code:
+                            st.warning(f"⚠️ صفحة {current_page}: لم يتم العثور على كود الطالب")
+                            continue
                         
                         if res.success and res.student_code:
                             st_code = res.student_code.strip()
@@ -710,6 +744,11 @@ def main():
                                             st.info(f"ℹ️ صفحة {current_page} ({student.name}): {note}")
                                 
                                 status.text(f"✅ صفحة {current_page}: {st_code} - {student.name} ({score}/{total})")
+                                
+                                # Update live results display
+                                with results_container:
+                                    if len(results) % 5 == 0:  # Update every 5 students
+                                        st.info(f"📊 تم حتى الآن: {len(results)} طالب | متوسط: {np.mean([r.percentage for r in results]):.1f}%")
                             else:
                                 unmatched_codes.append(st_code)
                                 st.warning(f"⚠️ صفحة {current_page}: الكود {st_code} غير موجود في القائمة")
