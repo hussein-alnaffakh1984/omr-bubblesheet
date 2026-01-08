@@ -123,10 +123,11 @@ def find_bubble_centers(bin_img: np.ndarray,
 # ==============================
 # 🆕 Smart Region Detection
 # ==============================
-def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray, Dict]:
+def detect_bubble_regions(centers: np.ndarray, w: int, h: int, 
+                         left_boundary_percent: float = 8.0) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
     Automatically detect ID and Question regions using clustering
-    Filters out question numbers on the far left
+    Filters out question numbers on the far left using manual boundary
     Returns: (id_centers, q_centers, debug_info)
     """
     if centers.shape[0] < 20:
@@ -151,44 +152,12 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
         "y_median": y_mid
     }
     
+    # Use manual boundary setting
+    left_boundary = (left_boundary_percent / 100.0) * w
+    
     # More precise splitting using better boundaries
     # ID section: typically top-right
     id_mask = (xs > 0.6 * w) & (ys < 0.5 * h)
-    
-    # Questions section: Find the leftmost answer bubble, not the question numbers
-    # Strategy: Question numbers are isolated on far left, answer bubbles form a dense cluster
-    # Let's find where the main cluster starts
-    
-    # Get left half bubbles
-    left_bubbles = centers[(xs < x_mid) & (ys > 0.4 * h)]
-    
-    if left_bubbles.shape[0] > 0:
-        # Sort by x position
-        left_xs = np.sort(left_bubbles[:, 0])
-        
-        # Find the gap between question numbers and answer bubbles
-        # Question numbers are typically 1-10 bubbles on far left
-        # Then there's a gap, then answer bubbles (40-60 bubbles) start
-        
-        if len(left_xs) > 15:
-            # Look at x-position differences
-            x_diffs = np.diff(left_xs)
-            
-            # Find the largest gap in first 30% of bubbles (should be between Q nums and answers)
-            search_range = min(15, len(x_diffs) // 3)
-            if search_range > 0:
-                max_gap_idx = np.argmax(x_diffs[:search_range])
-                # The boundary should be after this gap
-                left_boundary = (left_xs[max_gap_idx] + left_xs[max_gap_idx + 1]) / 2
-            else:
-                left_boundary = 0.08 * w
-        else:
-            left_boundary = 0.08 * w
-    else:
-        left_boundary = 0.08 * w
-    
-    # Make sure boundary is reasonable
-    left_boundary = max(0.05 * w, min(left_boundary, 0.15 * w))
     
     # Questions section: after the boundary, in left half
     right_boundary = 0.5 * w  # Questions are in left half
@@ -204,17 +173,16 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
     
     if q_centers.shape[0] < 20:
         # More lenient
-        left_boundary = 0.08 * w
         q_centers = centers[(xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)]
     
     if q_centers.shape[0] < 20:
-        # Last resort: quadrant-based but still filter obvious left edge
-        left_boundary = 0.05 * w
+        # Last resort: quadrant-based but still filter left edge
         q_centers = centers[(xs > left_boundary) & (xs < x_mid) & (ys > y_mid)]
     
     debug["id_count"] = id_centers.shape[0]
     debug["q_count"] = q_centers.shape[0]
     debug["left_boundary"] = left_boundary
+    debug["left_boundary_percent"] = left_boundary_percent
     debug["filtered_out"] = centers.shape[0] - id_centers.shape[0] - q_centers.shape[0]
     debug["id_expected_multiples"] = [30, 40, 50, 60, 70, 80]
     debug["q_expected_multiples"] = [40, 50, 60]
@@ -449,7 +417,8 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
                                  max_area: int = 9000,
                                  min_circ: float = 0.55,
                                  blank_thresh: float = 170,
-                                 diff_thresh: float = 12) -> Tuple[AutoDetectedParams, pd.DataFrame]:
+                                 diff_thresh: float = 12,
+                                 left_boundary_percent: float = 8.0) -> Tuple[AutoDetectedParams, pd.DataFrame]:
     """
     Automatically detect ALL parameters from answer key image
     Returns: (params, debug_dataframe)
@@ -466,12 +435,12 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
     
     notes.append(f"✓ تم اكتشاف {centers.shape[0]} فقاعة إجمالاً")
     
-    # Detect regions
-    id_centers, q_centers, region_debug = detect_bubble_regions(centers, w, h)
+    # Detect regions with manual boundary
+    id_centers, q_centers, region_debug = detect_bubble_regions(centers, w, h, left_boundary_percent)
     notes.append(f"✓ منطقة الكود: {id_centers.shape[0]} فقاعة")
     notes.append(f"✓ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
     notes.append(f"✓ فقاعات متجاهلة (أرقام الأسئلة): {region_debug['filtered_out']}")
-    notes.append(f"  → الحد الفاصل التلقائي: {region_debug['left_boundary']:.1f} بكسل")
+    notes.append(f"  → الحد الفاصل: {region_debug['left_boundary_percent']}% ({region_debug['left_boundary']:.1f} بكسل)")
     
     # Estimate ID grid dimensions
     id_rows_est, id_cols_est, id_conf = estimate_grid_dimensions(id_centers, is_questions=False)
@@ -789,16 +758,26 @@ def main():
         st.warning("⚠️ إذا كان عدد الفقاعات المكتشفة ناقص، عدّل هذه الإعدادات:")
         d1, d2, d3 = st.columns(3)
         with d1:
-            min_area = st.number_input("min_area (كلما قل = يكشف فقاعات أصغر)", 20, 2000, 100, 10,
+            min_area = st.number_input("min_area (كلما قل = يكشف فقاعات أصغر)", 20, 2000, 80, 10,
                                       help="الحد الأدنى لمساحة الفقاعة - قلله إذا كانت الفقاعات صغيرة")
         with d2:
             max_area = st.number_input("max_area (كلما كبر = يكشف فقاعات أكبر)", 1000, 30000, 10000, 500,
                                       help="الحد الأقصى لمساحة الفقاعة - زوده إذا كانت الفقاعات كبيرة")
         with d3:
-            min_circ = st.slider("min_circularity (كلما قل = يقبل أشكال أقل استدارة)", 0.30, 0.95, 0.50, 0.01,
+            min_circ = st.slider("min_circularity (كلما قل = يقبل أشكال أقل استدارة)", 0.30, 0.95, 0.45, 0.01,
                                help="يقيس مدى استدارة الشكل - قلله إذا كانت الفقاعات بيضاوية")
         
-        st.info("💡 **نصيحة:** ابدأ بتقليل min_area إلى 80-90 إذا كان عدد الفقاعات ناقص")
+        st.info("💡 **نصيحة:** ابدأ بتقليل min_area إلى 70-80 وmin_circularity إلى 0.40-0.45")
+    
+    # NEW: Adjustable left boundary
+    with st.expander("✂️ إعدادات فصل أرقام الأسئلة", expanded=True):
+        st.info("🎯 هذا الإعداد يتحكم في الخط الفاصل بين أرقام الأسئلة (1-10) وخيارات الإجابة (ABCD)")
+        left_boundary_percent = st.slider(
+            "موضع الخط الفاصل (نسبة من عرض الصفحة)",
+            5.0, 20.0, 8.0, 0.5,
+            help="زود القيمة لتجاهل المزيد من اليسار، قللها لتجاهل أقل"
+        )
+        st.write(f"الخط الفاصل حالياً عند: **{left_boundary_percent}%** من عرض الصفحة")
 
     # Reading parameters
     with st.expander("✅ إعدادات قراءة التظليل"):
@@ -850,7 +829,8 @@ def main():
                     max_area=int(max_area),
                     min_circ=float(min_circ),
                     blank_thresh=float(blank_mean_thresh),
-                    diff_thresh=float(diff_thresh)
+                    diff_thresh=float(diff_thresh),
+                    left_boundary_percent=float(left_boundary_percent)
                 )
             
             # Display detected parameters
@@ -894,7 +874,7 @@ def main():
                         # Draw all detected centers
                         bin_key = preprocess_binary_for_detection(key_bgr)
                         all_centers = find_bubble_centers(bin_key, int(min_area), int(max_area), float(min_circ))
-                        id_ctrs, q_ctrs, reg_debug = detect_bubble_regions(all_centers, key_bgr.shape[1], key_bgr.shape[0])
+                        id_ctrs, q_ctrs, reg_debug = detect_bubble_regions(all_centers, key_bgr.shape[1], key_bgr.shape[0], float(left_boundary_percent))
                         
                         # Draw ID bubbles in RED
                         for (x, y) in id_ctrs:
