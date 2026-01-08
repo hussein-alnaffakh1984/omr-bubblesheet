@@ -1,5 +1,9 @@
 # ============================================================
-# OMR BUBBLE SHEET SCANNER - DEBUG / VERIFY EVERY STEP
+# OMR BUBBLE SHEET SCANNER (SCANNER) — DEBUG / VERIFY STEP-BY-STEP
+# ============================================================
+# ✅ يعرض ناتج كل إجراء: Aligned → Binary → ROI → Grid → Fill Tables
+# ✅ يدعم PDF/صور + Multiple student files
+# ✅ إصلاح مشكلة Streamlit getvalue(): نستخدم getbuffer/read بطريقة آمنة
 # ============================================================
 
 import io
@@ -12,6 +16,24 @@ import pandas as pd
 import streamlit as st
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageDraw
+
+
+# ============================================================
+# HELPERS (SAFE FILE READ)
+# ============================================================
+
+def read_uploaded_file_bytes(uploaded_file) -> bytes:
+    """Most compatible way to read bytes from Streamlit UploadedFile."""
+    if uploaded_file is None:
+        return b""
+    try:
+        return uploaded_file.getbuffer().tobytes()
+    except Exception:
+        try:
+            # WARNING: read() can consume the stream; but acceptable if used once per file
+            return uploaded_file.read()
+        except Exception:
+            return b""
 
 
 # ============================================================
@@ -96,24 +118,24 @@ class ImageProcessor:
         return Image.fromarray(rgb)
 
     @staticmethod
-    def preprocess_binary(img_bgr: np.ndarray,
-                          blur_ksize: int = 3,
-                          block_size: int = 21,
-                          C: int = 6) -> np.ndarray:
+    def preprocess_binary(img_bgr: np.ndarray, blur_ksize: int, block_size: int, C: int) -> np.ndarray:
         """
-        returns binary image (white=ink) using THRESH_BINARY_INV
+        Output binary (white=ink) using adaptive threshold, inverted.
         """
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
         if blur_ksize and blur_ksize > 0:
             gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
 
-        # adaptive threshold
-        block_size = block_size if block_size % 2 == 1 else block_size + 1
+        block_size = int(block_size)
+        if block_size % 2 == 0:
+            block_size += 1
+
         binary = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV,
-            block_size, C
+            block_size, int(C)
         )
         return binary
 
@@ -124,9 +146,8 @@ class ImageProcessor:
     @staticmethod
     def align_to_template_warp(img_bgr: np.ndarray, target_w: int, target_h: int) -> Tuple[np.ndarray, bool]:
         """
-        Detect paper boundary as quadrilateral then warp to template size.
-        Returns (warped, ok).
-        For scanner: often helps if there is slight shift/crop.
+        Detect largest 4-point contour (paper) then warp to template size.
+        If not found, fall back to resize.
         """
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -192,6 +213,7 @@ class BubbleDetector:
 
         y1, y2 = mh, h - mh
         x1, x2 = mw, w - mw
+
         if y2 <= y1 or x2 <= x1:
             return 0.0
 
@@ -199,7 +221,6 @@ class BubbleDetector:
         if inner.size == 0:
             return 0.0
 
-        # binary is 0/255: count "ink" as >0
         return float(np.sum(inner > 0) / inner.size)
 
     def detect_answer(self, cells: List[np.ndarray], choices: List[str]) -> Dict:
@@ -213,7 +234,6 @@ class BubbleDetector:
         if top_fill < self.min_fill:
             return {"answer": "?", "status": "BLANK", "fills": fills}
 
-        # double-mark condition
         if second_fill >= self.min_fill and (top_fill / (second_fill + 1e-9)) < self.double_ratio:
             return {"answer": "!", "status": "DOUBLE", "fills": fills}
 
@@ -235,19 +255,17 @@ class GradingEngine:
             return None
         return binary[rect.y:rect.y2, rect.x:rect.x2]
 
-    def extract_id(self, binary: np.ndarray) -> Tuple[str, Dict]:
+    def extract_id(self, binary: np.ndarray) -> Tuple[str, pd.DataFrame]:
         """
-        Returns (id_string, debug_info)
+        Returns (id_string, debug_table).
+        debug_table shows status and fills per row (0..9) for each digit column.
         """
-        dbg = {"ok": False, "reason": "", "digits": [], "fills_table": None}
         if not self.template.id_block:
-            dbg["reason"] = "NO_ID_BLOCK"
-            return "", dbg
+            return "", pd.DataFrame()
 
         roi = self._safe_roi(binary, self.template.id_block)
         if roi is None:
-            dbg["reason"] = "ID_OUT_OF_BOUNDS"
-            return "OUT_OF_BOUNDS", dbg
+            return "OUT_OF_BOUNDS", pd.DataFrame()
 
         rows = int(self.template.id_rows)
         cols = int(self.template.id_digits)
@@ -256,7 +274,7 @@ class GradingEngine:
         cell_w = max(1, self.template.id_block.width // cols)
 
         digits = []
-        fills_rows = []  # for dataframe
+        dbg_rows = []
 
         for col in range(cols):
             col_cells = []
@@ -266,38 +284,29 @@ class GradingEngine:
                 col_cells.append(roi[y1:y2, x1:x2])
 
             res = self.detector.detect_answer(col_cells, [str(i) for i in range(10)])
-            # For ID: if not OK, write X (strict)
             digit = res["answer"] if res["status"] == "OK" else "X"
             digits.append(digit)
 
-            fills_rows.append({
-                "digit_col": col + 1,
-                "status": res["status"],
-                "picked": res["answer"],
-                **{f"r{r}": round(res["fills"][r], 3) for r in range(min(10, len(res["fills"])))}
-            })
+            row_obj = {"digit_col": col + 1, "status": res["status"], "picked": res["answer"]}
+            for r in range(min(10, len(res["fills"]))):
+                row_obj[f"r{r}"] = round(res["fills"][r], 3)
+            dbg_rows.append(row_obj)
 
-        out = "".join(digits)
-        dbg["ok"] = True
-        dbg["digits"] = digits
-        dbg["fills_table"] = pd.DataFrame(fills_rows)
-        return out, dbg
+        return "".join(digits), pd.DataFrame(dbg_rows)
 
     def extract_answers_block(self, binary: np.ndarray, block: QuestionBlock) -> Tuple[Dict[int, Dict], pd.DataFrame]:
-        rect = block.rect
-        roi = self._safe_roi(binary, rect)
+        roi = self._safe_roi(binary, block.rect)
         if roi is None:
             return {}, pd.DataFrame()
 
         rows = int(block.num_rows)
         cols = int(self.template.num_choices)
-
-        cell_h = max(1, rect.height // rows)
-        cell_w = max(1, rect.width // cols)
+        cell_h = max(1, block.rect.height // rows)
+        cell_w = max(1, block.rect.width // cols)
 
         choices = list("ABCDEFGH"[:cols])
-        answers = {}
-        debug_rows = []
+        answers: Dict[int, Dict] = {}
+        dbg = []
 
         q = block.start_q
         for r in range(rows):
@@ -313,26 +322,34 @@ class GradingEngine:
             res = self.detector.detect_answer(row_cells, choices)
             answers[q] = res
 
-            debug_rows.append({
-                "q": q,
-                "status": res["status"],
-                "answer": res["answer"],
-                **{choices[i]: round(res["fills"][i], 3) for i in range(len(choices))}
-            })
+            dbg_row = {"q": q, "status": res["status"], "answer": res["answer"]}
+            for i, ch in enumerate(choices):
+                dbg_row[ch] = round(res["fills"][i], 3)
+            dbg.append(dbg_row)
+
             q += 1
 
-        return answers, pd.DataFrame(debug_rows)
+        return answers, pd.DataFrame(dbg)
 
-    def grade_one(self, binary: np.ndarray, answer_key: Dict[int, str], strict: bool) -> Dict:
-        # Extract all answers
-        all_answers = {}
-        debug_tables = []
-        for b in self.template.q_blocks:
-            ans, dbg = self.extract_answers_block(binary, b)
+    def build_answer_key_from_key_binary(self, key_binary: np.ndarray) -> Tuple[Dict[int, str], List[pd.DataFrame]]:
+        answer_key: Dict[int, str] = {}
+        debug_tables: List[pd.DataFrame] = []
+
+        for block in self.template.q_blocks:
+            ans, dbg = self.extract_answers_block(key_binary, block)
+            debug_tables.append(dbg)
+            for q, res in ans.items():
+                if res["status"] == "OK":
+                    answer_key[q] = res["answer"]
+
+        return answer_key, debug_tables
+
+    def grade_one(self, binary: np.ndarray, answer_key: Dict[int, str], strict: bool) -> Tuple[int, int, float, pd.DataFrame]:
+        # extract all answers
+        all_answers: Dict[int, Dict] = {}
+        for block in self.template.q_blocks:
+            ans, _ = self.extract_answers_block(binary, block)
             all_answers.update(ans)
-            if not dbg.empty:
-                dbg.insert(0, "block", f"{b.start_q}-{b.end_q}")
-                debug_tables.append(dbg)
 
         correct = 0
         total = len(answer_key)
@@ -353,14 +370,7 @@ class GradingEngine:
             per_q.append({"q": q, "key": k, "student": res["answer"], "status": res["status"], "is_correct": is_ok})
 
         pct = (correct / total * 100) if total else 0.0
-
-        return {
-            "score": correct,
-            "total": total,
-            "percentage": pct,
-            "per_question": pd.DataFrame(per_q),
-            "debug_answers_tables": debug_tables
-        }
+        return correct, total, pct, pd.DataFrame(per_q)
 
 
 # ============================================================
@@ -384,11 +394,6 @@ def draw_preview(img: Image.Image, template: Template) -> Image.Image:
     return preview
 
 
-def show_step(title: str, body: str):
-    st.markdown(f"### {title}")
-    st.info(body)
-
-
 def make_rect_from_points(x1, y1, x2, y2) -> Optional[Rectangle]:
     x = int(min(x1, x2))
     y = int(min(y1, y2))
@@ -400,34 +405,31 @@ def make_rect_from_points(x1, y1, x2, y2) -> Optional[Rectangle]:
 
 
 # ============================================================
-# MAIN APP
+# MAIN
 # ============================================================
 
 def main():
-    st.set_page_config(page_title="OMR Debug Scanner", layout="wide")
-
-    st.title("✅ OMR Scanner — Debug خطوة بخطوة")
-    st.caption("نسخة تحقق/تشخيص: نعرض ناتج كل إجراء قبل المتابعة.")
+    st.set_page_config(page_title="OMR Debug (Scanner)", layout="wide")
+    st.title("✅ OMR Bubble Sheet — Debug خطوة بخطوة (Scanner)")
 
     # Session state
     if "template" not in st.session_state:
         st.session_state.template = None
     if "template_img" not in st.session_state:
         st.session_state.template_img = None
+    if "answer_key" not in st.session_state:
+        st.session_state.answer_key = None
 
-    # ------------------------------------------------------------
-    # STEP 1: Upload Template
-    # ------------------------------------------------------------
     st.markdown("---")
-    show_step("1) رفع نموذج البابل شيت (Template)",
-              "ارفع ملف النموذج (PDF أو صورة). سنستخدمه لتحديد مناطق ID وBlocks بدقة.")
+    st.subheader("1) رفع نموذج البابل شيت (Template)")
+    template_file = st.file_uploader("Template (PDF/PNG/JPG)", type=["pdf", "png", "jpg", "jpeg"], key="tpl")
 
-    template_file = st.file_uploader("Template", type=["pdf", "png", "jpg", "jpeg"], key="template")
     if template_file:
-        img = ImageProcessor.load_first_page(template_file.getvalue(), template_file.name, dpi=250)
-        if img:
-            st.session_state.template_img = img
-            w, h = img.size
+        tpl_bytes = read_uploaded_file_bytes(template_file)
+        tpl_img = ImageProcessor.load_first_page(tpl_bytes, template_file.name, dpi=250)
+        if tpl_img:
+            st.session_state.template_img = tpl_img
+            w, h = tpl_img.size
             if st.session_state.template is None:
                 st.session_state.template = Template(w, h)
             else:
@@ -435,17 +437,14 @@ def main():
                 st.session_state.template.height = h
 
             st.success(f"✅ Template جاهز: {w}×{h}")
+            st.image(draw_preview(tpl_img, st.session_state.template), use_container_width=True)
 
     if not st.session_state.template_img:
+        st.info("ارفع Template للبدء.")
         st.stop()
 
-    # ------------------------------------------------------------
-    # STEP 2: Settings + Detector
-    # ------------------------------------------------------------
     st.markdown("---")
-    show_step("2) إعدادات الكشف (Detector)",
-              "هذه الإعدادات تؤثر على اكتشاف التظليل. للسكنر عادة min_fill = 0.08–0.12 ممتاز.")
-
+    st.subheader("2) إعدادات الكشف (Detector + Binary)")
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         num_choices = st.selectbox("عدد الخيارات", [4, 5, 6], index=0)
@@ -458,14 +457,6 @@ def main():
     with c5:
         margin = st.slider("margin", 0.05, 0.35, 0.15, 0.01)
 
-    st.session_state.template.num_choices = int(num_choices)
-    st.session_state.template.id_digits = int(id_digits)
-    st.session_state.template.id_rows = int(id_rows)
-
-    detector = BubbleDetector(min_fill=min_fill, margin=margin)
-
-    # Preprocess tunings
-    st.markdown("#### إعدادات التحويل إلى Binary (Threshold)")
     p1, p2, p3 = st.columns(3)
     with p1:
         blur_k = st.selectbox("Gaussian blur", [0, 3, 5], index=1)
@@ -474,15 +465,26 @@ def main():
     with p3:
         C = st.selectbox("Adaptive C", [2, 4, 6, 8, 10], index=2)
 
-    # ------------------------------------------------------------
-    # STEP 3: Define Regions (Coordinates)
-    # ------------------------------------------------------------
-    st.markdown("---")
-    show_step("3) تحديد المناطق (ID + Blocks)",
-              "حدد المناطق بإحداثيات (x1,y1) و (x2,y2). بعد الحفظ سنعرض Preview للتأكد.")
+    use_warp = st.checkbox("استخدم Warp قبل القصّ (مفيد إذا يوجد قص/إزاحة بالسكنر)", value=True)
+    strict = st.checkbox("وضع صارم: BLANK/DOUBLE لا تُحسب", value=False)
 
-    preview = draw_preview(st.session_state.template_img, st.session_state.template)
-    st.image(preview, caption="Template Preview", use_container_width=True)
+    st.session_state.template.num_choices = int(num_choices)
+    st.session_state.template.id_digits = int(id_digits)
+    st.session_state.template.id_rows = int(id_rows)
+
+    detector = BubbleDetector(min_fill=min_fill, margin=margin)
+    engine = GradingEngine(st.session_state.template, detector)
+
+    def align(img_bgr: np.ndarray) -> Tuple[np.ndarray, bool]:
+        if use_warp:
+            return ImageProcessor.align_to_template_warp(img_bgr, st.session_state.template.width, st.session_state.template.height)
+        return ImageProcessor.resize_to_template(img_bgr, st.session_state.template.width, st.session_state.template.height), True
+
+    st.markdown("---")
+    st.subheader("3) تحديد المناطق (ID + Blocks)")
+    st.caption("استخدم Paint للحصول على الإحداثيات (x1,y1) و(x2,y2) لنفس أبعاد الـTemplate.")
+
+    st.image(draw_preview(st.session_state.template_img, st.session_state.template), caption="Preview", use_container_width=True)
 
     mode = st.radio("نوع المنطقة", ["ID", "Q_BLOCK"], horizontal=True)
 
@@ -493,11 +495,10 @@ def main():
         with b:
             end_q = st.number_input("إلى سؤال", 1, 500, 20)
         with c:
-            num_rows = st.number_input("عدد الصفوف", 1, 200, 20)
+            num_rows_block = st.number_input("عدد الصفوف", 1, 200, 20)
     else:
-        start_q = end_q = num_rows = 0
+        start_q, end_q, num_rows_block = 0, 0, 0
 
-    st.markdown("**ادخل الإحداثيات:**")
     colL, colR = st.columns(2)
     with colL:
         x1 = st.number_input("x1", 0, st.session_state.template.width, 0, 10)
@@ -520,7 +521,7 @@ def main():
                 st.session_state.template.id_block = rect
                 st.success("✅ تم حفظ منطقة ID")
             else:
-                qb = QuestionBlock(rect=rect, start_q=int(start_q), end_q=int(end_q), num_rows=int(num_rows))
+                qb = QuestionBlock(rect=rect, start_q=int(start_q), end_q=int(end_q), num_rows=int(num_rows_block))
                 st.session_state.template.q_blocks.append(qb)
                 st.success(f"✅ تم حفظ Block: Q{start_q}-{end_q}")
             st.rerun()
@@ -534,105 +535,30 @@ def main():
             r = b.rect
             colA, colB = st.columns([4, 1])
             with colA:
-                st.success(f"Block {i}: Q{b.start_q}-{b.end_q} | ({r.x},{r.y}) → ({r.x2},{r.y2})")
+                st.success(f"Block {i}: Q{b.start_q}-{b.end_q} | ({r.x},{r.y}) → ({r.x2},{r.y2}) | rows={b.num_rows}")
             with colB:
                 if st.button("🗑️ حذف", key=f"del_{i}"):
                     st.session_state.template.q_blocks.pop(i - 1)
                     st.rerun()
 
-    # ------------------------------------------------------------
-    # STEP 4: Upload roster + key + student sheets
-    # ------------------------------------------------------------
-    st.markdown("---")
-    show_step("4) رفع الملفات (Roster + Key + Sheets)",
-              "رفع قائمة الطلاب + نموذج الإجابات + أوراق الطلاب. (PDF أو صور).")
+    if not st.session_state.template.id_block or not st.session_state.template.q_blocks:
+        st.warning("لازم تحدد ID وBlock واحد على الأقل قبل رفع الملفات.")
+        st.stop()
 
+    st.markdown("---")
+    st.subheader("4) رفع الملفات (Roster + Key + Sheets)")
     c1, c2, c3 = st.columns(3)
     with c1:
         roster_file = st.file_uploader("📋 Roster (xlsx/csv)", type=["xlsx", "xls", "csv"], key="roster")
     with c2:
         key_file = st.file_uploader("🔑 Answer Key (pdf/jpg/png)", type=["pdf", "png", "jpg", "jpeg"], key="key")
     with c3:
-        sheets_files = st.file_uploader("📚 Student Sheets (pdf/images) - multiple",
-                                        type=["pdf", "png", "jpg", "jpeg"],
-                                        accept_multiple_files=True,
-                                        key="sheets")
+        sheets_files = st.file_uploader("📚 Student Sheets (multiple)", type=["pdf", "png", "jpg", "jpeg"],
+                                        accept_multiple_files=True, key="sheets")
 
-    strict = st.checkbox("وضع صارم: BLANK/DOUBLE لا تُحسب", value=False)
-
-    # Alignment choice
-    st.markdown("#### محاذاة السكنر")
-    use_warp = st.checkbox("استخدم Warp (Perspective) قبل القصّ", value=True)
-    st.caption("لو الـROI طالع بمكان غلط، فعل Warp. للسكنر غالبًا يفيد إذا يوجد قص/إزاحة بسيطة.")
-
-    # ------------------------------------------------------------
-    # STEP 5: VERIFY PIPELINE ON KEY & ONE SHEET
-    # ------------------------------------------------------------
-    st.markdown("---")
-    show_step("5) تحقق خطوة بخطوة قبل التصحيح النهائي",
-              "سنطبق المعالجة ونعرض (Aligned → Binary → ID ROI → Q ROI → fills) حتى تتأكد أنها صحيحة.")
-
-    # Validate minimum
-    if not (st.session_state.template.id_block and st.session_state.template.q_blocks):
-        st.warning("لازم تحدد ID وBlock واحد على الأقل قبل الفحص.")
-        st.stop()
-
-    engine = GradingEngine(st.session_state.template, detector)
-
-    def align(img_bgr: np.ndarray) -> Tuple[np.ndarray, bool]:
-        if use_warp:
-            warped, ok = ImageProcessor.align_to_template_warp(img_bgr, st.session_state.template.width, st.session_state.template.height)
-            return warped, ok
-        return ImageProcessor.resize_to_template(img_bgr, st.session_state.template.width, st.session_state.template.height), True
-
-    # --- Verify KEY
-    if key_file:
-        st.markdown("### 🔎 فحص نموذج الإجابة (Key)")
-        key_img = ImageProcessor.load_first_page(key_file.getvalue(), key_file.name, dpi=250)
-        if key_img:
-            key_bgr = ImageProcessor.pil_to_bgr(key_img)
-            key_aligned, ok_warp = align(key_bgr)
-            key_binary = ImageProcessor.preprocess_binary(key_aligned, blur_ksize=blur_k, block_size=block_size, C=C)
-
-            colA, colB = st.columns(2)
-            with colA:
-                st.image(ImageProcessor.bgr_to_pil(key_aligned), caption=f"Aligned (warp_ok={ok_warp})", use_container_width=True)
-            with colB:
-                st.image(key_binary, caption="Binary", clamp=True, use_container_width=True)
-
-            # Show ROIs
-            r = st.session_state.template.id_block
-            roi_id = key_binary[r.y:r.y2, r.x:r.x2]
-            st.image(roi_id, caption="ID ROI (Key)", clamp=True, use_container_width=True)
-
-            b0 = st.session_state.template.q_blocks[0].rect
-            roi_q = key_binary[b0.y:b0.y2, b0.x:b0.x2]
-            st.image(roi_q, caption="Q Block ROI (Key)", clamp=True, use_container_width=True)
-
-            # Extract key answers (debug table)
-            answer_key = {}
-            key_debug_tables = []
-            for b in st.session_state.template.q_blocks:
-                ans, dbg = engine.extract_answers_block(key_binary, b)
-                key_debug_tables.append(dbg)
-                for q, res in ans.items():
-                    if res["status"] == "OK":
-                        answer_key[q] = res["answer"]
-
-            st.success(f"✅ استخرجت {len(answer_key)} إجابة صحيحة من Key")
-            with st.expander("عرض جدول fills لنموذج الإجابة (Key)"):
-                for i, dbg in enumerate(key_debug_tables, 1):
-                    st.write(f"Block {i}")
-                    st.dataframe(dbg, use_container_width=True)
-
-            st.session_state["answer_key"] = answer_key
-        else:
-            st.error("فشل تحميل Key.")
-
-    # --- Load roster (verify)
-    roster_dict = {}
+    # -------- ROSTER LOAD (WITH ZFILL) --------
+    roster_dict: Dict[str, str] = {}
     if roster_file:
-        st.markdown("### 🔎 فحص قائمة الطلاب (Roster)")
         try:
             if roster_file.name.endswith((".xlsx", ".xls")):
                 df = pd.read_excel(roster_file)
@@ -648,21 +574,61 @@ def main():
                 df["student_name"] = df["student_name"].astype(str).str.strip()
                 roster_dict = dict(zip(df["student_code"], df["student_name"]))
                 st.success(f"✅ roster جاهز: {len(roster_dict)} طالب")
-                st.dataframe(df.head(10), use_container_width=True)
+                with st.expander("عرض أول 10 صفوف من roster"):
+                    st.dataframe(df.head(10), use_container_width=True)
         except Exception as e:
             st.error(f"❌ خطأ roster: {e}")
 
-    # --- Verify on first student sheet (one sample)
-    if sheets_files:
-        st.markdown("### 🔎 فحص ورقة طالب (Sample) قبل التصحيح")
-        sample = sheets_files[0]
-        pages = ImageProcessor.load_all_pages(sample.getvalue(), sample.name, dpi=250)
-        if pages:
-            st.write(f"الملف: {sample.name} | عدد الصفحات: {len(pages)} (نستخدم أول صفحة للفحص)")
+    # -------- KEY VERIFY + BUILD ANSWER KEY --------
+    if key_file:
+        st.markdown("---")
+        st.subheader("5) فحص نموذج الإجابة (Key) — خطوة بخطوة")
 
+        key_bytes = read_uploaded_file_bytes(key_file)
+        key_img = ImageProcessor.load_first_page(key_bytes, key_file.name, dpi=250)
+        if key_img:
+            key_bgr = ImageProcessor.pil_to_bgr(key_img)
+            key_aligned, ok_warp = align(key_bgr)
+            key_binary = ImageProcessor.preprocess_binary(key_aligned, blur_ksize=int(blur_k), block_size=int(block_size), C=int(C))
+
+            colA, colB = st.columns(2)
+            with colA:
+                st.image(ImageProcessor.bgr_to_pil(key_aligned), caption=f"Aligned (warp_ok={ok_warp})", use_container_width=True)
+            with colB:
+                st.image(key_binary, caption="Binary", clamp=True, use_container_width=True)
+
+            # ROIs
+            r = st.session_state.template.id_block
+            st.image(key_binary[r.y:r.y2, r.x:r.x2], caption="ID ROI (Key)", clamp=True, use_container_width=True)
+
+            b0 = st.session_state.template.q_blocks[0].rect
+            st.image(key_binary[b0.y:b0.y2, b0.x:b0.x2], caption="Q Block ROI (Key)", clamp=True, use_container_width=True)
+
+            answer_key, key_debug_tables = engine.build_answer_key_from_key_binary(key_binary)
+            st.session_state.answer_key = answer_key
+
+            st.success(f"✅ تم استخراج {len(answer_key)} إجابة صحيحة من Key")
+            with st.expander("تفاصيل fills للـKey (لكل Block)"):
+                for i, dbg in enumerate(key_debug_tables, 1):
+                    st.write(f"Block {i}")
+                    st.dataframe(dbg, use_container_width=True)
+        else:
+            st.error("❌ فشل تحميل Key")
+
+    # -------- SAMPLE SHEET VERIFY --------
+    if sheets_files:
+        st.markdown("---")
+        st.subheader("6) فحص ورقة طالب (Sample) — خطوة بخطوة")
+
+        sample = sheets_files[0]
+        sample_bytes = read_uploaded_file_bytes(sample)
+        pages = ImageProcessor.load_all_pages(sample_bytes, sample.name, dpi=250)
+
+        if pages:
+            st.write(f"الملف: {sample.name} | الصفحات: {len(pages)} (نستخدم أول صفحة)")
             stud_bgr = ImageProcessor.pil_to_bgr(pages[0])
             stud_aligned, ok_warp = align(stud_bgr)
-            stud_binary = ImageProcessor.preprocess_binary(stud_aligned, blur_ksize=blur_k, block_size=block_size, C=C)
+            stud_binary = ImageProcessor.preprocess_binary(stud_aligned, blur_ksize=int(blur_k), block_size=int(block_size), C=int(C))
 
             colA, colB = st.columns(2)
             with colA:
@@ -670,7 +636,6 @@ def main():
             with colB:
                 st.image(stud_binary, caption="Binary", clamp=True, use_container_width=True)
 
-            # ROIs
             r = st.session_state.template.id_block
             roi_id = stud_binary[r.y:r.y2, r.x:r.x2]
             st.image(roi_id, caption="ID ROI (Student)", clamp=True, use_container_width=True)
@@ -679,79 +644,84 @@ def main():
             roi_q = stud_binary[b0.y:b0.y2, b0.x:b0.x2]
             st.image(roi_q, caption="Q Block ROI (Student)", clamp=True, use_container_width=True)
 
-            # Extract ID with fills table
             sid, id_dbg = engine.extract_id(stud_binary)
             sid_z = sid.zfill(st.session_state.template.id_digits) if sid.isdigit() else sid
+
             st.success(f"🆔 ID المستخرج: {sid_z}")
+            with st.expander("تفاصيل ID (fills لكل عمود)"):
+                if id_dbg is not None and not id_dbg.empty:
+                    st.dataframe(id_dbg, use_container_width=True)
+                else:
+                    st.write("لا يوجد جدول (قد يكون OUT_OF_BOUNDS أو مشكلة بالـID ROI).")
 
-            if isinstance(id_dbg.get("fills_table"), pd.DataFrame) and not id_dbg["fills_table"].empty:
-                with st.expander("تفاصيل ID (fills لكل عمود)"):
-                    st.dataframe(id_dbg["fills_table"], use_container_width=True)
-
-            # Extract answers debug
-            for i, b in enumerate(st.session_state.template.q_blocks, 1):
-                _, dbg = engine.extract_answers_block(stud_binary, b)
-                with st.expander(f"تفاصيل Block {i} (Q{b.start_q}-{b.end_q})"):
+            # Answer blocks debug
+            for i, block in enumerate(st.session_state.template.q_blocks, 1):
+                _, dbg = engine.extract_answers_block(stud_binary, block)
+                with st.expander(f"تفاصيل Block {i} (Q{block.start_q}-{block.end_q})"):
                     st.dataframe(dbg, use_container_width=True)
 
-            # Name matching
-            if roster_dict and sid_z in roster_dict:
-                st.success(f"✅ الاسم مطابق في roster: {roster_dict[sid_z]}")
-            elif roster_dict:
-                st.warning("⚠️ لم يتم إيجاد الاسم في roster (تأكد من zfill وعدد خانات الكود)")
+            # Roster match
+            if roster_dict:
+                if sid_z in roster_dict:
+                    st.success(f"✅ الاسم: {roster_dict[sid_z]}")
+                else:
+                    st.warning("⚠️ لم يتم العثور على الاسم في roster — تأكد من عدد خانات الكود (zfill) وتحديد منطقة ID.")
         else:
-            st.error("لا يمكن قراءة ورقة الطالب.")
+            st.error("❌ لا يمكن قراءة صفحات Sample")
 
-    # ------------------------------------------------------------
-    # STEP 6: FINAL GRADING (after user confirms)
-    # ------------------------------------------------------------
+    # -------- FINAL GRADING --------
     st.markdown("---")
-    show_step("6) التصحيح النهائي (بعد ما تتأكد أن كل شيء صحيح)",
-              "إذا نتائج الفحص أعلاه صحيحة (ROI صحيح + ID صحيح + Key صحيح) اضغط تصحيح.")
+    st.subheader("7) التصحيح النهائي لكل الأوراق")
 
-    can_grade = bool(st.session_state.get("answer_key")) and bool(roster_dict) and bool(sheets_files)
-    if not can_grade:
-        st.warning("لا يمكن التصحيح: تأكد من رفع Key + Roster + Sheets، وأن Key استُخرج بنجاح.")
+    if not st.session_state.answer_key:
+        st.warning("ارفع Key أولاً وتأكد أنه استخرج الإجابات.")
+        st.stop()
+    if not roster_dict:
+        st.warning("ارفع Roster صحيحاً (student_code, student_name).")
+        st.stop()
+    if not sheets_files:
+        st.warning("ارفع أوراق الطلاب.")
         st.stop()
 
-    if st.button("🚀 ابدأ التصحيح لكل الأوراق", type="primary", use_container_width=True):
-        answer_key = st.session_state["answer_key"]
+    if st.button("🚀 ابدأ التصحيح", type="primary", use_container_width=True):
+        answer_key = st.session_state.answer_key
         results = []
 
         for f in sheets_files:
-            pages = ImageProcessor.load_all_pages(f.getvalue(), f.name, dpi=250)
+            f_bytes = read_uploaded_file_bytes(f)
+            pages = ImageProcessor.load_all_pages(f_bytes, f.name, dpi=250)
+
             for page_idx, pil_page in enumerate(pages, 1):
                 img_bgr = ImageProcessor.pil_to_bgr(pil_page)
                 aligned, ok_warp = align(img_bgr)
-                binary = ImageProcessor.preprocess_binary(aligned, blur_ksize=blur_k, block_size=block_size, C=C)
+                binary = ImageProcessor.preprocess_binary(aligned, blur_ksize=int(blur_k), block_size=int(block_size), C=int(C))
 
                 sid, _ = engine.extract_id(binary)
                 sid_z = sid.zfill(st.session_state.template.id_digits) if sid.isdigit() else sid
                 name = roster_dict.get(sid_z, "غير موجود")
 
-                g = engine.grade_one(binary, answer_key, strict=strict)
+                score, total, pct, _ = engine.grade_one(binary, answer_key, strict=strict)
 
                 results.append({
                     "file": f.name,
                     "page": page_idx,
                     "student_code": sid_z,
                     "student_name": name,
-                    "score": g["score"],
-                    "total": g["total"],
-                    "percentage": round(g["percentage"], 2),
-                    "passed": "ناجح" if g["percentage"] >= 50 else "راسب"
+                    "score": score,
+                    "total": total,
+                    "percentage": round(pct, 2),
+                    "passed": "ناجح" if pct >= 50 else "راسب"
                 })
 
         df_res = pd.DataFrame(results)
         st.success("✅ اكتمل التصحيح")
-        st.dataframe(df_res, use_container_width=True, height=350)
+        st.dataframe(df_res, use_container_width=True, height=420)
 
-        # Export
         buf = io.BytesIO()
         df_res.to_excel(buf, index=False, engine="openpyxl")
         st.download_button(
             "⬇️ تحميل النتائج Excel",
-            buf.getvalue(),
+            data=buf.getvalue(),
             file_name="omr_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
