@@ -186,24 +186,30 @@ class ImageProcessor:
         h, w = img.shape[:2]
         
         # تصحيح انحراف بسيط
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        lines = cv2.HoughLines(edges, 1, np.pi/180, 100)
-        
-        if lines is not None and len(lines) > 5:
-            angles = []
-            for rho, theta in lines[:20]:
-                angle = (theta - np.pi/2) * 180 / np.pi
-                if abs(angle) < 10:
-                    angles.append(angle)
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            lines = cv2.HoughLines(edges, 1, np.pi/180, 100)
             
-            if angles:
-                median_angle = np.median(angles)
-                if abs(median_angle) > 0.3:
-                    center = (w // 2, h // 2)
-                    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-                    img = cv2.warpAffine(img, M, (w, h), 
-                                        borderMode=cv2.BORDER_REPLICATE)
+            if lines is not None and len(lines) > 5:
+                angles = []
+                for line in lines[:20]:
+                    # HoughLines يعيد array ثلاثي الأبعاد
+                    rho, theta = line[0]
+                    angle = (theta - np.pi/2) * 180 / np.pi
+                    if abs(angle) < 10:
+                        angles.append(angle)
+                
+                if angles:
+                    median_angle = np.median(angles)
+                    if abs(median_angle) > 0.3:
+                        center = (w // 2, h // 2)
+                        M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+                        img = cv2.warpAffine(img, M, (w, h), 
+                                            borderMode=cv2.BORDER_REPLICATE)
+        except Exception as e:
+            # إذا فشل التصحيح، نتجاهل ونكمل
+            pass
         
         # تغيير الحجم
         return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
