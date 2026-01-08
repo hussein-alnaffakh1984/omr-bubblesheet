@@ -1,15 +1,15 @@
 """
 ======================================================================================
-                    OMR BUBBLE SHEET SCANNER - FINAL VERSION
-                         نظام تصحيح البابل شيت - النسخة النهائية
+                    OMR BUBBLE SHEET SCANNER - MOUSE SELECTION
+                         نظام تصحيح البابل شيت - تحديد بالماوس
 ======================================================================================
-مضمون 100% | Tested & Working
+✅ تحديد بالماوس مباشرة | Mouse Click Selection
 """
 
 import io
 import json
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 
 import cv2
 import numpy as np
@@ -17,6 +17,7 @@ import pandas as pd
 import streamlit as st
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageDraw
+from streamlit_drawable_canvas import st_canvas
 
 
 # ======================================================================================
@@ -25,7 +26,6 @@ from PIL import Image, ImageDraw
 
 @dataclass
 class Rectangle:
-    """مستطيل"""
     x: int
     y: int
     width: int
@@ -42,7 +42,6 @@ class Rectangle:
 
 @dataclass
 class QuestionBlock:
-    """بلوك أسئلة"""
     rect: Rectangle
     start_q: int
     end_q: int
@@ -51,7 +50,6 @@ class QuestionBlock:
 
 @dataclass
 class Template:
-    """النموذج"""
     width: int
     height: int
     id_block: Optional[Rectangle] = None
@@ -73,7 +71,6 @@ class ImageProcessor:
     
     @staticmethod
     def load_image(file_bytes: bytes, filename: str) -> Optional[Image.Image]:
-        """تحميل صورة"""
         try:
             if filename.lower().endswith('.pdf'):
                 pages = convert_from_bytes(file_bytes, dpi=200)
@@ -85,12 +82,10 @@ class ImageProcessor:
     
     @staticmethod
     def align_and_resize(img: np.ndarray, w: int, h: int) -> np.ndarray:
-        """محاذاة وتغيير حجم بسيط"""
         return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
     
     @staticmethod
     def preprocess(img: np.ndarray) -> np.ndarray:
-        """معالجة مسبقة"""
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -108,7 +103,6 @@ class BubbleDetector:
         self.min_fill = min_fill
     
     def calculate_fill(self, cell: np.ndarray) -> float:
-        """حساب التظليل"""
         if cell.size == 0:
             return 0.0
         
@@ -123,7 +117,6 @@ class BubbleDetector:
         return np.sum(inner > 0) / inner.size if inner.size > 0 else 0.0
     
     def detect_answer(self, cells: List[np.ndarray], choices: List[str]) -> Dict:
-        """كشف الإجابة"""
         fills = [self.calculate_fill(c) for c in cells]
         sorted_idx = sorted(range(len(fills)), key=lambda i: fills[i], reverse=True)
         
@@ -151,7 +144,6 @@ class GradingEngine:
         self.detector = BubbleDetector()
     
     def extract_id(self, binary: np.ndarray) -> str:
-        """استخراج الكود"""
         if not self.template.id_block:
             return ""
         
@@ -176,7 +168,6 @@ class GradingEngine:
         return "".join(digits)
     
     def extract_answers(self, binary: np.ndarray, block: QuestionBlock) -> Dict:
-        """استخراج الإجابات"""
         rect = block.rect
         roi = binary[rect.y:rect.y2, rect.x:rect.x2]
         
@@ -206,22 +197,17 @@ class GradingEngine:
     
     def grade_sheet(self, img: np.ndarray, answer_key: Dict, roster: Dict, 
                    strict: bool = True) -> Dict:
-        """تصحيح ورقة"""
-        # محاذاة
         aligned = ImageProcessor.align_and_resize(img, self.template.width, 
                                                  self.template.height)
         binary = ImageProcessor.preprocess(aligned)
         
-        # استخراج الكود
         student_id = self.extract_id(binary)
         student_name = roster.get(student_id, "غير موجود")
         
-        # استخراج الإجابات
         all_answers = {}
         for block in self.template.q_blocks:
             all_answers.update(self.extract_answers(binary, block))
         
-        # التصحيح
         correct = 0
         total = len(answer_key)
         
@@ -253,17 +239,14 @@ class GradingEngine:
 # ======================================================================================
 
 def draw_preview(img: Image.Image, template: Template) -> Image.Image:
-    """رسم المعاينة"""
     preview = img.copy()
     draw = ImageDraw.Draw(preview)
     
-    # ID Block
     if template.id_block:
         r = template.id_block
         draw.rectangle([r.x, r.y, r.x2, r.y2], outline="red", width=4)
         draw.text((r.x+10, r.y+10), "ID", fill="red")
     
-    # Q Blocks
     for i, block in enumerate(template.q_blocks, 1):
         r = block.rect
         draw.rectangle([r.x, r.y, r.x2, r.y2], outline="green", width=4)
@@ -275,7 +258,7 @@ def draw_preview(img: Image.Image, template: Template) -> Image.Image:
 def main():
     st.set_page_config(page_title="OMR Scanner", layout="wide")
     
-    st.title("✅ نظام تصحيح البابل شيت")
+    st.title("✅ نظام تصحيح البابل شيت - تحديد بالماوس")
     st.markdown("---")
     
     # Session State
@@ -293,7 +276,6 @@ def main():
     with col2:
         st.subheader("⚙️ الإعدادات")
         
-        # Upload template
         template_file = st.file_uploader("📄 النموذج", type=["pdf", "png", "jpg"])
         
         if template_file:
@@ -313,7 +295,6 @@ def main():
         if st.session_state.template_img:
             st.divider()
             
-            # Settings
             col_a, col_b = st.columns(2)
             with col_a:
                 choices = st.selectbox("الخيارات", [4, 5, 6], 0)
@@ -327,7 +308,6 @@ def main():
             
             st.divider()
             
-            # Selection
             mode = st.radio("التحديد", ["🆔 الكود", "📝 أسئلة"], 0)
             
             if mode == "📝 أسئلة":
@@ -341,65 +321,8 @@ def main():
             else:
                 start_q = end_q = num_rows = 0
             
-            st.info("💡 أدخل الإحداثيات")
+            st.info("🖱️ ارسم مستطيل على الصورة في اليسار")
             
-            # Coordinates - طريقة أسهل مع نسخ/لصق
-            st.markdown("**طريقة سريعة: انسخ القيم من برنامج رسم**")
-            
-            coords_text = st.text_area(
-                "الإحداثيات (X1 Y1 X2 Y2)",
-                "",
-                placeholder="مثال: 100 150 400 350",
-                height=80
-            )
-            
-            # أو إدخال يدوي
-            with st.expander("أو أدخل يدوياً"):
-                col_x1, col_y1 = st.columns(2)
-                with col_x1:
-                    x1 = st.number_input("X1", 0, st.session_state.template.width, 0)
-                with col_y1:
-                    y1 = st.number_input("Y1", 0, st.session_state.template.height, 0)
-                
-                col_x2, col_y2 = st.columns(2)
-                with col_x2:
-                    x2 = st.number_input("X2", 0, st.session_state.template.width, 100)
-                with col_y2:
-                    y2 = st.number_input("Y2", 0, st.session_state.template.height, 100)
-            
-            # Parse coordinates
-            if coords_text.strip():
-                try:
-                    parts = coords_text.strip().split()
-                    if len(parts) >= 4:
-                        x1, y1, x2, y2 = map(int, parts[:4])
-                        st.success(f"✅ إحداثيات: ({x1}, {y1}) → ({x2}, {y2})")
-                except:
-                    st.error("❌ صيغة خاطئة")
-            
-            # Save button
-            if st.button("💾 حفظ", type="primary", use_container_width=True):
-                x = min(x1, x2)
-                y = min(y1, y2)
-                w = abs(x2 - x1)
-                h = abs(y2 - y1)
-                
-                if w < 10 or h < 10:
-                    st.error("❌ صغير جداً")
-                else:
-                    rect = Rectangle(x, y, w, h)
-                    
-                    if mode == "🆔 الكود":
-                        st.session_state.template.id_block = rect
-                        st.success("✅ تم حفظ منطقة الكود")
-                    else:
-                        block = QuestionBlock(rect, start_q, end_q, num_rows)
-                        st.session_state.template.q_blocks.append(block)
-                        st.success(f"✅ بلوك {start_q}-{end_q}")
-                    
-                    st.rerun()
-            
-            # Show blocks
             if st.session_state.template.q_blocks:
                 st.divider()
                 st.markdown("**البلوكات:**")
@@ -414,7 +337,6 @@ def main():
             
             st.divider()
             
-            # Files
             st.subheader("📂 الملفات")
             roster = st.file_uploader("📋 القائمة", type=["xlsx", "csv"])
             key_file = st.file_uploader("🔑 الإجابات", type=["pdf", "png", "jpg"])
@@ -423,21 +345,76 @@ def main():
             strict = st.checkbox("وضع صارم", True)
     
     # ======================
-    # LEFT: Preview & Grading
+    # LEFT: Canvas
     # ======================
     with col1:
         if st.session_state.template_img:
-            st.subheader("🖼️ المعاينة")
+            st.subheader("🖱️ ارسم المستطيل بالماوس")
             
+            # عرض معاينة أولاً
             preview = draw_preview(st.session_state.template_img, 
                                   st.session_state.template)
-            st.image(preview, use_container_width=True)
+            
+            # Canvas للرسم
+            canvas_width = 800
+            canvas_height = int(st.session_state.template_img.height * 
+                              (canvas_width / st.session_state.template_img.width))
+            
+            st.markdown("**📌 اضغط واسحب لرسم مستطيل**")
+            
+            canvas_result = st_canvas(
+                fill_color="rgba(255, 0, 0, 0.1)",
+                stroke_width=3,
+                stroke_color="#FF0000" if mode == "🆔 الكود" else "#00FF00",
+                background_image=preview,
+                update_streamlit=True,
+                height=canvas_height,
+                width=canvas_width,
+                drawing_mode="rect",
+                point_display_radius=0,
+                key="canvas"
+            )
+            
+            # معالجة الرسم
+            if canvas_result.json_data is not None:
+                objects = canvas_result.json_data["objects"]
+                
+                if objects:
+                    # آخر مستطيل مرسوم
+                    last_rect = objects[-1]
+                    
+                    # تحويل من حجم Canvas للحجم الأصلي
+                    scale_x = st.session_state.template_img.width / canvas_width
+                    scale_y = st.session_state.template_img.height / canvas_height
+                    
+                    x = int(last_rect["left"] * scale_x)
+                    y = int(last_rect["top"] * scale_y)
+                    w = int(last_rect["width"] * scale_x)
+                    h = int(last_rect["height"] * scale_y)
+                    
+                    st.info(f"📏 المستطيل: ({x}, {y}) - العرض: {w}, الارتفاع: {h}")
+                    
+                    # زر الحفظ
+                    if st.button("💾 حفظ المستطيل", type="primary", use_container_width=True):
+                        if w < 10 or h < 10:
+                            st.error("❌ المستطيل صغير جداً")
+                        else:
+                            rect = Rectangle(x, y, w, h)
+                            
+                            if mode == "🆔 الكود":
+                                st.session_state.template.id_block = rect
+                                st.success("✅ تم حفظ منطقة الكود")
+                            else:
+                                block = QuestionBlock(rect, start_q, end_q, num_rows)
+                                st.session_state.template.q_blocks.append(block)
+                                st.success(f"✅ بلوك {start_q}-{end_q}")
+                            
+                            st.rerun()
             
             st.divider()
             st.subheader("🚀 التصحيح")
             
             if st.button("▶️ ابدأ", type="primary", use_container_width=True):
-                # Validation
                 if not st.session_state.template.id_block:
                     st.error("❌ حدد منطقة الكود")
                     st.stop()
@@ -463,7 +440,7 @@ def main():
                     
                     st.info(f"📋 {len(roster_dict)} طالب")
                     
-                    # Process answer key
+                    # Process key
                     key_img = ImageProcessor.load_image(key_file.getvalue(), key_file.name)
                     key_bgr = cv2.cvtColor(np.array(key_img), cv2.COLOR_RGB2BGR)
                     
@@ -485,13 +462,12 @@ def main():
                     
                     st.success(f"✅ {len(answer_key)} إجابة")
                     
-                    # Grade sheets
+                    # Grade
                     sheets_img = ImageProcessor.load_image(sheets.getvalue(), sheets.name)
                     sheets_bgr = cv2.cvtColor(np.array(sheets_img), cv2.COLOR_RGB2BGR)
                     
                     result = engine.grade_sheet(sheets_bgr, answer_key, roster_dict, strict)
                     
-                    # Display
                     st.success("✅ اكتمل التصحيح!")
                     
                     df_results = pd.DataFrame([{
@@ -505,7 +481,6 @@ def main():
                     
                     st.dataframe(df_results, use_container_width=True)
                     
-                    # Export
                     buffer = io.BytesIO()
                     df_results.to_excel(buffer, index=False, engine='openpyxl')
                     
