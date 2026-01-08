@@ -165,15 +165,65 @@ def analyze_with_ai(image_bytes: bytes, api_key: str, is_answer_key: bool = True
 
 **الجزء الثاني - قراءة الإجابات:**
 1. الأسئلة في **أسفل الورقة**
-2. كل سؤال له فقاعة واحدة مظللة (A, B, C, أو D)
+2. كل سؤال له إجابة واحدة صحيحة (A, B, C, أو D)
 3. **تجاهل أرقام الأسئلة** (1, 2, 3...)
-4. اقرأ فقط الفقاعات المظللة بوضوح
+
+**⚠️ معالجة الحالات الخاصة:**
+
+**الحالة 1: فقاعة واحدة مظللة:**
+```
+Q1: [ ] A [●] B [ ] C [ ] D
+→ الإجابة: B ✅
+```
+
+**الحالة 2: أكثر من فقاعة مظللة + واحدة عليها X:**
+```
+Q2: [●] A [X] B [ ] C [ ] D
+→ B ملغية (عليها X)
+→ الإجابة: A ✅
+```
+
+**الحالة 3: فقاعة مظللة + عليها X:**
+```
+Q3: [X] A [●] B [ ] C [ ] D
+→ A ملغية
+→ الإجابة: B ✅
+```
+
+**الحالة 4: أكثر من فقاعة مظللة بدون X:**
+```
+Q4: [●] A [●] B [ ] C [ ] D
+→ غير واضح - خذ الأولى
+→ الإجابة: A ⚠️
+→ Note: "Q4 has multiple answers"
+```
+
+**الحالة 5: لا شيء مظلل:**
+```
+Q5: [ ] A [ ] B [ ] C [ ] D
+→ لا إجابة
+→ الإجابة: "?" أو تجاهل السؤال
+```
 
 **معايير التظليل:**
-- فقاعة **مظللة بالكامل** = مملوءة ✅
-- فقاعة **نصف مظللة** = تجاهلها ❌
-- فقاعة **فارغة** = تجاهلها ❌
-- فقاعة **بها X** = تجاهلها ❌
+- ✅ فقاعة **مظللة بالكامل** = إجابة
+- ❌ فقاعة **نصف مظللة** = تجاهلها
+- ❌ فقاعة **فارغة** = تجاهلها
+- ❌ فقاعة **عليها X** = **ملغية** (حتى لو مظللة!)
+- ⚠️ **X يلغي الفقاعة تماماً** - ابحث عن الفقاعة الأخرى المظللة
+
+**أولوية المعالجة:**
+1. ابحث عن فقاعة مظللة **بدون X**
+2. إذا وجدت أكثر من واحدة (بدون X)، خذ الأولى
+3. إذا لم تجد أي فقاعة صالحة، ضع "?"
+
+**مثال واقعي:**
+```
+Q6: [●] A [X●] B [ ] C [ ] D
+     مظلل   مظلل+X
+→ B ملغية (عليها X)
+→ الإجابة: A ✅
+```
 
 **أعطني JSON دقيق:**
 ```json
@@ -359,11 +409,17 @@ def grade_student(student_answers: Dict[int, str], answer_key: Dict[int, str]) -
         if is_correct:
             score += 1
         
+        # Flag for review if answer seems problematic
+        flag = ""
+        if student_answer == "?":
+            flag = "⚠️ لا إجابة"
+        
         details.append({
             "Question": q_num,
             "Correct": correct_answer,
             "Student": student_answer,
-            "Status": "✅" if is_correct else "❌"
+            "Status": "✅" if is_correct else "❌",
+            "Flag": flag
         })
     
     return score, total, details
@@ -646,6 +702,13 @@ def main():
                                     percentage=pct,
                                     details=details
                                 ))
+                                
+                                # Show AI notes if any
+                                if res.notes:
+                                    for note in res.notes:
+                                        if note:
+                                            st.info(f"ℹ️ صفحة {current_page} ({student.name}): {note}")
+                                
                                 status.text(f"✅ صفحة {current_page}: {st_code} - {student.name} ({score}/{total})")
                             else:
                                 unmatched_codes.append(st_code)
