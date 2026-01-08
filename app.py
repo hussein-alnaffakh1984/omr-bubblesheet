@@ -56,16 +56,28 @@ class LearnedTemplate:
     ref_bgr: np.ndarray
     ref_w: int
     ref_h: int
-    id_grid: BubbleGrid      # 10x4
-    q_grid: BubbleGrid       # 10x4
+    id_grid: BubbleGrid
+    q_grid: BubbleGrid
     num_q: int
     num_choices: int
     id_rows: int
     id_digits: int
 
 
+@dataclass
+class AutoDetectedParams:
+    """Parameters automatically detected from answer key"""
+    num_questions: int
+    num_choices: int
+    id_digits: int
+    id_rows: int
+    answer_key: Dict[int, str]
+    confidence: str  # "high", "medium", "low"
+    detection_notes: List[str]
+
+
 # ==============================
-# Preprocess for bubble detection (ONLY for finding circles)
+# Preprocess for bubble detection
 # ==============================
 def preprocess_binary_for_detection(bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -109,6 +121,102 @@ def find_bubble_centers(bin_img: np.ndarray,
 
 
 # ==============================
+# 🆕 Smart Region Detection
+# ==============================
+def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """
+    Automatically detect ID and Question regions using clustering
+    Returns: (id_centers, q_centers, debug_info)
+    """
+    if centers.shape[0] < 20:
+        raise ValueError("عدد الفقاعات قليل جداً - تأكد من جودة الصورة")
+    
+    xs = centers[:, 0]
+    ys = centers[:, 1]
+    
+    # Split into quadrants for initial analysis
+    x_mid = np.median(xs)
+    y_mid = np.median(ys)
+    
+    # Count bubbles in each quadrant
+    q1 = np.sum((xs > x_mid) & (ys < y_mid))  # top-right
+    q2 = np.sum((xs < x_mid) & (ys < y_mid))  # top-left
+    q3 = np.sum((xs < x_mid) & (ys > y_mid))  # bottom-left
+    q4 = np.sum((xs > x_mid) & (ys > y_mid))  # bottom-right
+    
+    debug = {
+        "quadrant_counts": {"TR": q1, "TL": q2, "BL": q3, "BR": q4},
+        "x_median": x_mid,
+        "y_median": y_mid
+    }
+    
+    # Typical layout: ID is top-right, Questions are bottom-left
+    # But we'll be flexible
+    id_mask = (xs > 0.55 * w) & (ys < 0.55 * h)
+    q_mask = (xs < 0.55 * w) & (ys > 0.40 * h)
+    
+    id_centers = centers[id_mask]
+    q_centers = centers[q_mask]
+    
+    # Fallback if regions are empty
+    if id_centers.shape[0] < 10:
+        id_centers = centers[(xs > x_mid) & (ys < y_mid)]
+    if q_centers.shape[0] < 10:
+        q_centers = centers[(xs < x_mid) & (ys > y_mid)]
+    
+    debug["id_count"] = id_centers.shape[0]
+    debug["q_count"] = q_centers.shape[0]
+    
+    return id_centers, q_centers, debug
+
+
+# ==============================
+# 🆕 Auto-detect grid dimensions
+# ==============================
+def estimate_grid_dimensions(centers: np.ndarray) -> Tuple[int, int, float]:
+    """
+    Estimate rows and columns by analyzing spacing patterns
+    Returns: (estimated_rows, estimated_cols, confidence)
+    """
+    if centers.shape[0] < 4:
+        return 1, 1, 0.0
+    
+    xs = centers[:, 0]
+    ys = centers[:, 1]
+    
+    # Find typical spacing
+    xs_sorted = np.sort(xs)
+    ys_sorted = np.sort(ys)
+    
+    # Calculate differences
+    x_diffs = np.diff(xs_sorted)
+    y_diffs = np.diff(ys_sorted)
+    
+    # Find modal spacing (most common distance)
+    x_spacing = np.median(x_diffs[x_diffs > 5])
+    y_spacing = np.median(y_diffs[y_diffs > 5])
+    
+    # Estimate dimensions
+    x_range = xs.max() - xs.min()
+    y_range = ys.max() - ys.min()
+    
+    cols = int(round(x_range / x_spacing)) + 1 if x_spacing > 0 else 1
+    rows = int(round(y_range / y_spacing)) + 1 if y_spacing > 0 else 1
+    
+    # Sanity bounds
+    cols = max(1, min(cols, 20))
+    rows = max(1, min(rows, 100))
+    
+    # Confidence based on consistency
+    expected_bubbles = rows * cols
+    actual_bubbles = centers.shape[0]
+    confidence = 1.0 - abs(expected_bubbles - actual_bubbles) / expected_bubbles
+    confidence = max(0.0, min(1.0, confidence))
+    
+    return rows, cols, confidence
+
+
+# ==============================
 # Build grids
 # ==============================
 def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
@@ -123,7 +231,7 @@ def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
 
 
 def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid]:
-    if centers.shape[0] < int(rows * cols * 0.7):
+    if centers.shape[0] < int(rows * cols * 0.6):  # More lenient threshold
         return None
 
     xs = centers[:, 0].astype(np.float32)
@@ -155,24 +263,127 @@ def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid
     return BubbleGrid(centers=grid, rows=rows, cols=cols)
 
 
-def split_id_questions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
-    # ID is TOP-RIGHT, Questions are LOWER-LEFT in your sheet
-    xs = centers[:, 0]
-    ys = centers[:, 1]
+# ==============================
+# ✅ Correct shading measure (GRAY DARKNESS)
+# ==============================
+def mean_darkness(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> float:
+    h, w = gray.shape[:2]
+    x1 = max(0, cx - win)
+    x2 = min(w, cx + win)
+    y1 = max(0, cy - win)
+    y2 = min(h, cy + win)
+    patch = gray[y1:y2, x1:x2]
+    if patch.size == 0:
+        return 255.0
 
-    id_mask = (xs > 0.55 * w) & (ys < 0.55 * h)
-    q_mask  = (xs < 0.55 * w) & (ys > 0.40 * h)
+    ph, pw = patch.shape
+    mh = int(ph * 0.25)
+    mw = int(pw * 0.25)
+    inner = patch[mh:ph - mh, mw:pw - mw]
+    if inner.size == 0:
+        inner = patch
 
-    id_centers = centers[id_mask]
-    q_centers  = centers[q_mask]
+    return float(np.mean(inner))
 
-    # Fallback if masks are strict
-    if id_centers.shape[0] < 25:
-        id_centers = centers[(xs > np.median(xs)) & (ys < np.median(ys))]
-    if q_centers.shape[0] < 25:
-        q_centers = centers[(xs < np.median(xs)) & (ys > np.median(ys))]
 
-    return id_centers, q_centers
+def pick_by_darkness(means: List[float], labels: List[str],
+                     blank_mean_thresh: float, diff_thresh: float) -> Tuple[str, str]:
+    if not means:
+        return "?", "BLANK"
+    
+    idx = np.argsort(means)
+    best = int(idx[0])
+    second = int(idx[1]) if len(idx) > 1 else best
+    best_m = means[best]
+    second_m = means[second]
+
+    if best_m > blank_mean_thresh:
+        return "?", "BLANK"
+    if (second_m - best_m) < diff_thresh:
+        return "!", "DOUBLE"
+    return labels[best], "OK"
+
+
+# ==============================
+# 🆕 AUTO-DETECT ALL PARAMETERS
+# ==============================
+def auto_detect_from_answer_key(key_bgr: np.ndarray,
+                                 min_area: int = 120,
+                                 max_area: int = 9000,
+                                 min_circ: float = 0.55,
+                                 blank_thresh: float = 170,
+                                 diff_thresh: float = 12) -> AutoDetectedParams:
+    """
+    Automatically detect ALL parameters from answer key image
+    """
+    h, w = key_bgr.shape[:2]
+    gray = cv2.cvtColor(key_bgr, cv2.COLOR_BGR2GRAY)
+    bin_key = preprocess_binary_for_detection(key_bgr)
+    centers = find_bubble_centers(bin_key, min_area, max_area, min_circ)
+    
+    notes = []
+    
+    if centers.shape[0] < 20:
+        raise ValueError(f"عدد الفقاعات المكتشفة قليل جداً ({centers.shape[0]}). جرب تعديل min_area/max_area")
+    
+    notes.append(f"✓ تم اكتشاف {centers.shape[0]} فقاعة إجمالاً")
+    
+    # Detect regions
+    id_centers, q_centers, region_debug = detect_bubble_regions(centers, w, h)
+    notes.append(f"✓ منطقة الكود: {id_centers.shape[0]} فقاعة")
+    notes.append(f"✓ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
+    
+    # Estimate ID grid dimensions
+    id_rows_est, id_cols_est, id_conf = estimate_grid_dimensions(id_centers)
+    notes.append(f"✓ تقدير شبكة الكود: {id_rows_est} صفوف × {id_cols_est} أعمدة (ثقة: {id_conf:.1%})")
+    
+    # Estimate Question grid dimensions
+    q_rows_est, q_cols_est, q_conf = estimate_grid_dimensions(q_centers)
+    notes.append(f"✓ تقدير شبكة الأسئلة: {q_rows_est} أسئلة × {q_cols_est} خيارات (ثقة: {q_conf:.1%})")
+    
+    # Build grids with estimated dimensions
+    id_grid = build_grid(id_centers, rows=id_rows_est, cols=id_cols_est)
+    q_grid = build_grid(q_centers, rows=q_rows_est, cols=q_cols_est)
+    
+    if id_grid is None:
+        raise ValueError("فشل بناء شبكة الكود. جرب تعديل معايير الكشف.")
+    if q_grid is None:
+        raise ValueError("فشل بناء شبكة الأسئلة. جرب تعديل معايير الكشف.")
+    
+    # Extract answer key by reading filled bubbles
+    answer_key = {}
+    choices = list("ABCDEFGHIJ"[:q_cols_est])
+    
+    for r in range(q_rows_est):
+        means = []
+        for c in range(q_cols_est):
+            cx, cy = q_grid.centers[r, c]
+            means.append(mean_darkness(gray, int(cx), int(cy), win=18))
+        
+        ans, status = pick_by_darkness(means, choices, blank_thresh, diff_thresh)
+        if status == "OK":
+            answer_key[r + 1] = ans
+    
+    notes.append(f"✓ تم استخراج {len(answer_key)} إجابة صحيحة من {q_rows_est} سؤال")
+    
+    # Determine confidence
+    avg_conf = (id_conf + q_conf) / 2
+    if avg_conf > 0.8 and len(answer_key) > q_rows_est * 0.7:
+        confidence = "high"
+    elif avg_conf > 0.6 and len(answer_key) > q_rows_est * 0.5:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    
+    return AutoDetectedParams(
+        num_questions=q_rows_est,
+        num_choices=q_cols_est,
+        id_digits=id_cols_est,
+        id_rows=id_rows_est,
+        answer_key=answer_key,
+        confidence=confidence,
+        detection_notes=notes
+    )
 
 
 # ==============================
@@ -195,9 +406,11 @@ def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray,
     matches = bf.knnMatch(d1, d2, k=2)
 
     good = []
-    for m, n in matches:
-        if m.distance < 0.75 * n.distance:
-            good.append(m)
+    for pair in matches:
+        if len(pair) == 2:
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
 
     if len(good) < 25:
         return cv2.resize(student_bgr, (w, h)), False, len(good)
@@ -211,45 +424,6 @@ def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray,
 
     warped = cv2.warpPerspective(student_bgr, H, (w, h))
     return warped, True, len(good)
-
-
-# ==============================
-# ✅ Correct shading measure (GRAY DARKNESS)
-# ==============================
-def mean_darkness(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> float:
-    h, w = gray.shape[:2]
-    x1 = max(0, cx - win)
-    x2 = min(w, cx + win)
-    y1 = max(0, cy - win)
-    y2 = min(h, cy + win)
-    patch = gray[y1:y2, x1:x2]
-    if patch.size == 0:
-        return 255.0
-
-    ph, pw = patch.shape
-    mh = int(ph * 0.25)
-    mw = int(pw * 0.25)
-    inner = patch[mh:ph - mh, mw:pw - mw]
-    if inner.size == 0:
-        inner = patch
-
-    # Filled bubble => darker => LOWER mean
-    return float(np.mean(inner))
-
-
-def pick_by_darkness(means: List[float], labels: List[str],
-                     blank_mean_thresh: float, diff_thresh: float) -> Tuple[str, str]:
-    idx = np.argsort(means)  # ascending: darker first
-    best = int(idx[0])
-    second = int(idx[1]) if len(idx) > 1 else best
-    best_m = means[best]
-    second_m = means[second]
-
-    if best_m > blank_mean_thresh:
-        return "?", "BLANK"
-    if (second_m - best_m) < diff_thresh:
-        return "!", "DOUBLE"
-    return labels[best], "OK"
 
 
 # ==============================
@@ -276,7 +450,7 @@ def load_roster(file, id_digits: int) -> Dict[str, str]:
 
 
 # ==============================
-# Learn template from Answer Key
+# Manual template learning (with known params)
 # ==============================
 def learn_template(key_bgr: np.ndarray,
                    id_rows: int, id_digits: int,
@@ -285,17 +459,17 @@ def learn_template(key_bgr: np.ndarray,
 
     h, w = key_bgr.shape[:2]
     bin_key = preprocess_binary_for_detection(key_bgr)
-    centers = find_bubble_centers(bin_key, min_area=min_area, max_area=max_area, min_circularity=min_circ)
+    centers = find_bubble_centers(bin_key, min_area, max_area, min_circ)
 
-    id_centers, q_centers = split_id_questions(centers, w, h)
+    id_centers, q_centers, _ = detect_bubble_regions(centers, w, h)
 
     id_grid = build_grid(id_centers, rows=id_rows, cols=id_digits)
-    q_grid  = build_grid(q_centers, rows=num_q, cols=num_choices)
+    q_grid = build_grid(q_centers, rows=num_q, cols=num_choices)
 
     if id_grid is None:
-        raise ValueError("فشل تعلم شبكة الكود. عدّل min_area/max_area/min_circularity أو ارفع DPI.")
+        raise ValueError("فشل تعلم شبكة الكود")
     if q_grid is None:
-        raise ValueError("فشل تعلم شبكة الأسئلة. عدّل min_area/max_area/min_circularity أو ارفع DPI.")
+        raise ValueError("فشل تعلم شبكة الأسئلة")
 
     template = LearnedTemplate(
         ref_bgr=key_bgr, ref_w=w, ref_h=h,
@@ -352,7 +526,6 @@ def read_student_id(template: LearnedTemplate,
             cx, cy = template.id_grid.centers[r, c]
             means.append(mean_darkness(gray, int(cx), int(cy), win=16))
 
-        # digit labels are 0..9 by rows
         labels = [str(i) for i in range(template.id_grid.rows)]
         digit, status = pick_by_darkness(means, labels, blank_mean_thresh, diff_thresh)
         digits.append(digit if status == "OK" else "X")
@@ -386,8 +559,17 @@ def read_student_answers(template: LearnedTemplate,
 # Streamlit app
 # ==============================
 def main():
-    st.set_page_config(page_title="OMR Auto Learn (Correct ID+Name)", layout="wide")
-    st.title("✅ OMR يتعلّم من الأنسر ويقرأ كود الطالب + الاسم بشكل صحيح")
+    st.set_page_config(page_title="🤖 Smart OMR - Auto Detect", layout="wide")
+    st.title("🤖 OMR ذكي - يكتشف كل شيء تلقائياً!")
+    
+    st.info("🎯 **جديد!** الآن النظام يكتشف تلقائياً: عدد الأسئلة، عدد الخيارات، خانات الكود، والإجابات الصحيحة!")
+
+    # Mode selection
+    mode = st.radio(
+        "اختر طريقة العمل:",
+        ["🤖 اكتشاف تلقائي (Smart)", "⚙️ إعدادات يدوية (Manual)"],
+        horizontal=True
+    )
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -399,105 +581,179 @@ def main():
 
     st.markdown("---")
 
-    # Your known layout defaults
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        dpi = st.slider("DPI", 150, 400, 250, 10)
-    with c2:
-        id_rows = st.number_input("صفوف الكود (0-9)", 10, 15, 10, 1)
-    with c3:
-        id_digits = st.number_input("خانات الكود", 1, 12, 4, 1)
-    with c4:
-        num_q = st.number_input("عدد الأسئلة", 1, 200, 10, 1)
-    with c5:
-        num_choices = st.selectbox("عدد الخيارات", [4, 5, 6], index=0)
+    # DPI setting (always needed)
+    dpi = st.slider("DPI (جودة المسح)", 150, 400, 250, 10)
 
-    choices = list("ABCDEF"[:int(num_choices)])
+    # Detection parameters (for both modes)
+    with st.expander("⚙️ إعدادات اكتشاف الفقاعات"):
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            min_area = st.number_input("min_area", 20, 2000, 120, 10)
+        with d2:
+            max_area = st.number_input("max_area", 1000, 30000, 9000, 500)
+        with d3:
+            min_circ = st.slider("min_circularity", 0.30, 0.95, 0.55, 0.01)
 
-    st.subheader("إعدادات اكتشاف الفقاعات (للتعلّم فقط)")
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        min_area = st.number_input("min_area", 20, 2000, 120, 10)
-    with d2:
-        max_area = st.number_input("max_area", 1000, 30000, 9000, 500)
-    with d3:
-        min_circ = st.slider("min_circularity", 0.30, 0.95, 0.55, 0.01)
+    # Reading parameters
+    with st.expander("✅ إعدادات قراءة التظليل"):
+        r1, r2 = st.columns(2)
+        with r1:
+            blank_mean_thresh = st.slider("Blank threshold", 120, 240, 170, 1)
+        with r2:
+            diff_thresh = st.slider("Diff threshold", 3, 60, 12, 1)
 
-    st.subheader("✅ إعدادات القراءة الصحيحة (Gray Darkness)")
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        blank_mean_thresh = st.slider("Blank mean threshold (أعلى = يعتبر فارغ)", 120, 240, 170, 1)
-    with r2:
-        diff_thresh = st.slider("Diff threshold (أقل = يعتبر مزدوج)", 3, 60, 12, 1)
-    with r3:
-        debug = st.checkbox("Debug", value=True)
+    debug = st.checkbox("🔍 عرض تفاصيل Debug", value=True)
+
+    # Manual mode settings
+    if mode == "⚙️ إعدادات يدوية (Manual)":
+        st.subheader("📝 إعدادات يدوية")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            id_rows = st.number_input("صفوف الكود (0-9)", 10, 15, 10, 1)
+        with c2:
+            id_digits = st.number_input("خانات الكود", 1, 12, 4, 1)
+        with c3:
+            num_q = st.number_input("عدد الأسئلة", 1, 200, 10, 1)
+        with c4:
+            num_choices = st.selectbox("عدد الخيارات", [4, 5, 6], index=0)
 
     if not (roster_file and key_file and sheets_file):
-        st.info("ارفع الملفات الثلاثة حتى يبدأ البرنامج.")
+        st.info("📤 ارفع الملفات الثلاثة حتى يبدأ البرنامج")
         return
 
-    # Load roster (normalize codes to fixed digits)
-    try:
-        roster = load_roster(roster_file, id_digits=int(id_digits))
-        st.success(f"✅ تم تحميل قائمة الطلاب: {len(roster)}")
-    except Exception as e:
-        st.error(f"خطأ ملف الطلاب: {e}")
-        return
-
-    # Load key first page
+    # Load Answer Key
     key_bytes = read_bytes(key_file)
     key_pages = load_pages(key_bytes, key_file.name, dpi=int(dpi))
     if not key_pages:
-        st.error("فشل قراءة Answer Key")
+        st.error("❌ فشل قراءة Answer Key")
         return
     key_bgr = pil_to_bgr(key_pages[0])
 
-    # Learn template from key
+    # AUTO-DETECT MODE
+    if mode == "🤖 اكتشاف تلقائي (Smart)":
+        st.markdown("---")
+        st.subheader("🔍 جاري الكشف التلقائي...")
+        
+        try:
+            with st.spinner("⏳ يتم تحليل ورقة الإجابة النموذجية..."):
+                auto_params = auto_detect_from_answer_key(
+                    key_bgr,
+                    min_area=int(min_area),
+                    max_area=int(max_area),
+                    min_circ=float(min_circ),
+                    blank_thresh=float(blank_mean_thresh),
+                    diff_thresh=float(diff_thresh)
+                )
+            
+            # Display detected parameters
+            st.success("✅ تم الكشف التلقائي بنجاح!")
+            
+            conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+            st.metric("مستوى الثقة", f"{conf_color[auto_params.confidence]} {auto_params.confidence.upper()}")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("عدد الأسئلة", auto_params.num_questions)
+            with col2:
+                st.metric("عدد الخيارات", auto_params.num_choices)
+            with col3:
+                st.metric("خانات الكود", auto_params.id_digits)
+            with col4:
+                st.metric("صفوف الكود", auto_params.id_rows)
+            
+            with st.expander("📋 ملاحظات الكشف التلقائي", expanded=True):
+                for note in auto_params.detection_notes:
+                    st.write(note)
+            
+            st.subheader("🔑 الإجابات الصحيحة المكتشفة:")
+            choices = list("ABCDEFGHIJ"[:auto_params.num_choices])
+            st.write(auto_params.answer_key)
+            
+            # Use detected parameters
+            id_rows = auto_params.id_rows
+            id_digits = auto_params.id_digits
+            num_q = auto_params.num_questions
+            num_choices = auto_params.num_choices
+            answer_key = auto_params.answer_key
+            
+            # Show warning if confidence is low
+            if auto_params.confidence == "low":
+                st.warning("⚠️ مستوى الثقة منخفض! يُنصح بمراجعة النتائج أو استخدام الوضع اليدوي.")
+            
+        except Exception as e:
+            st.error(f"❌ فشل الكشف التلقائي: {e}")
+            st.info("💡 جرب تعديل معايير الكشف أو استخدم الوضع اليدوي")
+            return
+    
+    # MANUAL MODE
+    else:
+        try:
+            choices = list("ABCDEF"[:int(num_choices)])
+            template, dbg = learn_template(
+                key_bgr,
+                id_rows=int(id_rows), id_digits=int(id_digits),
+                num_q=int(num_q), num_choices=int(num_choices),
+                min_area=int(min_area), max_area=int(max_area), min_circ=float(min_circ)
+            )
+            st.success("✅ تم تعلم القالب (يدوي)")
+            
+            answer_key, df_key_dbg = extract_answer_key(
+                template,
+                blank_mean_thresh=float(blank_mean_thresh),
+                diff_thresh=float(diff_thresh),
+                choices=choices
+            )
+            st.write("🔑 Answer Key:")
+            st.write(answer_key)
+            
+            if debug:
+                with st.expander("🔍 Debug: Answer Key"):
+                    st.image(bgr_to_rgb(key_bgr), caption="Answer Key", width=800)
+                    st.dataframe(df_key_dbg, width=800, height=400)
+                    
+        except Exception as e:
+            st.error(f"❌ فشل التعلم اليدوي: {e}")
+            return
+
+    # Load Roster
     try:
-        template, dbg = learn_template(
-            key_bgr,
-            id_rows=int(id_rows), id_digits=int(id_digits),
-            num_q=int(num_q), num_choices=int(num_choices),
-            min_area=int(min_area), max_area=int(max_area), min_circ=float(min_circ)
-        )
-        st.success("✅ تم تعلم القالب من الأنسر بنجاح.")
+        roster = load_roster(roster_file, id_digits=int(id_digits))
+        st.success(f"✅ تم تحميل قائمة الطلاب: {len(roster)} طالب")
     except Exception as e:
-        st.error(f"❌ فشل تعلم القالب: {e}")
+        st.error(f"❌ خطأ في ملف الطلاب: {e}")
         return
 
-    # Extract key answers
-    answer_key, df_key_dbg = extract_answer_key(
-        template,
-        blank_mean_thresh=float(blank_mean_thresh),
-        diff_thresh=float(diff_thresh),
-        choices=choices
-    )
-    st.write("🔑 Answer Key المستخرج:")
-    st.write(answer_key)
-
-    if debug:
-        st.markdown("---")
-        st.subheader("Debug: Key")
-        st.image(bgr_to_rgb(key_bgr), caption="Answer Key (Original)", width="stretch")
-        st.image(dbg["bin_key"], caption="Binary (for bubble detection only)", width="stretch")
-
-        vis = key_bgr.copy()
-        for (x, y) in dbg["id_centers"]:
-            cv2.circle(vis, (int(x), int(y)), 7, (0, 0, 255), 2)
-        for (x, y) in dbg["q_centers"]:
-            cv2.circle(vis, (int(x), int(y)), 7, (0, 255, 0), 2)
-        st.image(bgr_to_rgb(vis), caption="Detected regions: Red=ID, Green=Questions", width="stretch")
-
-        st.dataframe(df_key_dbg, width="stretch", height=360)
-
-    # Grade students
+    # Grade Students
     st.markdown("---")
-    if st.button("🚀 ابدأ التصحيح", type="primary", width="stretch"):
+    if st.button("🚀 ابدأ التصحيح", type="primary", use_container_width=True):
         sheets_bytes = read_bytes(sheets_file)
         pages = load_pages(sheets_bytes, sheets_file.name, dpi=int(dpi))
         if not pages:
-            st.error("فشل قراءة أوراق الطلاب")
+            st.error("❌ فشل قراءة أوراق الطلاب")
             return
+
+        # Build template for manual mode
+        if mode == "⚙️ إعدادات يدوية (Manual)":
+            try:
+                template, _ = learn_template(
+                    key_bgr, int(id_rows), int(id_digits),
+                    int(num_q), int(num_choices),
+                    int(min_area), int(max_area), float(min_circ)
+                )
+            except Exception as e:
+                st.error(f"❌ خطأ في بناء القالب: {e}")
+                return
+        else:
+            # Build template from auto-detected params
+            try:
+                template, _ = learn_template(
+                    key_bgr, id_rows, id_digits,
+                    num_q, num_choices,
+                    int(min_area), int(max_area), float(min_circ)
+                )
+            except Exception as e:
+                st.error(f"❌ خطأ في بناء القالب: {e}")
+                return
 
         results = []
         debug_samples = []
@@ -511,17 +767,15 @@ def main():
 
             student_code, df_id_dbg = read_student_id(
                 template, gray,
-                blank_mean_thresh=float(blank_mean_thresh),
-                diff_thresh=float(diff_thresh)
+                float(blank_mean_thresh), float(diff_thresh)
             )
             student_code = str(student_code).zfill(int(id_digits))
             student_name = roster.get(student_code, "غير موجود")
 
             df_ans = read_student_answers(
                 template, gray,
-                blank_mean_thresh=float(blank_mean_thresh),
-                diff_thresh=float(diff_thresh),
-                choices=choices
+                float(blank_mean_thresh), float(diff_thresh),
+                choices
             )
 
             correct = 0
@@ -556,29 +810,31 @@ def main():
             prog.progress(int(i / len(pages) * 100))
 
         df_res = pd.DataFrame(results)
-        st.success("✅ اكتمل التصحيح")
-        st.dataframe(df_res, width="stretch", height=420)
+        st.success("✅ اكتمل التصحيح!")
+        st.dataframe(df_res, use_container_width=True, height=420)
 
+        # Download results
         out = io.BytesIO()
         df_res.to_excel(out, index=False, engine="openpyxl")
         st.download_button(
             "⬇️ تحميل النتائج Excel",
             data=out.getvalue(),
-            file_name="results.xlsx",
+            file_name="results_smart_omr.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch",
+            use_container_width=True,
         )
 
+        # Debug samples
         if debug and debug_samples:
             st.markdown("---")
-            st.header("Debug Samples (أول صفحتين)")
+            st.header("🔍 Debug Samples")
             for page_no, aligned, df_id_dbg, df_ans in debug_samples:
-                st.subheader(f"صفحة {page_no}")
-                st.image(bgr_to_rgb(aligned), caption="Aligned to Answer Key", width="stretch")
-                st.subheader("ID Means Table (الأقل = مظلل)")
-                st.dataframe(df_id_dbg, width="stretch")
-                st.subheader("Answers Means Table (الأقل = مظلل)")
-                st.dataframe(df_ans, width="stretch", height=360)
+                with st.expander(f"صفحة {page_no}"):
+                    st.image(bgr_to_rgb(aligned), caption="Aligned", width=800)
+                    st.subheader("ID Detection")
+                    st.dataframe(df_id_dbg, width=800)
+                    st.subheader("Answers Detection")
+                    st.dataframe(df_ans, width=800, height=400)
 
 
 if __name__ == "__main__":
