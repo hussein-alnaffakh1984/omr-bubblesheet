@@ -436,7 +436,7 @@ def main():
             
             if pages:
                 bgr = pil_to_bgr(pages[0])
-                st.image(bgr_to_rgb(bgr), use_container_width=True)
+                st.image(bgr_to_rgb(bgr), width='stretch')
                 
                 if st.button("🤖 تحليل", type="primary"):
                     if not api_key:
@@ -463,7 +463,7 @@ def main():
                 {"Q": q, "Answer": a}
                 for q, a in sorted(st.session_state.answer_key.items())
             ])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width='stretch')
     
     # ============================================================
     # TAB 2: Students
@@ -486,7 +486,7 @@ def main():
                 {"ID": s.student_id, "Name": s.name, "Code": s.code}
                 for s in st.session_state.students[:20]
             ])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width='stretch')
             
             if len(st.session_state.students) > 20:
                 st.info(f"عرض 20 من {len(st.session_state.students)}")
@@ -601,7 +601,7 @@ def main():
             }
             for r in st.session_state.results
         ])
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width='stretch')
         
         # Export
         st.markdown("---")
