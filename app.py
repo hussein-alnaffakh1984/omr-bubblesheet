@@ -279,53 +279,120 @@ def cluster_bins(values: np.ndarray, k: int) -> np.ndarray:
 
 
 def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid]:
-    if centers.shape[0] < int(rows * cols * 0.4):
+    """
+    Build grid with MAXIMUM tolerance for missing bubbles
+    Humans can see a pattern even with missing parts!
+    """
+    expected = rows * cols
+    actual = centers.shape[0]
+    
+    # VERY lenient threshold - accept even if 40% missing!
+    if actual < int(expected * 0.3):
+        st.warning(f"⚠️ فقط {actual} من {expected} فقاعات متوقعة - محاولة البناء...")
         return None
 
     xs = centers[:, 0].astype(np.float32)
     ys = centers[:, 1].astype(np.float32)
 
+    # Try to cluster into rows and columns
     rlab = cluster_bins(ys, rows)
     clab = cluster_bins(xs, cols)
 
     grid = np.zeros((rows, cols, 2), dtype=np.float32)
     cnt = np.zeros((rows, cols), dtype=np.int32)
 
+    # Place known bubbles
     for (x, y), r, c in zip(centers, rlab, clab):
         grid[r, c, 0] += x
         grid[r, c, 1] += y
         cnt[r, c] += 1
 
+    # Average cells with bubbles
     for r in range(rows):
         for c in range(cols):
             if cnt[r, c] > 0:
                 grid[r, c] /= cnt[r, c]
 
-    # Interpolate missing
+    # SMART INTERPOLATION for missing bubbles
+    # Calculate row centers (Y positions)
     row_ys = []
-    col_xs = []
-    
     for r in range(rows):
-        valid = [grid[r, c, 1] for c in range(cols) if cnt[r, c] > 0]
-        row_ys.append(np.median(valid) if valid else 0)
+        valid_y = [grid[r, c, 1] for c in range(cols) if cnt[r, c] > 0]
+        if valid_y:
+            row_ys.append(np.median(valid_y))
+        else:
+            row_ys.append(None)
     
-    for c in range(cols):
-        valid = [grid[r, c, 0] for r in range(rows) if cnt[r, c] > 0]
-        col_xs.append(np.median(valid) if valid else 0)
-    
+    # Fill missing row positions using linear interpolation
     for i in range(len(row_ys)):
-        if row_ys[i] == 0 and i > 0:
-            row_ys[i] = row_ys[i-1] + 50
-    for i in range(len(col_xs)):
-        if col_xs[i] == 0 and i > 0:
-            col_xs[i] = col_xs[i-1] + 50
+        if row_ys[i] is None:
+            # Find nearest valid rows
+            prev_valid = None
+            next_valid = None
+            for j in range(i-1, -1, -1):
+                if row_ys[j] is not None:
+                    prev_valid = (j, row_ys[j])
+                    break
+            for j in range(i+1, len(row_ys)):
+                if row_ys[j] is not None:
+                    next_valid = (j, row_ys[j])
+                    break
+            
+            if prev_valid and next_valid:
+                # Interpolate
+                ratio = (i - prev_valid[0]) / (next_valid[0] - prev_valid[0])
+                row_ys[i] = prev_valid[1] + ratio * (next_valid[1] - prev_valid[1])
+            elif prev_valid:
+                # Extrapolate forward
+                row_ys[i] = prev_valid[1] + 50 * (i - prev_valid[0])
+            elif next_valid:
+                # Extrapolate backward
+                row_ys[i] = next_valid[1] - 50 * (next_valid[0] - i)
+            else:
+                # Last resort
+                row_ys[i] = 100 + i * 50
     
+    # Calculate column centers (X positions)
+    col_xs = []
+    for c in range(cols):
+        valid_x = [grid[r, c, 0] for r in range(rows) if cnt[r, c] > 0]
+        if valid_x:
+            col_xs.append(np.median(valid_x))
+        else:
+            col_xs.append(None)
+    
+    # Fill missing column positions
+    for i in range(len(col_xs)):
+        if col_xs[i] is None:
+            prev_valid = None
+            next_valid = None
+            for j in range(i-1, -1, -1):
+                if col_xs[j] is not None:
+                    prev_valid = (j, col_xs[j])
+                    break
+            for j in range(i+1, len(col_xs)):
+                if col_xs[j] is not None:
+                    next_valid = (j, col_xs[j])
+                    break
+            
+            if prev_valid and next_valid:
+                ratio = (i - prev_valid[0]) / (next_valid[0] - prev_valid[0])
+                col_xs[i] = prev_valid[1] + ratio * (next_valid[1] - prev_valid[1])
+            elif prev_valid:
+                col_xs[i] = prev_valid[1] + 50 * (i - prev_valid[0])
+            elif next_valid:
+                col_xs[i] = next_valid[1] - 50 * (next_valid[0] - i)
+            else:
+                col_xs[i] = 100 + i * 50
+    
+    # Fill ALL grid positions (even missing ones)
     for r in range(rows):
         for c in range(cols):
             if cnt[r, c] == 0:
                 grid[r, c, 0] = col_xs[c]
                 grid[r, c, 1] = row_ys[r]
 
+    # Sort by position
     row_order = np.argsort(row_ys)
     col_order = np.argsort(col_xs)
     grid = grid[row_order][:, col_order]
@@ -448,11 +515,27 @@ def read_answer_key_like_human(key_bgr: np.ndarray,
     notes.append(f"✅ شبكة الكود: {id_rows}×{id_cols} (ثقة: {id_conf:.0%})")
     notes.append(f"✅ شبكة الأسئلة: {q_rows}×{q_cols} (ثقة: {q_conf:.0%})")
     
+    # Show expected vs actual
+    id_expected = id_rows * id_cols
+    q_expected = q_rows * q_cols
+    notes.append(f"   → الكود: {id_centers.shape[0]}/{id_expected} فقاعات")
+    notes.append(f"   → الأسئلة: {q_centers.shape[0]}/{q_expected} فقاعات")
+    
+    # Build with tolerance
     id_grid = build_grid(id_centers, id_rows, id_cols)
     q_grid = build_grid(q_centers, q_rows, q_cols)
     
-    if not id_grid or not q_grid:
-        raise ValueError("فشل بناء الشبكات")
+    if not id_grid:
+        notes.append(f"⚠️ فشل بناء شبكة الكود - ناقص {id_expected - id_centers.shape[0]} فقاعات")
+        notes.append(f"   💡 جرب: تقليل min_area إلى {max(20, min_area - 10)} أو تقليل min_circularity")
+        raise ValueError(f"فشل بناء شبكة الكود ({id_centers.shape[0]}/{id_expected})")
+    
+    if not q_grid:
+        notes.append(f"⚠️ فشل بناء شبكة الأسئلة - ناقص {q_expected - q_centers.shape[0]} فقاعات")
+        notes.append(f"   💡 جرب: تقليل min_area إلى {max(20, min_area - 10)} أو تقليل min_circularity")
+        raise ValueError(f"فشل بناء شبكة الأسئلة ({q_centers.shape[0]}/{q_expected})")
+    
+    notes.append(f"✅ تم بناء الشبكات بنجاح (مع تقدير {id_expected + q_expected - id_centers.shape[0] - q_centers.shape[0]} فقاعات مفقودة)")
     
     # Step 5: Read answers
     choices = list("ABCDEFGHIJ"[:q_cols])
@@ -502,20 +585,50 @@ def read_answer_key_like_human(key_bgr: np.ndarray,
     # Visualization
     vis = key_bgr.copy()
     
+    # Draw detected bubbles
     for (x, y) in id_centers:
         cv2.circle(vis, (int(x), int(y)), 7, (0, 0, 255), 2)
     for (x, y) in q_centers:
         cv2.circle(vis, (int(x), int(y)), 7, (0, 255, 0), 2)
     
+    # Draw interpolated (missing) bubbles in YELLOW
+    id_expected = id_rows * id_cols
+    q_expected = q_rows * q_cols
+    if id_centers.shape[0] < id_expected:
+        # Show interpolated ID positions
+        for r in range(id_rows):
+            for c in range(id_cols):
+                cx, cy = id_grid.centers[r, c]
+                # Check if this was interpolated (no nearby actual bubble)
+                distances = np.sqrt(np.sum((id_centers - np.array([cx, cy]))**2, axis=1))
+                if distances.min() > 20:  # No bubble within 20 pixels
+                    cv2.circle(vis, (int(cx), int(cy)), 7, (0, 255, 255), 2)  # Yellow
+    
+    if q_centers.shape[0] < q_expected:
+        # Show interpolated Q positions
+        for r in range(q_rows):
+            for c in range(q_cols):
+                cx, cy = q_grid.centers[r, c]
+                distances = np.sqrt(np.sum((q_centers - np.array([cx, cy]))**2, axis=1))
+                if distances.min() > 20:
+                    cv2.circle(vis, (int(cx), int(cy)), 7, (0, 255, 255), 2)  # Yellow
+    
+    # Draw filtered (question numbers)
     filtered = centers[(centers[:, 0] <= visual_info['boundary_x']) & (centers[:, 1] > 0.4 * h)]
     for (x, y) in filtered:
         cv2.circle(vis, (int(x), int(y)), 7, (128, 128, 128), 2)
     
+    # Draw visual boundary
     bound_x = int(visual_info['boundary_x'])
     cv2.line(vis, (bound_x, 0), (bound_x, h), (255, 0, 255), 3)
     
     cv2.putText(vis, f"Visual Boundary: {visual_info['boundary_percent']:.1f}%", 
                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+    
+    # Add legend
+    legend_y = 60
+    cv2.putText(vis, "Red=ID | Green=Questions | Yellow=Interpolated | Gray=Numbers", 
+               (10, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
     avg_conf = (id_conf + q_conf) / 2
     confidence = "high" if avg_conf > 0.8 and len(answer_key) >= q_rows * 0.8 else "medium" if avg_conf > 0.6 else "low"
@@ -623,7 +736,7 @@ def main():
                 st.image(bgr_to_rgb(key_bgr), caption="الأصلي", use_container_width=True)
             with col2:
                 st.image(bgr_to_rgb(vis), caption="التحليل البصري", use_container_width=True)
-            st.info("🔴 الكود | 🟢 الأسئلة | ⚪ أرقام | 🟣 الحد البصري")
+            st.info("🔴 الكود | 🟢 الأسئلة | 🟡 مقدّرة (مفقودة) | ⚪ أرقام | 🟣 الحد البصري")
     
     except Exception as e:
         st.error(f"❌ خطأ: {e}")
