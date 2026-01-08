@@ -27,7 +27,6 @@ def analyze_image_like_human(bgr: np.ndarray) -> Dict:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     
     # Create a visual density map
-    # Where are the dark areas? (bubbles)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
     # Divide image into vertical strips and count dark pixels
@@ -39,41 +38,62 @@ def analyze_image_like_human(bgr: np.ndarray) -> Dict:
         x_start = i * strip_width
         x_end = min((i + 1) * strip_width, w)
         strip = thresh[:, x_start:x_end]
-        # Count dark pixels (bubbles)
         dark_count = np.sum(strip > 0)
         density.append(dark_count)
     
-    # Find the valley (gap) between question numbers and answer bubbles
-    # Question numbers: LOW density (sparse, ~10 bubbles)
-    # Gap: VERY LOW density (almost empty)
-    # Answer bubbles: HIGH density (dense, ~40 bubbles)
-    
     # Smooth the density curve
-    density_smooth = np.convolve(density, np.ones(3)/3, mode='same')
+    density_smooth = np.convolve(density, np.ones(5)/5, mode='same')
     
-    # Find local minima (valleys)
+    # Find valleys in the FIRST 25% of image (where gap should be)
     valleys = []
-    for i in range(5, 20):  # Look in first 20% of image
-        if density_smooth[i] < density_smooth[i-1] and density_smooth[i] < density_smooth[i+1]:
-            if density_smooth[i] < np.mean(density_smooth[:25]) * 0.3:  # Significant valley
+    search_end = min(25, len(density_smooth))
+    
+    for i in range(3, search_end - 3):
+        # Check if it's a local minimum
+        if (density_smooth[i] < density_smooth[i-1] and 
+            density_smooth[i] < density_smooth[i+1] and
+            density_smooth[i] < density_smooth[i-2] and
+            density_smooth[i] < density_smooth[i+2]):
+            
+            # Must be significantly low (less than 30% of average)
+            if density_smooth[i] < np.mean(density_smooth[:search_end]) * 0.3:
                 valleys.append((i, density_smooth[i]))
     
     if valleys:
-        # Take the first significant valley
+        # Take the FIRST significant valley (most likely the gap)
         valley_idx = valleys[0][0]
         boundary_x = valley_idx * strip_width
+        confidence = 'high'
     else:
-        # Fallback: find biggest drop
-        diffs = -np.diff(density_smooth[:20])
-        valley_idx = np.argmax(diffs)
-        boundary_x = valley_idx * strip_width
+        # Fallback: Look for biggest DROP in density
+        diffs = -np.diff(density_smooth[:search_end])
+        if len(diffs) > 0:
+            valley_idx = np.argmax(diffs) + 1
+            boundary_x = valley_idx * strip_width
+            confidence = 'medium'
+        else:
+            # Last resort: use 10%
+            boundary_x = int(0.10 * w)
+            confidence = 'low'
+    
+    # Safety check: boundary should be between 5% and 20%
+    min_bound = int(0.05 * w)
+    max_bound = int(0.20 * w)
+    
+    if boundary_x < min_bound:
+        boundary_x = min_bound
+        confidence = 'low'
+    elif boundary_x > max_bound:
+        boundary_x = max_bound
+        confidence = 'low'
     
     return {
         'boundary_x': boundary_x,
         'boundary_percent': (boundary_x / w) * 100,
         'density_profile': density,
         'valley_found': len(valleys) > 0,
-        'confidence': 'high' if len(valleys) > 0 else 'medium'
+        'confidence': confidence,
+        'num_valleys': len(valleys)
     }
 
 
@@ -193,7 +213,7 @@ def find_bubbles(bin_img: np.ndarray, min_area: int, max_area: int, min_circ: fl
 def separate_regions_visually(centers: np.ndarray, w: int, h: int, 
                               visual_analysis: Dict) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
-    Use VISUAL analysis boundary instead of guessing!
+    Use VISUAL analysis boundary with VALIDATION and auto-correction!
     """
     if centers.shape[0] < 20:
         raise ValueError("عدد الفقاعات قليل جداً")
@@ -204,10 +224,10 @@ def separate_regions_visually(centers: np.ndarray, w: int, h: int,
     x_mid = np.median(xs)
     y_mid = np.median(ys)
     
-    # Use the VISUALLY detected boundary!
+    # Try the VISUALLY detected boundary first
     left_boundary = visual_analysis['boundary_x']
     
-    # ID section: top-right
+    # ID section: top-right (this usually works)
     id_mask = (xs > 0.6 * w) & (ys < 0.5 * h)
     id_centers = centers[id_mask]
     
@@ -215,23 +235,67 @@ def separate_regions_visually(centers: np.ndarray, w: int, h: int,
         id_centers = centers[(xs > x_mid) & (ys < y_mid)]
     
     # Questions: after visual boundary
-    q_mask = (xs > left_boundary) & (xs < 0.55 * w) & (ys > 0.4 * h)
+    right_boundary = 0.55 * w
+    q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)
     q_centers = centers[q_mask]
     
-    if q_centers.shape[0] < 20:
-        q_centers = centers[(xs > left_boundary) & (xs < x_mid) & (ys > y_mid)]
-    
-    # Filtered (question numbers)
+    # 🔍 VALIDATION: Check if we got reasonable numbers
     filtered_mask = (xs <= left_boundary) & (ys > 0.4 * h)
     filtered_count = np.sum(filtered_mask)
+    
+    # If question bubbles are 0 or very few, boundary is WRONG!
+    if q_centers.shape[0] < 20:
+        st.warning(f"⚠️ الحد البصري ({visual_analysis['boundary_percent']:.1f}%) أعطى {q_centers.shape[0]} فقاعة فقط!")
+        st.info("🔧 محاولة التصحيح التلقائي...")
+        
+        # AUTO-CORRECTION: Try different boundaries
+        # Find all bubbles in bottom half
+        bottom_bubbles = centers[ys > 0.4 * h]
+        
+        if bottom_bubbles.shape[0] > 0:
+            # Sort by X position
+            sorted_xs = np.sort(bottom_bubbles[:, 0])
+            
+            # We expect: ~10 question numbers on far left, then ~40 answer bubbles
+            # Try to find the 10th bubble from left
+            if len(sorted_xs) > 15:
+                # Take position after 12th bubble (giving some margin)
+                corrected_boundary = sorted_xs[min(12, len(sorted_xs) - 1)]
+                
+                # Make sure it's reasonable (between 5% and 20%)
+                corrected_boundary = max(0.05 * w, min(corrected_boundary, 0.20 * w))
+                
+                st.success(f"✅ تم التصحيح: حد جديد عند {(corrected_boundary/w)*100:.1f}%")
+                left_boundary = corrected_boundary
+                
+                # Retry with corrected boundary
+                q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)
+                q_centers = centers[q_mask]
+                filtered_mask = (xs <= left_boundary) & (ys > 0.4 * h)
+                filtered_count = np.sum(filtered_mask)
+            else:
+                # Not enough bubbles - try percentage fallback
+                st.warning("محاولة استخدام نسبة افتراضية 10%...")
+                left_boundary = 0.10 * w
+                q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)
+                q_centers = centers[q_mask]
+                filtered_mask = (xs <= left_boundary) & (ys > 0.4 * h)
+                filtered_count = np.sum(filtered_mask)
+    
+    # Final fallback
+    if q_centers.shape[0] < 20:
+        st.error("⚠️ فشل الكشف التلقائي - استخدام الموقع الوسطي")
+        q_centers = centers[(xs > 0.08 * w) & (xs < x_mid) & (ys > y_mid)]
+        filtered_count = np.sum((xs <= 0.08 * w) & (ys > 0.4 * h))
     
     debug = {
         'id_count': id_centers.shape[0],
         'q_count': q_centers.shape[0],
         'filtered_out': filtered_count,
         'boundary_x': left_boundary,
-        'boundary_percent': visual_analysis['boundary_percent'],
-        'visual_confidence': visual_analysis['confidence']
+        'boundary_percent': (left_boundary / w) * 100,
+        'visual_confidence': visual_analysis.get('confidence', 'unknown'),
+        'was_corrected': q_centers.shape[0] != centers[q_mask].shape[0]
     }
     
     return id_centers, q_centers, debug
@@ -501,6 +565,10 @@ def read_answer_key_like_human(key_bgr: np.ndarray,
     notes.append(f"✅ منطقة الكود: {id_centers.shape[0]} فقاعة")
     notes.append(f"✅ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
     notes.append(f"✅ متجاهلة (أرقام): {reg_debug['filtered_out']} فقاعة")
+    
+    # Show if boundary was corrected
+    if reg_debug.get('was_corrected', False):
+        notes.append(f"🔧 تم تصحيح الحد الفاصل تلقائياً إلى {reg_debug['boundary_percent']:.1f}%")
     
     # Validate
     if reg_debug['filtered_out'] < 8 or reg_debug['filtered_out'] > 12:
