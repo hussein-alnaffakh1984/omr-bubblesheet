@@ -1,68 +1,44 @@
 """
-🤖 AI-Powered OMR - Complete System
-- Answer key detection with AI
-- Student registration from Excel
-- Batch grading
-- Results export
+🤖 AI OMR - Batch Processing Version (No Timeout!)
+معالجة على دفعات لتجنب التوقف
 """
-import io
-import base64
-import time
+import io, base64, time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
-import cv2
-import numpy as np
-import pandas as pd
+from typing import Dict, List, Optional
+import cv2, numpy as np, pandas as pd
 import streamlit as st
 from pdf2image import convert_from_bytes
 from PIL import Image
 from datetime import datetime
 
+# Same helper functions as before...
+def read_bytes(f):
+    if not f: return b""
+    try: return f.getbuffer().tobytes()
+    except: 
+        try: return f.read()
+        except: return b""
 
-# ==============================
-# Helper functions
-# ==============================
-def read_bytes(uploaded_file) -> bytes:
-    if uploaded_file is None:
-        return b""
-    try:
-        return uploaded_file.getbuffer().tobytes()
-    except Exception:
-        try:
-            return uploaded_file.read()
-        except Exception:
-            return b""
-
-
-def load_pages(file_bytes: bytes, filename: str, dpi: int = 250) -> List[Image.Image]:
+def load_pages(file_bytes, filename, dpi=250):
     if filename.lower().endswith(".pdf"):
         pages = convert_from_bytes(file_bytes, dpi=dpi)
         return [p.convert("RGB") for p in pages]
     return [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
 
+def pil_to_bgr(pil_img):
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-def pil_to_bgr(pil_img: Image.Image) -> np.ndarray:
-    arr = np.array(pil_img)
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-
-
-def bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-
-def bgr_to_bytes(bgr: np.ndarray) -> bytes:
+def bgr_to_bytes(bgr):
     _, buffer = cv2.imencode('.png', bgr)
     return buffer.tobytes()
 
-
 @dataclass
 class AIResult:
-    answers: Dict[int, str]
+    answers: Dict
     confidence: str
-    notes: List[str]
+    notes: List
     success: bool
     student_code: Optional[str] = None
-
 
 @dataclass
 class StudentRecord:
@@ -70,202 +46,38 @@ class StudentRecord:
     name: str
     code: str
 
-
 @dataclass
 class GradingResult:
     student_id: str
     name: str
     detected_code: str
-    student_answers: Dict[int, str]
+    student_answers: Dict
     score: int
     total: int
     percentage: float
-    details: List[Dict]
+    details: List
 
-
-# ==============================
-# 🤖 AI Vision Analysis
-# ==============================
-def analyze_with_ai(image_bytes: bytes, api_key: str, is_answer_key: bool = True) -> AIResult:
-    """
-    Use Claude Vision API to analyze OMR sheet
-    """
+def analyze_with_ai(image_bytes, api_key, is_answer_key=True):
+    """AI Analysis - same as before"""
     if not api_key or len(api_key) < 20:
-        return AIResult(
-            answers={},
-            confidence="no_api",
-            notes=["❌ API Key مطلوب"],
-            success=False
-        )
+        return AIResult({}, "no_api", ["API Key required"], False)
     
     try:
         import anthropic
-    except ImportError:
-        return AIResult(
-            answers={},
-            confidence="error",
-            notes=["❌ مكتبة anthropic غير مثبتة"],
-            success=False
-        )
-    
-    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        
         image_b64 = base64.b64encode(image_bytes).decode('utf-8')
         
         if is_answer_key:
-            prompt = """
-أنت نظام OMR ذكي. انظر لورقة الإجابة النموذجية وحللها:
-
-**مهمتك:**
-1. احصي الفقاعات المظللة في كل سؤال
-2. حدد الإجابة الصحيحة لكل سؤال (A, B, C, أو D)
-3. تجاهل أرقام الأسئلة على اليسار
-4. إذا كان هناك X على فقاعة، تجاهلها
-
-**أعطني JSON فقط:**
-```json
-{
-  "answers": {
-    "1": "C",
-    "2": "B",
-    ...
-  },
-  "confidence": "high",
-  "notes": []
-}
-```
-"""
+            prompt = "أنت OMR خبير. اقرأ ورقة Answer Key واعطني JSON: {\"answers\": {\"1\": \"C\", ...}, \"confidence\": \"high\"}"
         else:
-            prompt = """
-أنت نظام OMR خبير. انظر لورقة إجابة الطالب بعناية شديدة:
+            prompt = """اقرأ ورقة الطالب واعطني JSON:
+{"student_code": "1013", "answers": {"1": "C", ...}, "confidence": "high"}
 
-**الجزء الأول - قراءة الكود (ID):**
-⚠️ **مهم جداً:**
-1. الكود في **أعلى الورقة** في شبكة من الفقاعات
-2. كل صف = رقم واحد من الكود (من 0 إلى 9)
-3. ابحث عن الفقاعة **الأكثر قتامة** في كل صف
-4. اقرأ من أول صف لآخر صف (عادة 10 صفوف)
-5. **اقرأ كل الأرقام المظللة** - حتى لو كانت بعض الصفوف فارغة
-6. **تجاهل الفقاعات الخفيفة أو غير المملوءة بالكامل**
-
-**ملاحظة مهمة:**
-- قد يكون الكود 4 أرقام، أو 10 أرقام
-- اقرأ **فقط الأرقام المظللة بوضوح**
-- إذا كانت صفوف فارغة في النهاية، لا تضيف أصفار
-
-**مثال 1 (كود من 4 أرقام):**
-- الصف 1: فقاعة "1" مظللة → 1
-- الصف 2: فقاعة "0" مظللة → 0
-- الصف 3: فقاعة "1" مظللة → 1
-- الصف 4: فقاعة "3" مظللة → 3
-- الصفوف 5-10: فارغة (تجاهلها)
-- النتيجة: "1013"
-
-**مثال 2 (كود من 10 أرقام):**
-- كل الصفوف مظللة
-- النتيجة: "1013030304"
-
-**الجزء الثاني - قراءة الإجابات:**
-1. الأسئلة في **أسفل الورقة**
-2. كل سؤال له إجابة واحدة صحيحة (A, B, C, أو D)
-3. **تجاهل أرقام الأسئلة** (1, 2, 3...)
-
-**⚠️ معالجة الحالات الخاصة:**
-
-**الحالة 1: فقاعة واحدة مظللة:**
-```
-Q1: [ ] A [●] B [ ] C [ ] D
-→ الإجابة: B ✅
-```
-
-**الحالة 2: أكثر من فقاعة مظللة + واحدة عليها X:**
-```
-Q2: [●] A [X] B [ ] C [ ] D
-→ B ملغية (عليها X)
-→ الإجابة: A ✅
-```
-
-**الحالة 3: فقاعة مظللة + عليها X:**
-```
-Q3: [X] A [●] B [ ] C [ ] D
-→ A ملغية
-→ الإجابة: B ✅
-```
-
-**الحالة 4: أكثر من فقاعة مظللة بدون X:**
-```
-Q4: [●●] A [●] B [ ] C [ ] D
-     أكثر   أقل
-     ظلام   ظلام
-→ قارن درجة التظليل
-→ الإجابة: A (الأكثر قتامة) ✅
-```
-
-**⚠️ معايير المقارنة عند وجود أكثر من إجابة:**
-1. **احسب درجة القتامة** لكل فقاعة مظللة
-2. اختر الفقاعة **الأكثر قتامة/تظليلاً**
-3. إذا كانت متساوية، خذ الأولى
-4. أضف ملاحظة: "Q4: multiple answers - selected darkest"
-
-**مثال مقارنة:**
-```
-Q5: [██] A [▓] B [ ] C [ ] D
-    100%  70%
-→ A أكثر قتامة
-→ الإجابة: A ✅
-→ Note: "Q5 had multiple marks - selected darkest (A)"
-```
-
-**الحالة 5: لا شيء مظلل:**
-```
-Q5: [ ] A [ ] B [ ] C [ ] D
-→ لا إجابة
-→ الإجابة: "?" أو تجاهل السؤال
-```
-
-**معايير التظليل:**
-- ✅ فقاعة **مظللة بالكامل** = إجابة
-- ❌ فقاعة **نصف مظللة** = تجاهلها
-- ❌ فقاعة **فارغة** = تجاهلها
-- ❌ فقاعة **عليها X** = **ملغية** (حتى لو مظللة!)
-- ⚠️ **X يلغي الفقاعة تماماً** - ابحث عن الفقاعة الأخرى المظللة
-
-**أولوية المعالجة:**
-1. ابحث عن فقاعة مظللة **بدون X**
-2. إذا وجدت أكثر من واحدة (بدون X)، خذ الأولى
-3. إذا لم تجد أي فقاعة صالحة، ضع "?"
-
-**مثال واقعي:**
-```
-Q6: [●] A [X●] B [ ] C [ ] D
-     مظلل   مظلل+X
-→ B ملغية (عليها X)
-→ الإجابة: A ✅
-```
-
-**أعطني JSON دقيق:**
-```json
-{
-  "student_code": "1013",
-  "answers": {
-    "1": "C",
-    "2": "B",
-    "3": "A",
-    ...
-  },
-  "confidence": "high",
-  "notes": ["فقط 4 أرقام مظللة في الكود"]
-}
-```
-
-**تحقق:**
-1. الكود = فقط الأرقام المظللة (قد يكون 4-10 أرقام)
-2. كل رقم من 0-9
-3. الإجابات = A, B, C, أو D فقط
-
-فقط JSON - لا شيء آخر!
-"""
-        
-        client = anthropic.Anthropic(api_key=api_key)
+ملاحظات:
+- الكود: فقط الأرقام المظللة (4-10 أرقام)
+- X يلغي الفقاعة تماماً
+- أكثر من فقاعة: اختر الأكثر قتامة"""
         
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -273,27 +85,15 @@ Q6: [●] A [X●] B [ ] C [ ] D
             messages=[{
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": image_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ],
-            }],
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                    {"type": "text", "text": prompt}
+                ]
+            }]
         )
         
         response_text = message.content[0].text
         
-        import json
-        import re
-        
+        import json, re
         json_text = response_text
         if "```json" in response_text:
             json_text = response_text.split("```json")[1].split("```")[0].strip()
@@ -303,551 +103,266 @@ Q6: [●] A [X●] B [ ] C [ ] D
         try:
             result = json.loads(json_text)
         except:
-            json_match = re.search(r'\{[\s\S]*\}', response_text)
-            if json_match:
-                result = json.loads(json_match.group())
-            else:
-                raise ValueError("لم يتم العثور على JSON")
+            match = re.search(r'\{[\s\S]*\}', response_text)
+            if match: result = json.loads(match.group())
+            else: raise ValueError("No JSON")
         
         answers = {int(k): v for k, v in result.get("answers", {}).items()}
-        student_code = result.get("student_code", None) if not is_answer_key else None
+        student_code = result.get("student_code") if not is_answer_key else None
         
-        return AIResult(
-            answers=answers,
-            confidence=result.get("confidence", "medium"),
-            notes=result.get("notes", []),
-            success=True,
-            student_code=student_code
-        )
-        
+        return AIResult(answers, result.get("confidence", "medium"), result.get("notes", []), True, student_code)
+    
     except Exception as e:
-        return AIResult(
-            answers={},
-            confidence="error",
-            notes=[f"❌ خطأ: {str(e)}"],
-            success=False
-        )
+        return AIResult({}, "error", [str(e)], False)
 
-
-# ==============================
-# Student Management
-# ==============================
-def load_students_from_excel(file_bytes: bytes) -> List[StudentRecord]:
-    """
-    Load student records from Excel file
-    Expected columns: student_id, name, code
-    """
+def load_students_from_excel(file_bytes):
+    """Load students from Excel"""
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
-        
-        # Try different column name variations
-        id_col = None
-        name_col = None
-        code_col = None
-        
+        id_col = name_col = code_col = None
         for col in df.columns:
-            col_lower = str(col).lower().strip()
-            if 'id' in col_lower or 'رقم' in col_lower:
-                id_col = col
-            elif 'name' in col_lower or 'اسم' in col_lower:
-                name_col = col
-            elif 'code' in col_lower or 'كود' in col_lower or 'رمز' in col_lower:
-                code_col = col
+            cl = str(col).lower().strip()
+            if 'id' in cl or 'رقم' in cl: id_col = col
+            elif 'name' in cl or 'اسم' in cl: name_col = col
+            elif 'code' in cl or 'كود' in cl or 'رمز' in cl: code_col = col
         
         if not all([id_col, name_col, code_col]):
-            st.error("❌ يجب أن يحتوي الملف على أعمدة: ID, Name, Code")
-            st.info(f"الأعمدة الموجودة: {', '.join(df.columns)}")
             return []
         
         students = []
         for _, row in df.iterrows():
-            students.append(StudentRecord(
-                student_id=str(row[id_col]),
-                name=str(row[name_col]),
-                code=str(row[code_col])
-            ))
-        
+            students.append(StudentRecord(str(row[id_col]), str(row[name_col]), str(row[code_col])))
         return students
-        
     except Exception as e:
-        st.error(f"❌ خطأ في قراءة ملف Excel: {e}")
+        st.error(f"Excel error: {e}")
         return []
 
-
-def find_student_by_code(students: List[StudentRecord], code: str) -> Optional[StudentRecord]:
-    """Find student by code with flexible matching"""
-    # Normalize the input code (remove spaces, convert to string)
-    code_normalized = str(code).strip().replace(" ", "").replace("-", "")
+def find_student_by_code(students, code):
+    """Find student with flexible matching"""
+    code_norm = str(code).strip().replace(" ", "").replace("-", "")
+    for s in students:
+        s_code = str(s.code).strip().replace(" ", "").replace("-", "")
+        if s_code == code_norm: return s
     
-    # Try exact match first
-    for student in students:
-        student_code_normalized = str(student.code).strip().replace(" ", "").replace("-", "")
-        if student_code_normalized == code_normalized:
-            return student
-    
-    # If no exact match and detected code is longer, try first N digits
-    if len(code_normalized) > 4:
-        # Try first 4 digits (common case)
-        code_prefix = code_normalized[:4]
-        for student in students:
-            student_code_normalized = str(student.code).strip().replace(" ", "").replace("-", "")
-            if student_code_normalized == code_prefix:
-                return student
-        
-        # Try other lengths (5, 6, 7, 8 digits)
-        for length in [5, 6, 7, 8]:
-            if len(code_normalized) >= length:
-                code_prefix = code_normalized[:length]
-                for student in students:
-                    student_code_normalized = str(student.code).strip().replace(" ", "").replace("-", "")
-                    if student_code_normalized == code_prefix:
-                        return student
-    
+    # Try prefix match
+    if len(code_norm) > 4:
+        for length in [4, 5, 6, 7, 8]:
+            if len(code_norm) >= length:
+                prefix = code_norm[:length]
+                for s in students:
+                    s_code = str(s.code).strip().replace(" ", "").replace("-", "")
+                    if s_code == prefix: return s
     return None
 
-
-# ==============================
-# Grading
-# ==============================
-def grade_student(student_answers: Dict[int, str], answer_key: Dict[int, str]) -> Tuple[int, int, List[Dict]]:
-    """
-    Grade student answers against answer key
-    Returns: (score, total, details)
-    """
-    details = []
-    score = 0
+def grade_student(student_answers, answer_key):
+    """Grade student"""
+    details, score = [], 0
     total = len(answer_key)
-    
-    for q_num in sorted(answer_key.keys()):
-        correct_answer = answer_key[q_num]
-        student_answer = student_answers.get(q_num, "?")
-        
-        is_correct = student_answer == correct_answer
-        if is_correct:
-            score += 1
-        
-        # Flag for review if answer seems problematic
-        flag = ""
-        if student_answer == "?":
-            flag = "⚠️ لا إجابة"
-        
-        details.append({
-            "Question": q_num,
-            "Correct": correct_answer,
-            "Student": student_answer,
-            "Status": "✅" if is_correct else "❌",
-            "Flag": flag
-        })
-    
+    for q in sorted(answer_key.keys()):
+        correct = answer_key[q]
+        student = student_answers.get(q, "?")
+        is_correct = student == correct
+        if is_correct: score += 1
+        details.append({"Question": q, "Correct": correct, "Student": student, "Status": "✅" if is_correct else "❌"})
     return score, total, details
 
-
-# ==============================
-# Export Results
-# ==============================
-def export_results_to_excel(results: List[GradingResult]) -> bytes:
-    """Export grading results to Excel"""
-    # Summary sheet
-    summary_data = []
-    for result in results:
-        summary_data.append({
-            "Student ID": result.student_id,
-            "Name": result.name,
-            "Code": result.detected_code,
-            "Score": result.score,
-            "Total": result.total,
-            "Percentage": f"{result.percentage:.1f}%",
-            "Grade": get_grade(result.percentage)
-        })
+def export_results(results):
+    """Export to Excel"""
+    summary = [{"ID": r.student_id, "Name": r.name, "Code": r.detected_code, "Score": f"{r.score}/{r.total}", "%": f"{r.percentage:.1f}"} for r in results]
+    detailed = []
+    for r in results:
+        for d in r.details:
+            detailed.append({"ID": r.student_id, "Name": r.name, "Q": d["Question"], "Correct": d["Correct"], "Student": d["Student"], "Status": d["Status"]})
     
-    # Detailed sheet
-    detailed_data = []
-    for result in results:
-        for detail in result.details:
-            detailed_data.append({
-                "Student ID": result.student_id,
-                "Name": result.name,
-                "Question": detail["Question"],
-                "Correct Answer": detail["Correct"],
-                "Student Answer": detail["Student"],
-                "Status": detail["Status"]
-            })
-    
-    # Create Excel file
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
-        pd.DataFrame(detailed_data).to_excel(writer, sheet_name='Details', index=False)
-    
+        pd.DataFrame(summary).to_excel(writer, sheet_name='Summary', index=False)
+        pd.DataFrame(detailed).to_excel(writer, sheet_name='Details', index=False)
     return output.getvalue()
 
-
-def get_grade(percentage: float) -> str:
-    """Convert percentage to grade"""
-    if percentage >= 90:
-        return "A"
-    elif percentage >= 80:
-        return "B"
-    elif percentage >= 70:
-        return "C"
-    elif percentage >= 60:
-        return "D"
-    else:
-        return "F"
-
-
-# ==============================
-# Main App
-# ==============================
+# ==== MAIN APP ====
 def main():
-    st.set_page_config(
-        page_title="🤖 AI OMR System",
-        page_icon="🤖",
-        layout="wide"
-    )
+    st.set_page_config(page_title="🤖 AI OMR (Batch)", layout="wide")
+    st.title("🤖 نظام OMR الذكي - معالجة على دفعات")
+    st.markdown("### ⚡ لا توقف! معالجة تدريجية")
     
-    st.title("🤖 نظام تصحيح OMR الكامل بالذكاء الاصطناعي")
-    st.markdown("### نظام متكامل: Answer Key + قائمة الطلاب + التصحيح + النتائج")
+    # Session state
+    if 'answer_key' not in st.session_state: st.session_state.answer_key = {}
+    if 'students' not in st.session_state: st.session_state.students = []
+    if 'results' not in st.session_state: st.session_state.results = []
+    if 'pages_data' not in st.session_state: st.session_state.pages_data = []
+    if 'current_idx' not in st.session_state: st.session_state.current_idx = 0
     
-    # Initialize session state
-    if 'answer_key' not in st.session_state:
-        st.session_state.answer_key = {}
-    if 'students' not in st.session_state:
-        st.session_state.students = []
-    if 'results' not in st.session_state:
-        st.session_state.results = []
-    
-    # Sidebar - API Key
+    # Sidebar
     with st.sidebar:
         st.header("⚙️ الإعدادات")
-        
         api_key = ""
         try:
             api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-            if api_key:
-                st.success("✅ API Key من Secrets")
-        except:
-            pass
-        
+            if api_key: st.success("✅ API Key")
+        except: pass
         if not api_key:
-            api_key = st.text_input(
-                "🔑 API Key",
-                type="password",
-                placeholder="sk-ant-..."
-            )
+            api_key = st.text_input("🔑 API Key", type="password", placeholder="sk-ant-...")
         
         st.markdown("---")
-        st.metric("Answer Key", f"{len(st.session_state.answer_key)} أسئلة")
-        st.metric("Students", f"{len(st.session_state.students)} طالب")
-        st.metric("Graded", f"{len(st.session_state.results)} ورقة")
+        st.metric("Answer Key", f"{len(st.session_state.answer_key)} Q")
+        st.metric("Students", len(st.session_state.students))
+        st.metric("Graded", len(st.session_state.results))
     
-    # Main tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "1️⃣ Answer Key",
-        "2️⃣ قائمة الطلاب", 
-        "3️⃣ التصحيح",
-        "4️⃣ النتائج"
-    ])
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["1️⃣ Answer Key", "2️⃣ Students", "3️⃣ Grade", "4️⃣ Results"])
     
-    # ============================================================
     # TAB 1: Answer Key
-    # ============================================================
     with tab1:
-        st.subheader("📝 ورقة الإجابة النموذجية")
-        
-        key_file = st.file_uploader(
-            "ارفع ورقة الإجابة النموذجية",
-            type=["pdf", "png", "jpg"],
-            key="key"
-        )
-        
+        st.subheader("📝 Answer Key")
+        key_file = st.file_uploader("Upload", type=["pdf","png","jpg"], key="key")
         if key_file:
             key_bytes = read_bytes(key_file)
             pages = load_pages(key_bytes, key_file.name, 250)
-            
             if pages:
-                bgr = pil_to_bgr(pages[0])
-                st.image(bgr_to_rgb(bgr), width='stretch')
-                
-                if st.button("🤖 تحليل", type="primary"):
-                    if not api_key:
-                        st.error("❌ أدخل API Key")
+                st.image(cv2.cvtColor(pil_to_bgr(pages[0]), cv2.COLOR_BGR2RGB), width='stretch')
+                if st.button("🤖 Analyze", type="primary"):
+                    if not api_key: st.error("Need API Key")
                     else:
-                        with st.spinner("⏳ جاري التحليل..."):
-                            img_bytes = bgr_to_bytes(bgr)
-                            result = analyze_with_ai(img_bytes, api_key, True)
-                            
-                            if result.success:
-                                st.session_state.answer_key = result.answers
-                                st.success(f"✅ {len(result.answers)} سؤال")
-                                
-                                ans = " | ".join([f"Q{q}: {a}" for q, a in sorted(result.answers.items())])
-                                st.info(ans)
-                            else:
-                                st.error("❌ فشل")
-                                for n in result.notes:
-                                    st.warning(n)
-        
+                        with st.spinner("Analyzing..."):
+                            img = bgr_to_bytes(pil_to_bgr(pages[0]))
+                            res = analyze_with_ai(img, api_key, True)
+                            if res.success:
+                                st.session_state.answer_key = res.answers
+                                st.success(f"✅ {len(res.answers)} questions")
+                                st.info(" | ".join([f"Q{q}: {a}" for q, a in sorted(res.answers.items())]))
+                            else: st.error("Failed")
         if st.session_state.answer_key:
-            st.markdown("---")
-            df = pd.DataFrame([
-                {"Q": q, "Answer": a}
-                for q, a in sorted(st.session_state.answer_key.items())
-            ])
+            df = pd.DataFrame([{"Q": q, "A": a} for q, a in sorted(st.session_state.answer_key.items())])
             st.dataframe(df, width='stretch')
     
-    # ============================================================
     # TAB 2: Students
-    # ============================================================
     with tab2:
-        st.subheader("👥 قائمة الطلاب")
-        
-        st.info("**Excel يجب أن يحتوي على:** ID, Name, Code")
-        
-        excel = st.file_uploader("ارفع Excel", type=["xlsx", "xls"], key="excel")
-        
-        if excel and st.button("📊 تحميل"):
+        st.subheader("👥 Students")
+        excel = st.file_uploader("Upload Excel (ID, Name, Code)", type=["xlsx","xls"], key="excel")
+        if excel and st.button("📊 Load"):
             students = load_students_from_excel(read_bytes(excel))
             if students:
                 st.session_state.students = students
-                st.success(f"✅ {len(students)} طالب")
-        
+                st.success(f"✅ {len(students)} students")
         if st.session_state.students:
-            df = pd.DataFrame([
-                {"ID": s.student_id, "Name": s.name, "Code": s.code}
-                for s in st.session_state.students  # عرض الكل!
-            ])
+            df = pd.DataFrame([{"ID": s.student_id, "Name": s.name, "Code": s.code} for s in st.session_state.students])
             st.dataframe(df, width='stretch')
-            
-            st.info(f"✅ تم تحميل {len(st.session_state.students)} طالب")
     
-    # ============================================================
     # TAB 3: Grading
-    # ============================================================
     with tab3:
-        st.subheader("✅ التصحيح")
+        st.subheader("✅ التصحيح التدريجي")
         
         if not st.session_state.answer_key:
-            st.warning("⚠️ حمّل Answer Key أولاً")
+            st.warning("⚠️ Load Answer Key first")
             return
-        
         if not st.session_state.students:
-            st.warning("⚠️ حمّل قائمة الطلاب أولاً")
+            st.warning("⚠️ Load Students first")
             return
         
-        sheets = st.file_uploader(
-            "ارفع أوراق الطلاب",
-            type=["pdf", "png", "jpg"],
-            accept_multiple_files=True,
-            key="sheets"
-        )
+        sheets = st.file_uploader("Upload papers", type=["pdf","png","jpg"], accept_multiple_files=True, key="sheets")
         
-        if sheets and st.button("🚀 ابدأ", type="primary"):
-            if not api_key:
-                st.error("❌ أدخل API Key")
-                return
+        batch_size = st.select_slider("📦 Batch size", options=[5,10,15,20], value=10)
+        
+        if sheets and not st.session_state.pages_data:
+            if st.button("🔍 Prepare files"):
+                with st.spinner("Loading files..."):
+                    for f in sheets:
+                        b = read_bytes(f)
+                        pages = load_pages(b, f.name, 250)
+                        for p in pages:
+                            st.session_state.pages_data.append((f.name, p))
+                st.success(f"✅ Loaded {len(st.session_state.pages_data)} pages")
+                st.session_state.current_idx = 0
+        
+        if st.session_state.pages_data:
+            total = len(st.session_state.pages_data)
+            current = st.session_state.current_idx
+            remaining = total - current
             
-            progress = st.progress(0)
-            status = st.empty()
-            results_container = st.container()
+            st.info(f"📊 Progress: {current}/{total} ({current/total*100:.1f}%) | Remaining: {remaining}")
             
-            results = []
-            unmatched_codes = []
-            total_pages = 0
-            
-            # First, count total pages
-            for f in sheets:
-                try:
-                    b = read_bytes(f)
-                    pages = load_pages(b, f.name, 250)
-                    total_pages += len(pages)
-                except:
-                    pass
-            
-            st.info(f"📄 إجمالي الصفحات: {total_pages}")
-            
-            current_page = 0
-            
-            for file_idx, f in enumerate(sheets):
-                status.text(f"📝 معالجة ملف {file_idx+1}/{len(sheets)}: {f.name}")
-                
-                try:
-                    b = read_bytes(f)
-                    pages = load_pages(b, f.name, 250)
+            if remaining > 0:
+                if st.button(f"🚀 Process next {min(batch_size, remaining)} pages", type="primary"):
+                    if not api_key:
+                        st.error("Need API Key")
+                        return
                     
-                    if not pages:
-                        continue
+                    end = min(current + batch_size, total)
+                    progress = st.progress(0)
+                    status = st.empty()
                     
-                    # Process EACH page in the file
-                    for page_idx, page in enumerate(pages):
-                        current_page += 1
+                    for i in range(current, end):
+                        rel = i - current
+                        status.text(f"Processing page {i+1}/{total} ({rel+1}/{end-current} in batch)")
+                        progress.progress((rel+1)/(end-current))
                         
-                        # Update status frequently to prevent timeout
-                        status.text(f"📝 معالجة صفحة {current_page}/{total_pages}")
-                        progress.progress(current_page / total_pages)
-                        
-                        # Small delay to prevent rate limiting
-                        if current_page > 1:
-                            time.sleep(0.5)  # Half second between requests
-                        
+                        fname, page = st.session_state.pages_data[i]
                         bgr = pil_to_bgr(page)
                         img = bgr_to_bytes(bgr)
                         
-                        status.text(f"🤖 تحليل صفحة {current_page} بالـ AI...")
+                        time.sleep(0.2)
                         
                         res = analyze_with_ai(img, api_key, False)
-                        
-                        if not res.success:
-                            st.warning(f"⚠️ صفحة {current_page}: فشل التحليل - {', '.join(res.notes)}")
+                        if not res.success or not res.student_code:
+                            st.warning(f"⚠️ Page {i+1}: Failed")
                             continue
                         
-                        if not res.student_code:
-                            st.warning(f"⚠️ صفحة {current_page}: لم يتم العثور على كود الطالب")
+                        code = res.student_code.strip()
+                        if not code.isdigit() or len(code) < 4:
+                            st.warning(f"⚠️ Page {i+1}: Bad code '{code}'")
                             continue
                         
-                        if res.success and res.student_code:
-                            st_code = res.student_code.strip()
-                            
-                            # Validate code format (digits only)
-                            if not st_code.isdigit():
-                                st.warning(f"⚠️ صفحة {current_page}: كود غير صحيح '{st_code}' (يحتوي على أحرف)")
-                                continue
-                            
-                            # Allow codes of any length (4-10 digits typically)
-                            if len(st_code) < 4:
-                                st.warning(f"⚠️ صفحة {current_page}: كود قصير جداً '{st_code}' (طوله {len(st_code)})")
-                                continue
-                            
-                            st_ans = res.answers
-                            
-                            student = find_student_by_code(st.session_state.students, st_code)
-                            
-                            if student:
-                                score, total, details = grade_student(st_ans, st.session_state.answer_key)
-                                pct = (score/total*100) if total > 0 else 0
-                                
-                                results.append(GradingResult(
-                                    student_id=student.student_id,
-                                    name=student.name,
-                                    detected_code=st_code,
-                                    student_answers=st_ans,
-                                    score=score,
-                                    total=total,
-                                    percentage=pct,
-                                    details=details
-                                ))
-                                
-                                # Show AI notes if any
-                                if res.notes:
-                                    for note in res.notes:
-                                        if note:
-                                            st.info(f"ℹ️ صفحة {current_page} ({student.name}): {note}")
-                                
-                                status.text(f"✅ صفحة {current_page}: {st_code} - {student.name} ({score}/{total})")
-                                
-                                # Update live results display
-                                with results_container:
-                                    if len(results) % 5 == 0:  # Update every 5 students
-                                        st.info(f"📊 تم حتى الآن: {len(results)} طالب | متوسط: {np.mean([r.percentage for r in results]):.1f}%")
-                            else:
-                                unmatched_codes.append(st_code)
-                                st.warning(f"⚠️ صفحة {current_page}: الكود {st_code} غير موجود في القائمة")
-                        else:
-                            st.error(f"❌ فشل قراءة صفحة {current_page}")
-                
-                except Exception as e:
-                    st.error(f"❌ خطأ في ملف {f.name}: {e}")
-            
-            st.session_state.results = results
-            
-            # Summary
-            st.markdown("---")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("✅ تم التصحيح", len(results))
-            with col2:
-                st.metric("⚠️ غير موجود", len(unmatched_codes))
-            with col3:
-                st.metric("📝 الإجمالي", len(sheets))
-            
-            if unmatched_codes:
-                st.error("### ⚠️ أكواد غير موجودة في قائمة الطلاب:")
-                
-                # Show unmatched codes
-                codes_text = ", ".join(unmatched_codes)
-                st.code(codes_text)
-                
-                # Show available codes for comparison
-                with st.expander("🔍 الأكواد المتاحة في قائمة الطلاب"):
-                    available = [s.code for s in st.session_state.students]
-                    # Show in chunks of 10 per line for better readability
-                    for i in range(0, len(available), 10):
-                        chunk = available[i:i+10]
-                        st.code(", ".join(chunk))
-                    st.info(f"الإجمالي: {len(st.session_state.students)} طالب")
-                
-                st.info("""
-                **💡 حلول:**
-                1. تأكد من أن الأكواد في ملف Excel صحيحة
-                2. تأكد من عدم وجود مسافات زيادة
-                3. تأكد من أن الطلاب ظللوا الأكواد بشكل صحيح
-                4. حمّل ملف Excel محدّث يحتوي على هذه الأكواد
-                """)
-            
-            if results:
-                st.success(f"✅ تم تصحيح {len(results)} ورقة بنجاح!")
+                        student = find_student_by_code(st.session_state.students, code)
+                        if not student:
+                            st.warning(f"⚠️ Page {i+1}: Code {code} not found")
+                            continue
+                        
+                        score, tot, details = grade_student(res.answers, st.session_state.answer_key)
+                        pct = (score/tot*100) if tot > 0 else 0
+                        
+                        st.session_state.results.append(GradingResult(
+                            student.student_id, student.name, code, res.answers, score, tot, pct, details
+                        ))
+                        
+                        status.text(f"✅ Page {i+1}: {code} - {student.name} ({score}/{tot})")
+                    
+                    st.session_state.current_idx = end
+                    st.success(f"✅ Batch complete! Processed {end-current} pages")
+                    st.balloons()
+                    
+                    if end >= total:
+                        st.success("🎉 ALL DONE!")
+            else:
+                st.success("🎉 All pages processed!")
+                if st.button("🔄 Reset"):
+                    st.session_state.pages_data = []
+                    st.session_state.current_idx = 0
     
-    # ============================================================
     # TAB 4: Results
-    # ============================================================
     with tab4:
-        st.subheader("📊 النتائج")
+        st.subheader("📊 Results")
         
         if not st.session_state.results:
-            st.info("لا توجد نتائج")
+            st.info("No results yet")
             return
         
-        # Stats
         scores = [r.percentage for r in st.session_state.results]
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
+        with col1: st.metric("Students", len(scores))
+        with col2: st.metric("Average", f"{np.mean(scores):.1f}%")
+        with col3: st.metric("Max", f"{np.max(scores):.1f}%")
         
-        with col1:
-            st.metric("الطلاب", len(scores))
-        with col2:
-            st.metric("المتوسط", f"{np.mean(scores):.1f}%")
-        with col3:
-            st.metric("الأعلى", f"{np.max(scores):.1f}%")
-        with col4:
-            st.metric("الأدنى", f"{np.min(scores):.1f}%")
-        
-        # Table
-        st.markdown("---")
-        df = pd.DataFrame([
-            {
-                "ID": r.student_id,
-                "Name": r.name,
-                "Code": r.detected_code,
-                "Score": f"{r.score}/{r.total}",
-                "%": f"{r.percentage:.1f}",
-                "Grade": get_grade(r.percentage)
-            }
-            for r in st.session_state.results
-        ])
+        df = pd.DataFrame([{
+            "ID": r.student_id, "Name": r.name, "Code": r.detected_code,
+            "Score": f"{r.score}/{r.total}", "%": f"{r.percentage:.1f}"
+        } for r in st.session_state.results])
         st.dataframe(df, width='stretch')
         
-        # Export
-        st.markdown("---")
-        if st.button("📥 تصدير Excel", type="primary"):
-            excel = export_results_to_excel(st.session_state.results)
+        if st.button("📥 Export Excel", type="primary"):
+            excel = export_results(st.session_state.results)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            st.download_button(
-                "⬇️ تحميل",
-                excel,
-                f"results_{ts}.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
+            st.download_button("⬇️ Download", excel, f"results_{ts}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if __name__ == "__main__":
     main()
