@@ -126,6 +126,7 @@ def find_bubble_centers(bin_img: np.ndarray,
 def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
     Automatically detect ID and Question regions using clustering
+    Filters out question numbers on the left
     Returns: (id_centers, q_centers, debug_info)
     """
     if centers.shape[0] < 20:
@@ -154,8 +155,13 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
     # ID section: typically top-right, tighter boundaries
     id_mask = (xs > 0.6 * w) & (ys < 0.5 * h)
     
-    # Questions section: typically bottom-left, tighter boundaries  
-    q_mask = (xs < 0.5 * w) & (ys > 0.45 * h)
+    # Questions section: bottom-left BUT EXCLUDE far left (question numbers)
+    # Question numbers are typically in leftmost 15% of the page
+    # The actual answer bubbles start around 20% from left
+    left_boundary = 0.15 * w  # Ignore leftmost 15% (question numbers area)
+    right_boundary = 0.5 * w  # Questions are in left half
+    
+    q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.45 * h)
     
     id_centers = centers[id_mask]
     q_centers = centers[q_mask]
@@ -165,12 +171,18 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
         # Try quadrant-based
         id_centers = centers[(xs > x_mid) & (ys < y_mid)]
     
-    if q_centers.shape[0] < 20 or q_centers.shape[0] > 100:
-        # Try quadrant-based
-        q_centers = centers[(xs < x_mid) & (ys > y_mid)]
+    if q_centers.shape[0] < 20:
+        # More lenient but still exclude far left
+        q_centers = centers[(xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)]
+    
+    if q_centers.shape[0] < 20:
+        # Last resort: quadrant-based but still filter left edge
+        q_centers = centers[(xs > left_boundary) & (xs < x_mid) & (ys > y_mid)]
     
     debug["id_count"] = id_centers.shape[0]
     debug["q_count"] = q_centers.shape[0]
+    debug["left_boundary"] = left_boundary
+    debug["filtered_out"] = centers.shape[0] - id_centers.shape[0] - q_centers.shape[0]
     debug["id_expected_multiples"] = [30, 40, 50, 60, 70, 80]  # 10×3, 10×4, etc.
     debug["q_expected_multiples"] = [40, 50, 60]  # 10×4, 10×5, 10×6
     
@@ -857,11 +869,23 @@ def main():
                         for (x, y) in q_ctrs:
                             cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 0), 2)
                         
+                        # Draw filtered bubbles (question numbers) in GRAY
+                        all_xs = all_centers[:, 0]
+                        left_bound = 0.15 * key_bgr.shape[1]
+                        filtered = all_centers[all_xs <= left_bound]
+                        for (x, y) in filtered:
+                            cv2.circle(vis, (int(x), int(y)), 8, (128, 128, 128), 2)
+                        
+                        # Draw boundary line
+                        cv2.line(vis, (int(left_bound), 0), (int(left_bound), key_bgr.shape[0]), (255, 0, 255), 2)
+                        
                         # Add text labels
                         cv2.putText(vis, f"ID: {id_ctrs.shape[0]}/{auto_params.id_rows * auto_params.id_digits}", (10, 30), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         cv2.putText(vis, f"Q: {q_ctrs.shape[0]}/{auto_params.num_questions * auto_params.num_choices}", (10, 60), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(vis, f"Filtered: {filtered.shape[0]}", (10, 90), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
                         
                         # Show missing count
                         q_missing = (auto_params.num_questions * auto_params.num_choices) - q_ctrs.shape[0]
@@ -875,12 +899,14 @@ def main():
                         with col2:
                             st.image(bgr_to_rgb(vis), caption="المناطق المكتشفة: 🔴 ID | 🟢 أسئلة", use_container_width=True)
                         
-                        missing_info = f"📊 توزيع الفقاعات: ID={id_ctrs.shape[0]} | Questions={q_ctrs.shape[0]} | Total={all_centers.shape[0]}"
+                        missing_info = f"📊 توزيع الفقاعات: ID={id_ctrs.shape[0]} | Questions={q_ctrs.shape[0]} | Filtered={filtered.shape[0]} | Total={all_centers.shape[0]}"
                         if q_missing > 0:
                             st.error(f"{missing_info} | ⚠️ ناقص {q_missing} فقاعة!")
                             st.warning("🔧 **لإصلاح المشكلة:** قلل min_area إلى 80-100 أو قلل min_circularity إلى 0.45")
                         else:
                             st.success(missing_info)
+                        
+                        st.info("🔵 **الألوان:** 🔴 الكود | 🟢 الأسئلة | ⚪ أرقام الأسئلة (مُتجاهلة) | 🟣 الخط الفاصل")
                         
                         # Show binary image for debugging
                         st.image(bin_key, caption="الصورة الثنائية (Binary) - الفقاعات تظهر بيضاء", use_container_width=True)
