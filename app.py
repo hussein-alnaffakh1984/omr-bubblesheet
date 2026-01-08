@@ -332,7 +332,8 @@ def build_grid_smart(centers: np.ndarray, rows: int, cols: int) -> Optional[Bubb
 # ==============================
 def mean_darkness_smart(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> float:
     """
-    Read darkness like a human would - focus on the center of the bubble
+    Read darkness like a human would - focus on the CENTER of the bubble
+    Handles X marks and partial erasures by emphasizing the core
     """
     h, w = gray.shape[:2]
     x1 = max(0, cx - win)
@@ -344,15 +345,31 @@ def mean_darkness_smart(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> fl
     if patch.size == 0:
         return 255.0
 
-    # Focus on inner circle (exclude edges)
+    # Focus MORE on inner core (ignore edges completely)
+    # This helps handle X marks or erasures on edges
     ph, pw = patch.shape
-    margin_h = max(1, int(ph * 0.3))
-    margin_w = max(1, int(pw * 0.3))
+    margin_h = max(2, int(ph * 0.35))  # Increased from 0.3 to 0.35
+    margin_w = max(2, int(pw * 0.35))
     inner = patch[margin_h:ph-margin_h, margin_w:pw-margin_w]
     
     if inner.size == 0:
+        # Fallback to smaller margin
+        margin_h = max(1, int(ph * 0.25))
+        margin_w = max(1, int(pw * 0.25))
+        inner = patch[margin_h:ph-margin_h, margin_w:pw-margin_w]
+    
+    if inner.size == 0:
         inner = patch
-
+    
+    # Additional: Take the darkest 50% of pixels in the inner area
+    # This helps when there's an X or partial erasure
+    flat = inner.flatten()
+    if len(flat) > 10:
+        # Sort and take darkest 50%
+        sorted_pixels = np.sort(flat)
+        darkest_half = sorted_pixels[:len(sorted_pixels)//2]
+        return float(np.mean(darkest_half))
+    
     # Return mean darkness (lower = darker = filled)
     return float(np.mean(inner))
 
@@ -455,6 +472,7 @@ def auto_detect_smart(key_bgr: np.ndarray,
     choices = list("ABCDEFGHIJ"[:q_cols])
     answer_key = {}
     debug_rows = []
+    crossed_answers = []  # Track potential X-marked answers
     
     for r in range(q_rows):
         # Read darkness of all choices
@@ -466,6 +484,14 @@ def auto_detect_smart(key_bgr: np.ndarray,
         
         # Pick answer smartly
         ans, status, info = pick_answer_smart(means, choices, blank_thresh, diff_thresh)
+        
+        # Check if there might be an X mark (two dark answers close together)
+        if status == "DOUBLE":
+            # Find the two darkest
+            sorted_idx = np.argsort(means)
+            first_choice = choices[sorted_idx[0]]
+            second_choice = choices[sorted_idx[1]]
+            crossed_answers.append(f"Q{r+1}: قد يكون {first_choice} محذوف بـ X - تحقق!")
         
         if status == "OK":
             answer_key[r + 1] = ans
@@ -487,6 +513,11 @@ def auto_detect_smart(key_bgr: np.ndarray,
     debug_df = pd.DataFrame(debug_rows)
     
     notes.append(f"✅ استخراج {len(answer_key)}/{q_rows} إجابة")
+    
+    if crossed_answers:
+        notes.append("⚠️ **تحذير:** تم اكتشاف إجابات محتملة محذوفة بـ X:")
+        for note in crossed_answers:
+            notes.append(f"   • {note}")
     
     # Step 6: Create visualization
     vis = key_bgr.copy()
@@ -711,7 +742,9 @@ def main():
             diff_thresh = st.slider("Diff threshold", 3, 60, 8, 1)
 
     with st.expander("✂️ إعدادات فصل أرقام الأسئلة"):
-        left_boundary = st.slider("موضع الخط الفاصل (%)", 5.0, 20.0, 8.0, 0.5)
+        left_boundary = st.slider("موضع الخط الفاصل (%)", 5.0, 20.0, 10.0, 0.5,
+                                  help="زود القيمة لتجاهل المزيد من اليسار")
+        st.info(f"💡 **نصيحة:** القيمة الموصى بها: 9-11% حسب تصميم الورقة")
 
     debug = st.checkbox("🔍 عرض Debug", value=True)
 
@@ -769,9 +802,55 @@ def main():
             ans_display = " | ".join([f"Q{q}: **{a}**" for q, a in sorted(params.answer_key.items())])
             st.success(ans_display)
             
+            # Show warnings about X marks
+            x_warnings = [n for n in params.detection_notes if "محذوفة" in n or "X" in n]
+            if x_warnings:
+                with st.expander("⚠️ تحذيرات هامة - راجع يدوياً!", expanded=True):
+                    for warning in x_warnings:
+                        st.warning(warning)
+                    st.info("💡 افتح الجدول التفصيلي أدناه وشوف قيم الظلام للأسئلة المشبوهة")
+            
             with st.expander("📊 جدول التحليل التفصيلي", expanded=True):
+                # Highlight problematic rows
+                styled_df = debug_df.style.apply(
+                    lambda row: ['background-color: #ffe6e6' if row['Status'] == 'DOUBLE' 
+                                else '' for _ in row], axis=1
+                )
                 st.dataframe(debug_df, use_container_width=True, height=400)
-                st.info("💡 العمود 'Darkest' = أغمق فقاعة | 'Diff' = الفرق مع الثانية")
+                st.info("💡 **الأعمدة:**\n- **Darkest** = أغمق فقاعة\n- **2nd_Dark** = ثاني أغمق\n- **Diff** = الفرق (كلما أقل = مشبوه)\n- **A,B,C,D** = قيمة الظلام لكل خيار (الأقل = الأغمق)")
+                
+                # Option to manually correct
+                st.markdown("---")
+                st.subheader("✏️ تصحيح يدوي (اختياري)")
+                manual_corrections = {}
+                
+                double_qs = debug_df[debug_df['Status'] == 'DOUBLE']['Q'].tolist()
+                if double_qs:
+                    st.warning(f"⚠️ الأسئلة التالية تحتاج مراجعة: {', '.join(map(str, double_qs))}")
+                    
+                    for q in double_qs:
+                        row = debug_df[debug_df['Q'] == q].iloc[0]
+                        col1, col2 = st.columns([1, 2])
+                        with col1:
+                            st.write(f"**السؤال {q}:**")
+                        with col2:
+                            choice_vals = {ch: row[ch] for ch in choices}
+                            sorted_choices = sorted(choice_vals.items(), key=lambda x: x[1])
+                            info_text = f"الأغمق: {sorted_choices[0][0]} ({sorted_choices[0][1]}) | الثاني: {sorted_choices[1][0]} ({sorted_choices[1][1]})"
+                            st.info(info_text)
+                            manual_answer = st.selectbox(
+                                f"اختر الإجابة الصحيحة للسؤال {q}:",
+                                options=[''] + choices,
+                                key=f"manual_q{q}"
+                            )
+                            if manual_answer:
+                                manual_corrections[q] = manual_answer
+                
+                # Apply manual corrections
+                if manual_corrections:
+                    for q, ans in manual_corrections.items():
+                        params.answer_key[q] = ans
+                    st.success(f"✅ تم تطبيق {len(manual_corrections)} تصحيح يدوي")
         else:
             st.error("❌ لم يتم استخراج إجابات!")
             st.dataframe(debug_df, use_container_width=True)
