@@ -213,7 +213,9 @@ def find_bubbles(bin_img: np.ndarray, min_area: int, max_area: int, min_circ: fl
 def separate_regions_visually(centers: np.ndarray, w: int, h: int, 
                               visual_analysis: Dict) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
-    Use VISUAL analysis boundary with VALIDATION and auto-correction!
+    🎯 NEW SMART APPROACH:
+    Treat question area like student ID - find RECTANGULAR regions!
+    No need for fancy boundary detection!
     """
     if centers.shape[0] < 20:
         raise ValueError("عدد الفقاعات قليل جداً")
@@ -224,78 +226,102 @@ def separate_regions_visually(centers: np.ndarray, w: int, h: int,
     x_mid = np.median(xs)
     y_mid = np.median(ys)
     
-    # Try the VISUALLY detected boundary first
-    left_boundary = visual_analysis['boundary_x']
-    
-    # ID section: top-right (this usually works)
+    # ============================================
+    # 🆔 ID SECTION: Standard top-right detection
+    # ============================================
     id_mask = (xs > 0.6 * w) & (ys < 0.5 * h)
     id_centers = centers[id_mask]
     
     if id_centers.shape[0] < 20:
         id_centers = centers[(xs > x_mid) & (ys < y_mid)]
     
-    # Questions: after visual boundary
-    right_boundary = 0.55 * w
-    q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)
-    q_centers = centers[q_mask]
+    # ============================================
+    # 📝 QUESTIONS: Smart rectangular detection
+    # ============================================
+    # Get all bottom-left bubbles
+    bottom_left = centers[(xs < 0.55 * w) & (ys > 0.35 * h)]
     
-    # 🔍 VALIDATION: Check if we got reasonable numbers
-    filtered_mask = (xs <= left_boundary) & (ys > 0.4 * h)
-    filtered_count = np.sum(filtered_mask)
+    if bottom_left.shape[0] < 20:
+        raise ValueError(f"فقط {bottom_left.shape[0]} فقاعات في المنطقة السفلى!")
     
-    # If question bubbles are 0 or very few, boundary is WRONG!
-    if q_centers.shape[0] < 20:
-        st.warning(f"⚠️ الحد البصري ({visual_analysis['boundary_percent']:.1f}%) أعطى {q_centers.shape[0]} فقاعة فقط!")
-        st.info("🔧 محاولة التصحيح التلقائي...")
+    # Sort by X position
+    sorted_by_x = bottom_left[np.argsort(bottom_left[:, 0])]
+    
+    # Find CLUSTERS of bubbles (question numbers vs answer bubbles)
+    # Question numbers: small cluster on far left (~10 bubbles)
+    # Answer bubbles: large cluster (~40 bubbles)
+    
+    # Calculate X-position gaps between consecutive bubbles
+    x_positions = sorted_by_x[:, 0]
+    gaps = np.diff(x_positions)
+    
+    # Find the LARGEST gap - this separates question numbers from answers
+    if len(gaps) > 5:
+        largest_gap_idx = np.argmax(gaps)
+        largest_gap_size = gaps[largest_gap_idx]
         
-        # AUTO-CORRECTION: Try different boundaries
-        # Find all bubbles in bottom half
-        bottom_bubbles = centers[ys > 0.4 * h]
-        
-        if bottom_bubbles.shape[0] > 0:
-            # Sort by X position
-            sorted_xs = np.sort(bottom_bubbles[:, 0])
+        # If gap is significant (>30 pixels), it's the separator
+        if largest_gap_size > 30:
+            # Boundary is between these two bubbles
+            separator_x = (x_positions[largest_gap_idx] + x_positions[largest_gap_idx + 1]) / 2
             
-            # We expect: ~10 question numbers on far left, then ~40 answer bubbles
-            # Try to find the 10th bubble from left
-            if len(sorted_xs) > 15:
-                # Take position after 12th bubble (giving some margin)
-                corrected_boundary = sorted_xs[min(12, len(sorted_xs) - 1)]
+            # Question numbers: before separator
+            q_numbers = sorted_by_x[sorted_by_x[:, 0] < separator_x]
+            
+            # Answer bubbles: after separator
+            q_centers = sorted_by_x[sorted_by_x[:, 0] >= separator_x]
+            
+            st.success(f"✅ كشف ذكي: فجوة {largest_gap_size:.1f} بكسل عند X={separator_x:.0f}")
+            st.info(f"📊 أرقام: {len(q_numbers)} | إجابات: {len(q_centers)}")
+            
+            boundary_x = separator_x
+            filtered_count = len(q_numbers)
+        else:
+            # No significant gap - use position-based method
+            st.warning("لم يتم اكتشاف فجوة كبيرة - استخدام طريقة المواقع")
+            
+            # Take first 10-12 bubbles as question numbers
+            if len(sorted_by_x) > 15:
+                boundary_idx = 12  # After 12th bubble
+                boundary_x = sorted_by_x[boundary_idx, 0] + 10  # +10 for margin
                 
-                # Make sure it's reasonable (between 5% and 20%)
-                corrected_boundary = max(0.05 * w, min(corrected_boundary, 0.20 * w))
-                
-                st.success(f"✅ تم التصحيح: حد جديد عند {(corrected_boundary/w)*100:.1f}%")
-                left_boundary = corrected_boundary
-                
-                # Retry with corrected boundary
-                q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)
-                q_centers = centers[q_mask]
-                filtered_mask = (xs <= left_boundary) & (ys > 0.4 * h)
-                filtered_count = np.sum(filtered_mask)
+                q_centers = sorted_by_x[boundary_idx:]
+                filtered_count = boundary_idx
             else:
-                # Not enough bubbles - try percentage fallback
-                st.warning("محاولة استخدام نسبة افتراضية 10%...")
-                left_boundary = 0.10 * w
-                q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)
-                q_centers = centers[q_mask]
-                filtered_mask = (xs <= left_boundary) & (ys > 0.4 * h)
-                filtered_count = np.sum(filtered_mask)
+                # Fallback
+                boundary_x = 0.10 * w
+                q_centers = bottom_left[bottom_left[:, 0] > boundary_x]
+                filtered_count = len(bottom_left) - len(q_centers)
+    else:
+        # Very few bubbles - use percentage
+        boundary_x = 0.10 * w
+        q_centers = bottom_left[bottom_left[:, 0] > boundary_x]
+        filtered_count = len(bottom_left) - len(q_centers)
     
-    # Final fallback
-    if q_centers.shape[0] < 20:
-        st.error("⚠️ فشل الكشف التلقائي - استخدام الموقع الوسطي")
-        q_centers = centers[(xs > 0.08 * w) & (xs < x_mid) & (ys > y_mid)]
-        filtered_count = np.sum((xs <= 0.08 * w) & (ys > 0.4 * h))
+    # Ensure we have reasonable numbers
+    if len(q_centers) < 20:
+        st.error(f"⚠️ فقط {len(q_centers)} فقاعة إجابة - محاولة التصحيح...")
+        
+        # More aggressive: take everything except far left 8%
+        boundary_x = 0.08 * w
+        q_centers = bottom_left[bottom_left[:, 0] > boundary_x]
+        filtered_count = len(bottom_left) - len(q_centers)
+        
+        if len(q_centers) < 20:
+            # Last resort: take all bottom-left as questions
+            st.warning("استخدام كل الفقاعات السفلى كإجابات")
+            q_centers = bottom_left
+            filtered_count = 0
+            boundary_x = 0.05 * w
     
     debug = {
         'id_count': id_centers.shape[0],
-        'q_count': q_centers.shape[0],
+        'q_count': len(q_centers),
         'filtered_out': filtered_count,
-        'boundary_x': left_boundary,
-        'boundary_percent': (left_boundary / w) * 100,
-        'visual_confidence': visual_analysis.get('confidence', 'unknown'),
-        'was_corrected': q_centers.shape[0] != centers[q_mask].shape[0]
+        'boundary_x': boundary_x,
+        'boundary_percent': (boundary_x / w) * 100,
+        'detection_method': 'gap_analysis',
+        'total_bottom_left': len(bottom_left)
     }
     
     return id_centers, q_centers, debug
@@ -565,10 +591,8 @@ def read_answer_key_like_human(key_bgr: np.ndarray,
     notes.append(f"✅ منطقة الكود: {id_centers.shape[0]} فقاعة")
     notes.append(f"✅ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
     notes.append(f"✅ متجاهلة (أرقام): {reg_debug['filtered_out']} فقاعة")
-    
-    # Show if boundary was corrected
-    if reg_debug.get('was_corrected', False):
-        notes.append(f"🔧 تم تصحيح الحد الفاصل تلقائياً إلى {reg_debug['boundary_percent']:.1f}%")
+    notes.append(f"📊 إجمالي المنطقة السفلى: {reg_debug.get('total_bottom_left', 0)} فقاعة")
+    notes.append(f"🎯 طريقة الكشف: {reg_debug.get('detection_method', 'unknown')}")
     
     # Validate
     if reg_debug['filtered_out'] < 8 or reg_debug['filtered_out'] > 12:
