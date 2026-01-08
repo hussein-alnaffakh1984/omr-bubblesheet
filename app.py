@@ -139,17 +139,28 @@ def analyze_with_ai(image_bytes: bytes, api_key: str, is_answer_key: bool = True
 
 **الجزء الأول - قراءة الكود (ID):**
 ⚠️ **مهم جداً:**
-1. الكود في **أعلى الورقة** في شبكة 10×10
+1. الكود في **أعلى الورقة** في شبكة من الفقاعات
 2. كل صف = رقم واحد من الكود (من 0 إلى 9)
 3. ابحث عن الفقاعة **الأكثر قتامة** في كل صف
-4. اقرأ من اليمين لليسار (أو حسب تصميم الورقة)
-5. الكود النهائي = 10 أرقام متتالية
+4. اقرأ من أول صف لآخر صف (عادة 10 صفوف)
+5. **اقرأ كل الأرقام المظللة** - حتى لو كانت بعض الصفوف فارغة
 6. **تجاهل الفقاعات الخفيفة أو غير المملوءة بالكامل**
 
-**مثال:**
-- الصف 1: الفقاعة "1" مظللة → الرقم الأول = 1
-- الصف 2: الفقاعة "0" مظللة → الرقم الثاني = 0
-- ...
+**ملاحظة مهمة:**
+- قد يكون الكود 4 أرقام، أو 10 أرقام
+- اقرأ **فقط الأرقام المظللة بوضوح**
+- إذا كانت صفوف فارغة في النهاية، لا تضيف أصفار
+
+**مثال 1 (كود من 4 أرقام):**
+- الصف 1: فقاعة "1" مظللة → 1
+- الصف 2: فقاعة "0" مظللة → 0
+- الصف 3: فقاعة "1" مظللة → 1
+- الصف 4: فقاعة "3" مظللة → 3
+- الصفوف 5-10: فارغة (تجاهلها)
+- النتيجة: "1013"
+
+**مثال 2 (كود من 10 أرقام):**
+- كل الصفوف مظللة
 - النتيجة: "1013030304"
 
 **الجزء الثاني - قراءة الإجابات:**
@@ -167,7 +178,7 @@ def analyze_with_ai(image_bytes: bytes, api_key: str, is_answer_key: bool = True
 **أعطني JSON دقيق:**
 ```json
 {
-  "student_code": "1013030304",
+  "student_code": "1013",
   "answers": {
     "1": "C",
     "2": "B",
@@ -175,12 +186,12 @@ def analyze_with_ai(image_bytes: bytes, api_key: str, is_answer_key: bool = True
     ...
   },
   "confidence": "high",
-  "notes": ["ملاحظات إن وجدت"]
+  "notes": ["فقط 4 أرقام مظللة في الكود"]
 }
 ```
 
-**تحقق مرتين:**
-1. الكود = 10 أرقام بالضبط
+**تحقق:**
+1. الكود = فقط الأرقام المظللة (قد يكون 4-10 أرقام)
 2. كل رقم من 0-9
 3. الإجابات = A, B, C, أو D فقط
 
@@ -297,16 +308,34 @@ def load_students_from_excel(file_bytes: bytes) -> List[StudentRecord]:
 
 
 def find_student_by_code(students: List[StudentRecord], code: str) -> Optional[StudentRecord]:
-    """Find student by code with normalization"""
+    """Find student by code with flexible matching"""
     # Normalize the input code (remove spaces, convert to string)
     code_normalized = str(code).strip().replace(" ", "").replace("-", "")
     
+    # Try exact match first
     for student in students:
-        # Normalize student code
         student_code_normalized = str(student.code).strip().replace(" ", "").replace("-", "")
-        
         if student_code_normalized == code_normalized:
             return student
+    
+    # If no exact match and detected code is longer, try first N digits
+    if len(code_normalized) > 4:
+        # Try first 4 digits (common case)
+        code_prefix = code_normalized[:4]
+        for student in students:
+            student_code_normalized = str(student.code).strip().replace(" ", "").replace("-", "")
+            if student_code_normalized == code_prefix:
+                return student
+        
+        # Try other lengths (5, 6, 7, 8 digits)
+        for length in [5, 6, 7, 8]:
+            if len(code_normalized) >= length:
+                code_prefix = code_normalized[:length]
+                for student in students:
+                    student_code_normalized = str(student.code).strip().replace(" ", "").replace("-", "")
+                    if student_code_normalized == code_prefix:
+                        return student
+    
     return None
 
 
@@ -569,13 +598,14 @@ def main():
                     if res.success and res.student_code:
                         st_code = res.student_code.strip()
                         
-                        # Validate code format
+                        # Validate code format (digits only)
                         if not st_code.isdigit():
                             st.warning(f"⚠️ ورقة {idx+1}: كود غير صحيح '{st_code}' (يحتوي على أحرف)")
                             continue
                         
-                        if len(st_code) != 10:
-                            st.warning(f"⚠️ ورقة {idx+1}: كود غير مكتمل '{st_code}' (طوله {len(st_code)} بدلاً من 10)")
+                        # Allow codes of any length (4-10 digits typically)
+                        if len(st_code) < 4:
+                            st.warning(f"⚠️ ورقة {idx+1}: كود قصير جداً '{st_code}' (طوله {len(st_code)})")
                             continue
                         
                         st_ans = res.answers
