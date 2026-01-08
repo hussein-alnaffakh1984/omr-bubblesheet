@@ -135,33 +135,56 @@ def analyze_with_ai(image_bytes: bytes, api_key: str, is_answer_key: bool = True
 """
         else:
             prompt = """
-أنت نظام OMR ذكي. انظر لورقة إجابة الطالب وحللها:
+أنت نظام OMR خبير. انظر لورقة إجابة الطالب بعناية شديدة:
 
-**مهمتك:**
-1. **أولاً: اقرأ الكود (ID) من الفقاعات المظللة في الأعلى**
-   - كل صف = رقم من الكود (0-9)
-   - ظلل فقاعة واحدة في كل صف
-   - الكود عادة 10 أرقام
-   - القسم الأعلى من الورقة
+**الجزء الأول - قراءة الكود (ID):**
+⚠️ **مهم جداً:**
+1. الكود في **أعلى الورقة** في شبكة 10×10
+2. كل صف = رقم واحد من الكود (من 0 إلى 9)
+3. ابحث عن الفقاعة **الأكثر قتامة** في كل صف
+4. اقرأ من اليمين لليسار (أو حسب تصميم الورقة)
+5. الكود النهائي = 10 أرقام متتالية
+6. **تجاهل الفقاعات الخفيفة أو غير المملوءة بالكامل**
 
-2. **ثانياً: اقرأ الإجابات من الأسئلة**
-   - كل سؤال له فقاعة واحدة مظللة (A, B, C, أو D)
-   - تجاهل أرقام الأسئلة
-   - القسم السفلي من الورقة
+**مثال:**
+- الصف 1: الفقاعة "1" مظللة → الرقم الأول = 1
+- الصف 2: الفقاعة "0" مظللة → الرقم الثاني = 0
+- ...
+- النتيجة: "1013030304"
 
-**أعطني JSON فقط:**
+**الجزء الثاني - قراءة الإجابات:**
+1. الأسئلة في **أسفل الورقة**
+2. كل سؤال له فقاعة واحدة مظللة (A, B, C, أو D)
+3. **تجاهل أرقام الأسئلة** (1, 2, 3...)
+4. اقرأ فقط الفقاعات المظللة بوضوح
+
+**معايير التظليل:**
+- فقاعة **مظللة بالكامل** = مملوءة ✅
+- فقاعة **نصف مظللة** = تجاهلها ❌
+- فقاعة **فارغة** = تجاهلها ❌
+- فقاعة **بها X** = تجاهلها ❌
+
+**أعطني JSON دقيق:**
 ```json
 {
-  "student_code": "1234567890",
+  "student_code": "1013030304",
   "answers": {
     "1": "C",
     "2": "B",
+    "3": "A",
     ...
   },
   "confidence": "high",
-  "notes": []
+  "notes": ["ملاحظات إن وجدت"]
 }
 ```
+
+**تحقق مرتين:**
+1. الكود = 10 أرقام بالضبط
+2. كل رقم من 0-9
+3. الإجابات = A, B, C, أو D فقط
+
+فقط JSON - لا شيء آخر!
 """
         
         client = anthropic.Anthropic(api_key=api_key)
@@ -274,9 +297,15 @@ def load_students_from_excel(file_bytes: bytes) -> List[StudentRecord]:
 
 
 def find_student_by_code(students: List[StudentRecord], code: str) -> Optional[StudentRecord]:
-    """Find student by code"""
+    """Find student by code with normalization"""
+    # Normalize the input code (remove spaces, convert to string)
+    code_normalized = str(code).strip().replace(" ", "").replace("-", "")
+    
     for student in students:
-        if student.code == code:
+        # Normalize student code
+        student_code_normalized = str(student.code).strip().replace(" ", "").replace("-", "")
+        
+        if student_code_normalized == code_normalized:
             return student
     return None
 
@@ -539,7 +568,17 @@ def main():
                     res = analyze_with_ai(img, api_key, False)
                     
                     if res.success and res.student_code:
-                        st_code = res.student_code
+                        st_code = res.student_code.strip()
+                        
+                        # Validate code format
+                        if not st_code.isdigit():
+                            st.warning(f"⚠️ ورقة {idx+1}: كود غير صحيح '{st_code}' (يحتوي على أحرف)")
+                            continue
+                        
+                        if len(st_code) != 10:
+                            st.warning(f"⚠️ ورقة {idx+1}: كود غير مكتمل '{st_code}' (طوله {len(st_code)} بدلاً من 10)")
+                            continue
+                        
                         st_ans = res.answers
                         
                         student = find_student_by_code(st.session_state.students, st_code)
