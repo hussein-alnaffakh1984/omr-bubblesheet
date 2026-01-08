@@ -1,18 +1,19 @@
 # ============================================================
-# ✅ OMR Bubble Sheet (Streamlit)
-# Hybrid rule-based + Smart Auto-Template (No manual ROI)
-# FIXES:
-# 1) Stable ID grid detection (4 cols x 10 rows) from FAR RIGHT
-# 2) Prevent mixing ID cols with question cols
-# 3) Disable X detection on Answer Key (letters A/B/C/D false-X fixed)
-# 4) For students: X cancels only when bubble is NOT filled (X on empty bubble)
-# 5) Always show Answer Key table with Status (no empty confusion)
+# ✅ OMR Bubble Sheet (Streamlit) — FINAL FIX
+# Key Training: detects ONLY question grid (no student ID splitting)
+# Student Grading: uses learned question grid + tries to read ID (optional)
+#
+# Fixes:
+# 1) Bubble detection improved: Contours + HoughCircles + merge
+# 2) Key inference ignores student ID entirely (prevents wrong split)
+# 3) ID extraction on students is best-effort (never crashes grading)
+# 4) X-cancel only on students and only if bubble is not filled
 # ============================================================
 
 import io
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -53,8 +54,13 @@ def resize_max(img: np.ndarray, max_side: int = 2400) -> np.ndarray:
     scale = max_side / m
     return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-def gray_blur(img_bgr: np.ndarray) -> np.ndarray:
-    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+def preprocess_gray(img_bgr: np.ndarray) -> np.ndarray:
+    """More robust gray preprocessing."""
+    img = resize_max(img_bgr, 2400)
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # CLAHE improves contrast for faint circles
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    g = clahe.apply(g)
     g = cv2.GaussianBlur(g, (3, 3), 0)
     return g
 
@@ -65,6 +71,32 @@ def adaptive_bin_inv(gray: np.ndarray) -> np.ndarray:
         cv2.THRESH_BINARY_INV,
         31, 7
     )
+
+def merge_circles(circles: List[Tuple[float, float, float]], eps: float) -> List[Tuple[float, float, float]]:
+    """Merge near-duplicate circles by simple clustering."""
+    if not circles:
+        return []
+    circles = sorted(circles, key=lambda t: (t[0], t[1]))
+    used = [False] * len(circles)
+    out = []
+
+    for i, (x, y, r) in enumerate(circles):
+        if used[i]:
+            continue
+        grp = [(x, y, r)]
+        used[i] = True
+        for j in range(i + 1, len(circles)):
+            if used[j]:
+                continue
+            x2, y2, r2 = circles[j]
+            if (abs(x2 - x) <= eps) and (abs(y2 - y) <= eps):
+                grp.append((x2, y2, r2))
+                used[j] = True
+        mx = float(np.mean([t[0] for t in grp]))
+        my = float(np.mean([t[1] for t in grp]))
+        mr = float(np.mean([t[2] for t in grp]))
+        out.append((mx, my, mr))
+    return out
 
 
 # ----------------------------
@@ -81,14 +113,20 @@ class Bubble:
     cancelled: bool = False
 
 @dataclass
-class AutoTemplate:
-    id_cols_x: List[float]      # 4
-    id_rows_y: List[float]      # 10
-    q_cols_x: List[float]       # 2/4/5
-    q_rows_y: List[float]       # N
+class TemplateQ:
+    q_cols_x: List[float]     # 2/4/5
+    q_rows_y: List[float]     # N
     choice_count: int
     q_count: int
     debug: Dict
+
+@dataclass
+class TemplateFull:
+    # Question template always exists
+    q: TemplateQ
+    # ID template optional (for students)
+    id_cols_x: Optional[List[float]] = None
+    id_rows_y: Optional[List[float]] = None
 
 
 # ----------------------------
@@ -101,35 +139,37 @@ class OMRSmartEngine:
         self,
         blank_fill_thr: float = 0.14,
         double_gap_thr: float = 0.03,
+        bubble_margin_ratio: float = 0.22,
         x_hough_min_votes: int = 12,
         x_score_thr_student: float = 2.5,
-        bubble_margin_ratio: float = 0.22
     ):
         self.blank_fill_thr = float(blank_fill_thr)
         self.double_gap_thr = float(double_gap_thr)
+        self.bubble_margin_ratio = float(bubble_margin_ratio)
         self.x_hough_min_votes = int(x_hough_min_votes)
         self.x_score_thr_student = float(x_score_thr_student)
-        self.bubble_margin_ratio = float(bubble_margin_ratio)
 
-    # ---------- bubble detection ----------
+    # ---------- Bubble detection (Contours + HoughCircles) ----------
 
     def detect_bubbles(self, img_bgr: np.ndarray) -> Tuple[List[Bubble], Dict]:
-        dbg = {}
         img = resize_max(img_bgr, 2400)
-        g = gray_blur(img)
+        g = preprocess_gray(img)
+
         b = adaptive_bin_inv(g)
-
-        # open to remove small noise
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        b = cv2.morphologyEx(b, cv2.MORPH_OPEN, k, iterations=1)
+        b_open = cv2.morphologyEx(b, cv2.MORPH_OPEN, k, iterations=1)
 
-        contours, _ = cv2.findContours(b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        h, w = b.shape[:2]
+        h, w = b_open.shape[:2]
+        dbg = {"img_shape": (h, w)}
 
-        min_area = max(80, int(0.00002 * (h * w)))
-        max_area = int(0.0035 * (h * w))
+        # ---- Contour circles ----
+        contours, _ = cv2.findContours(b_open, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = max(70, int(0.000015 * (h * w)))
+        max_area = int(0.0040 * (h * w))
+        dbg["min_area"] = min_area
+        dbg["max_area"] = max_area
 
-        tmp = []
+        contour_circles = []
         for c in contours:
             area = cv2.contourArea(c)
             if area < min_area or area > max_area:
@@ -137,35 +177,70 @@ class OMRSmartEngine:
             per = cv2.arcLength(c, True)
             if per <= 0:
                 continue
-            circ = 4 * math.pi * (area / (per * per + 1e-9))
-            # stricter circularity
-            if circ < 0.45:
+            circularity = 4 * math.pi * (area / (per * per + 1e-9))
+            # ✅ relaxed (your previous 0.45 كان قاسي)
+            if circularity < 0.30:
                 continue
             (x, y), r = cv2.minEnclosingCircle(c)
             if r < 7:
                 continue
-            tmp.append((float(x), float(y), float(r), float(circ)))
+            contour_circles.append((float(x), float(y), float(r)))
 
-        if not tmp:
-            dbg["bubbles_found_filtered"] = 0
-            dbg["img_shape"] = (h, w)
+        # ---- Hough circles ----
+        # estimate radius range from contours if available
+        rs = [c[2] for c in contour_circles]
+        r_med = float(np.median(rs)) if rs else 20.0
+        r_min = max(8, int(r_med * 0.70))
+        r_max = int(r_med * 1.60)
+
+        # param2 controls sensitivity (lower => more circles)
+        hough = cv2.HoughCircles(
+            g,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=max(10, int(r_med * 1.6)),
+            param1=120,
+            param2=22,
+            minRadius=r_min,
+            maxRadius=r_max
+        )
+
+        hough_circles = []
+        if hough is not None:
+            hough = np.squeeze(hough, axis=0)
+            for (x, y, r) in hough:
+                hough_circles.append((float(x), float(y), float(r)))
+
+        # ---- Merge both ----
+        all_circles = contour_circles + hough_circles
+        if not all_circles:
+            dbg.update({
+                "bubbles_found_raw": 0,
+                "bubbles_found_filtered": 0,
+                "r_med": r_med,
+                "r_band": (r_min, r_max),
+            })
             return [], dbg
 
-        rs = np.array([t[2] for t in tmp], dtype=float)
-        r_med = float(np.median(rs))
-        r_lo = 0.70 * r_med
-        r_hi = 1.45 * r_med
+        merged = merge_circles(all_circles, eps=max(8.0, r_med * 0.7))
 
-        bubbles = [Bubble(x=x, y=y, r=r) for (x, y, r, _) in tmp if r_lo <= r <= r_hi]
+        # radius band filter (final)
+        rr = np.array([c[2] for c in merged], dtype=float)
+        r_med2 = float(np.median(rr)) if len(rr) else r_med
+        r_lo = 0.65 * r_med2
+        r_hi = 1.65 * r_med2
+
+        final = [(x, y, r) for (x, y, r) in merged if (r_lo <= r <= r_hi)]
+        bubbles = [Bubble(x=x, y=y, r=r) for (x, y, r) in final]
 
         dbg.update({
-            "img_shape": (h, w),
-            "min_area": min_area,
-            "max_area": max_area,
-            "r_med": r_med,
-            "r_band": (r_lo, r_hi),
-            "bubbles_found_raw": len(tmp),
+            "bubbles_found_raw": len(all_circles),
+            "bubbles_found_merged": len(merged),
             "bubbles_found_filtered": len(bubbles),
+            "r_med": r_med2,
+            "r_band": (r_lo, r_hi),
+            "contours_kept": len(contour_circles),
+            "hough_kept": len(hough_circles),
         })
         return bubbles, dbg
 
@@ -184,12 +259,12 @@ class OMRSmartEngine:
                 groups.append([x])
         return [float(np.mean(g)) for g in groups]
 
-    # ---------- template inference ----------
+    # ---------- Template inference for KEY (Questions only) ----------
 
-    def infer_template(self, bubbles: List[Bubble], img_shape: Tuple[int, int]) -> AutoTemplate:
+    def infer_key_questions(self, bubbles: List[Bubble], img_shape: Tuple[int, int]) -> TemplateQ:
         h, w = img_shape
-        if len(bubbles) < 40:
-            raise ValueError("عدد الفقاعات المكتشفة قليل جداً. ارفع DPI أو تأكد وضوح الصورة.")
+        if len(bubbles) < 30:
+            raise ValueError("عدد الفقاعات قليل جداً لاستخراج الأسئلة من الـ Key. ارفع DPI أو حسّن وضوح الـ PDF.")
 
         xs = np.array([b.x for b in bubbles], dtype=float)
         ys = np.array([b.y for b in bubbles], dtype=float)
@@ -199,117 +274,35 @@ class OMRSmartEngine:
         eps_x = max(10.0, r_med * 2.2)
         eps_y = max(10.0, r_med * 2.2)
 
-        col_centers = sorted(self._cluster_1d(xs, eps=eps_x))
-        if len(col_centers) < 6:
-            raise ValueError("لم أستطع تكوين أعمدة كافية. قد تكون الصفحة مقصوصة أو DPI منخفض.")
+        # ✅ KEY: ignore far-right ID area by default
+        left_bubbles = [b for b in bubbles if b.x < w * 0.75]
+        if len(left_bubbles) < 20:
+            left_bubbles = bubbles
+
+        q_xs = np.array([b.x for b in left_bubbles], dtype=float)
+        col_centers = sorted(self._cluster_1d(q_xs, eps=eps_x))
 
         debug = {
             "r_med": r_med, "eps_x": eps_x, "eps_y": eps_y,
-            "col_centers_total": len(col_centers),
             "bubbles_total": len(bubbles),
+            "bubbles_left": len(left_bubbles),
+            "col_centers_total": len(col_centers),
         }
 
-        # ---------------------------
-        # 1) Detect ID columns (FAR RIGHT)
-        # ---------------------------
-        right_bands = [0.72, 0.66, 0.60, 0.55, 0.50]
-        right_cols = []
-        used_rb = None
-        for rb in right_bands:
-            cand = [c for c in col_centers if c >= w * rb]
-            if len(cand) >= 4:
-                right_cols = cand[-10:]
-                used_rb = rb
-                break
-        if len(right_cols) < 4:
-            raise ValueError("فشل تحديد منطقة كود الطالب يمين الصفحة. تأكد الصفحة كاملة.")
-
-        debug["right_band_used"] = used_rb
-        debug["right_cols"] = right_cols
+        if len(col_centers) < 2:
+            raise ValueError("فشل تكوين أعمدة للأسئلة. ربما الصفحة مقصوصة.")
 
         from itertools import combinations
 
-        def score_id(cols4: List[float]) -> Tuple[float, List[float]]:
-            # bubbles near these columns
+        def score_cols(cols_k: List[float]) -> Tuple[float, List[float]]:
             idx = []
-            for i, b in enumerate(bubbles):
-                if min(abs(b.x - c) for c in cols4) <= eps_x:
-                    idx.append(i)
-            if len(idx) < 25:
-                return -1e9, []
-
-            y_local = np.array([bubbles[i].y for i in idx], dtype=float)
-            y_centers = sorted(self._cluster_1d(y_local, eps=eps_y))
-
-            # around 10 rows
-            rc = len(y_centers)
-            if rc < 8 or rc > 12:
-                return -1e9, y_centers
-
-            diffs = np.diff(y_centers) if len(y_centers) >= 2 else np.array([9999.0])
-            cv = float(np.std(diffs) / (np.mean(diffs) + 1e-9))
-
-            # prefer tight width (4 columns close)
-            width = max(cols4) - min(cols4)
-            score = -abs(rc - 10) * 6.0 - cv * 10.0 - width * 0.02 + len(idx) * 0.05
-            return score, y_centers
-
-        best_id = None
-        best_score = -1e9
-        for comb in combinations(right_cols, 4):
-            cols4 = sorted(list(comb))
-            s, y_centers = score_id(cols4)
-            if s > best_score:
-                best_score = s
-                best_id = (cols4, y_centers)
-
-        if best_id is None:
-            raise ValueError("فشل اكتشاف كود الطالب (4×10).")
-
-        id_cols_x, id_rows_y = best_id
-        if len(id_rows_y) > 10:
-            id_rows_y = id_rows_y[:10]
-
-        debug["id_cols_x"] = id_cols_x
-        debug["id_rows_detected"] = len(id_rows_y)
-
-        # ---------------------------
-        # 2) Build question candidates by removing bubbles near ID columns (X only)
-        # ---------------------------
-        def near_any(val, centers, eps):
-            return (min(abs(val - c) for c in centers) <= eps) if centers else False
-
-        q_candidate = [b for b in bubbles if not near_any(b.x, id_cols_x, eps_x)]
-        debug["bubbles_q_candidate"] = len(q_candidate)
-
-        if len(q_candidate) < 40:
-            raise ValueError("لم يتبقّ فقاعات كافية للأسئلة بعد فصل الكود. الكود مكتشف خطأ.")
-
-        # ---------------------------
-        # 3) Detect question columns (2/4/5) LEFT of ID group
-        # ---------------------------
-        q_xs = np.array([b.x for b in q_candidate], dtype=float)
-        q_cols_all = sorted(self._cluster_1d(q_xs, eps=eps_x))
-
-        id_left_edge = min(id_cols_x)
-        q_cols_filtered = [c for c in q_cols_all if c < (id_left_edge - eps_x)]
-        if len(q_cols_filtered) < 2:
-            q_cols_filtered = [c for c in q_cols_all if c < w * 0.70]
-        if len(q_cols_filtered) < 2:
-            q_cols_filtered = q_cols_all
-
-        q_cols_filtered = q_cols_filtered[:14]
-        debug["q_cols_filtered_count"] = len(q_cols_filtered)
-
-        def score_questions(cols_k: List[float]) -> Tuple[float, List[float]]:
-            idx = []
-            for i, b in enumerate(q_candidate):
+            for i, b in enumerate(left_bubbles):
                 if min(abs(b.x - c) for c in cols_k) <= eps_x:
                     idx.append(i)
             if len(idx) < 10 * len(cols_k):
                 return -1e9, []
 
-            y_local = np.array([q_candidate[i].y for i in idx], dtype=float)
+            y_local = np.array([left_bubbles[i].y for i in idx], dtype=float)
             y_centers = sorted(self._cluster_1d(y_local, eps=eps_y))
             if len(y_centers) < 5:
                 return -1e9, y_centers
@@ -317,35 +310,36 @@ class OMRSmartEngine:
             diffs = np.diff(y_centers) if len(y_centers) >= 2 else np.array([9999.0])
             cv = float(np.std(diffs) / (np.mean(diffs) + 1e-9))
             density = len(idx) / (len(cols_k) * max(len(y_centers), 1))
-
-            score = -cv * 10.0 + density * 4.0 + len(y_centers) * 0.12 + len(idx) * 0.01
+            # prefer more rows (more questions) and stable spacing
+            score = -cv * 10.0 + density * 4.0 + len(y_centers) * 0.15 + len(idx) * 0.01
             return score, y_centers
 
-        best_q = None
-        best_q_score = -1e9
-        for k in [2, 4, 5]:
-            if len(q_cols_filtered) < k:
+        best = None
+        best_score = -1e9
+
+        # ✅ try 4 first (most common), then 5, then 2
+        for k in [4, 5, 2]:
+            if len(col_centers) < k:
                 continue
-            for comb in combinations(q_cols_filtered, k):
+            for comb in combinations(col_centers[:14], k):
                 cols_k = sorted(list(comb))
-                s, y_centers = score_questions(cols_k)
-                if s > best_q_score:
-                    best_q_score = s
-                    best_q = (cols_k, y_centers, k)
+                s, y_centers = score_cols(cols_k)
+                if s > best_score:
+                    best_score = s
+                    best = (cols_k, y_centers, k)
 
-        if best_q is None:
-            raise ValueError("فشل اكتشاف شبكة الأسئلة. جرّب DPI أعلى أو ملف أوضح.")
+        if best is None:
+            raise ValueError("فشل استخراج شبكة الأسئلة من Answer Key. جرّب DPI=350 أو PDF أوضح.")
 
-        q_cols_x, q_rows_y, choice_count = best_q
+        q_cols_x, q_rows_y, choice_count = best
         q_count = len(q_rows_y)
+        debug.update({
+            "q_cols_x": q_cols_x,
+            "choice_count": choice_count,
+            "q_count": q_count,
+        })
 
-        debug["q_cols_x"] = q_cols_x
-        debug["q_rows_detected"] = q_count
-        debug["choice_count"] = choice_count
-
-        return AutoTemplate(
-            id_cols_x=id_cols_x,
-            id_rows_y=id_rows_y,
+        return TemplateQ(
             q_cols_x=q_cols_x,
             q_rows_y=q_rows_y,
             choice_count=choice_count,
@@ -353,7 +347,79 @@ class OMRSmartEngine:
             debug=debug
         )
 
-    # ---------- scoring ----------
+    # ---------- OPTIONAL ID inference on students ----------
+
+    def infer_student_id_grid(self, bubbles: List[Bubble], img_shape: Tuple[int, int]) -> Optional[Tuple[List[float], List[float]]]:
+        """Best-effort read ID grid from FAR RIGHT. Returns (id_cols_x, id_rows_y) or None."""
+        h, w = img_shape
+        if len(bubbles) < 30:
+            return None
+
+        xs = np.array([b.x for b in bubbles], dtype=float)
+        ys = np.array([b.y for b in bubbles], dtype=float)
+        rs = np.array([b.r for b in bubbles], dtype=float)
+
+        r_med = float(np.median(rs))
+        eps_x = max(10.0, r_med * 2.2)
+        eps_y = max(10.0, r_med * 2.2)
+
+        # far right only
+        right_b = [b for b in bubbles if b.x >= w * 0.72]
+        if len(right_b) < 20:
+            right_b = [b for b in bubbles if b.x >= w * 0.65]
+        if len(right_b) < 20:
+            return None
+
+        col_centers = sorted(self._cluster_1d(np.array([b.x for b in right_b], dtype=float), eps=eps_x))
+        if len(col_centers) < 4:
+            return None
+
+        from itertools import combinations
+
+        def score_id(cols4: List[float]) -> Tuple[float, List[float]]:
+            idx = []
+            for i, b in enumerate(right_b):
+                if min(abs(b.x - c) for c in cols4) <= eps_x:
+                    idx.append(i)
+            if len(idx) < 25:
+                return -1e9, []
+
+            y_local = np.array([right_b[i].y for i in idx], dtype=float)
+            y_centers = sorted(self._cluster_1d(y_local, eps=eps_y))
+            rc = len(y_centers)
+            if rc < 8 or rc > 12:
+                return -1e9, y_centers
+
+            diffs = np.diff(y_centers) if len(y_centers) >= 2 else np.array([9999.0])
+            cv = float(np.std(diffs) / (np.mean(diffs) + 1e-9))
+            width = max(cols4) - min(cols4)
+            score = -abs(rc - 10) * 6.0 - cv * 10.0 - width * 0.02 + len(idx) * 0.05
+            return score, y_centers
+
+        best = None
+        best_s = -1e9
+        for comb in combinations(col_centers[-10:], 4):
+            cols4 = sorted(list(comb))
+            s, y_centers = score_id(cols4)
+            # ✅ additional safety: must be really on the right
+            if min(cols4) < w * 0.60:
+                continue
+            if s > best_s:
+                best_s = s
+                best = (cols4, y_centers)
+
+        if best is None:
+            return None
+
+        id_cols_x, id_rows_y = best
+        if len(id_rows_y) > 10:
+            id_rows_y = id_rows_y[:10]
+        if len(id_rows_y) < 10:
+            return None
+
+        return id_cols_x, id_rows_y
+
+    # ---------- cell scoring ----------
 
     def _extract_roi(self, img: np.ndarray, cx: float, cy: float, r: float) -> np.ndarray:
         h, w = img.shape[:2]
@@ -398,54 +464,41 @@ class OMRSmartEngine:
                 pos += 1
             if 115 <= ang <= 155:
                 neg += 1
-
         if pos > 0 and neg > 0:
-            return float(min(pos, 3) + min(neg, 3))  # 2..6
+            return float(min(pos, 3) + min(neg, 3))
         return 0.0
 
-    def evaluate_cells(self, img_bgr: np.ndarray, template: AutoTemplate, for_key: bool) -> Dict[Tuple[int, int], Bubble]:
+    # ---------- evaluate question cells ----------
+
+    def evaluate_questions(self, img_bgr: np.ndarray, tq: TemplateQ, for_key: bool) -> Dict[Tuple[int, int], Bubble]:
         img = resize_max(img_bgr, 2400)
-        g = gray_blur(img)
+        g = preprocess_gray(img)
         b = adaptive_bin_inv(g)
 
-        out: Dict[Tuple[int, int], Bubble] = {}
-
         # radius guess from row spacing
-        id_r = max(10.0, float(np.median(np.diff(sorted(template.id_rows_y))) * 0.32)) if len(template.id_rows_y) >= 2 else 14.0
-        q_r  = max(10.0, float(np.median(np.diff(sorted(template.q_rows_y))) * 0.32)) if len(template.q_rows_y) >= 2 else 14.0
+        q_r = max(10.0, float(np.median(np.diff(sorted(tq.q_rows_y))) * 0.32)) if len(tq.q_rows_y) >= 2 else 14.0
 
-        def eval_cell(cx, cy, r_guess):
-            cell_bin = self._extract_roi(b, cx, cy, r_guess)
-            fill = self.fill_ratio(cell_bin)
+        out: Dict[Tuple[int, int], Bubble] = {}
+        for rr in range(tq.q_count):
+            cy = tq.q_rows_y[rr]
+            for cc in range(tq.choice_count):
+                cx = tq.q_cols_x[cc]
+                cell_bin = self._extract_roi(b, cx, cy, q_r)
+                fill = self.fill_ratio(cell_bin)
 
-            if for_key:
-                return fill, 0.0, False  # ✅ disable X on key
+                if for_key:
+                    xs = 0.0
+                    cancelled = False  # ✅ Key: never apply X
+                else:
+                    cell_gray = self._extract_roi(g, cx, cy, q_r)
+                    xs = self.x_cancellation_score(cell_gray)
+                    # ✅ cancel only if X and bubble is NOT filled
+                    cancelled = (xs >= self.x_score_thr_student) and (fill < self.blank_fill_thr * 0.9)
 
-            cell_gray = self._extract_roi(g, cx, cy, r_guess)
-            xs = self.x_cancellation_score(cell_gray)
-            # ✅ cancel only if X on empty-ish bubble
-            cancelled = (xs >= self.x_score_thr_student) and (fill < (self.blank_fill_thr * 0.90))
-            return fill, xs, cancelled
-
-        # ID (4x10)
-        for c in range(4):
-            for r in range(10):
-                cx = template.id_cols_x[c]
-                cy = template.id_rows_y[r]
-                fill, xs, cancelled = eval_cell(cx, cy, id_r)
-                out[(100 + c, r)] = Bubble(cx, cy, id_r, fill, xs, cancelled)
-
-        # Questions (N x choices)
-        for rr in range(template.q_count):
-            cy = template.q_rows_y[rr]
-            for cc in range(template.choice_count):
-                cx = template.q_cols_x[cc]
-                fill, xs, cancelled = eval_cell(cx, cy, q_r)
                 out[(rr, cc)] = Bubble(cx, cy, q_r, fill, xs, cancelled)
-
         return out
 
-    # ---------- decision ----------
+    # ---------- decision logic ----------
 
     def decide_row(self, bubbles_row: List[Bubble]) -> Dict:
         fills = np.array([b.fill for b in bubbles_row], dtype=float)
@@ -467,66 +520,72 @@ class OMRSmartEngine:
 
         return {"answer_idx": top_i, "status": "OK", "fills": fills.tolist()}
 
-    def decode_student_id(self, cell_map: Dict[Tuple[int, int], Bubble]) -> str:
+    def extract_answers(self, cell_map: Dict[Tuple[int, int], Bubble], tq: TemplateQ) -> Tuple[Dict[int, str], pd.DataFrame]:
+        choices = "ABCDE"[:tq.choice_count]
+        answers = {}
+        rows = []
+        for r in range(tq.q_count):
+            row_bubs = [cell_map[(r, c)] for c in range(tq.choice_count)]
+            d = self.decide_row(row_bubs)
+
+            ans = ""
+            if d["status"] == "OK":
+                ans = choices[d["answer_idx"]]
+                answers[r + 1] = ans
+
+            rows.append({"Q": r + 1, "Answer": ans, "Status": d["status"]})
+        return answers, pd.DataFrame(rows)
+
+    # ---------- decode student id (best-effort) ----------
+
+    def decode_student_id(self, img_bgr: np.ndarray, bubbles: List[Bubble]) -> str:
+        img = resize_max(img_bgr, 2400)
+        h, w = img.shape[:2]
+        grid = self.infer_student_id_grid(bubbles, (h, w))
+        if grid is None:
+            return "UNKNOWN"
+
+        id_cols_x, id_rows_y = grid
+        g = preprocess_gray(img)
+        b = adaptive_bin_inv(g)
+
+        id_r = max(10.0, float(np.median(np.diff(sorted(id_rows_y))) * 0.32)) if len(id_rows_y) >= 2 else 14.0
+
         digits = []
         for col in range(4):
             fills = []
             for row in range(10):
-                fills.append(cell_map[(100 + col, row)].fill)
+                cx = id_cols_x[col]
+                cy = id_rows_y[row]
+                cell_bin = self._extract_roi(b, cx, cy, id_r)
+                fills.append(self.fill_ratio(cell_bin))
             best_row = int(np.argmax(fills))
             best_fill = float(fills[best_row])
             digits.append("X" if best_fill < self.blank_fill_thr else str(best_row))
         return "".join(digits)
 
-    def extract_answers(self, cell_map: Dict[Tuple[int, int], Bubble], template: AutoTemplate) -> Tuple[Dict[int, str], pd.DataFrame]:
-        choices = "ABCDE"[:template.choice_count]
-        answers = {}
-        rows = []
-        for r in range(template.q_count):
-            row_bubs = [cell_map[(r, c)] for c in range(template.choice_count)]
-            d = self.decide_row(row_bubs)
-            ans = ""
-            if d["status"] == "OK":
-                ans = choices[d["answer_idx"]]
-                answers[r + 1] = ans
-            rows.append({
-                "Q": r + 1,
-                "Answer": ans,
-                "Status": d["status"],
-                "Cancelled": [bool(b.cancelled) for b in row_bubs],
-                "Fills": d["fills"],
-            })
-        return answers, pd.DataFrame(rows)[["Q", "Answer", "Status"]]
+    # ---------- overlay ----------
 
-    def draw_overlay(self, img_bgr: np.ndarray, template: AutoTemplate, cell_map: Dict[Tuple[int, int], Bubble]) -> np.ndarray:
+    def draw_overlay_questions(self, img_bgr: np.ndarray, tq: TemplateQ, cell_map: Dict[Tuple[int, int], Bubble]) -> np.ndarray:
         img = resize_max(img_bgr, 2400).copy()
 
-        # column lines (blue)
-        for x in template.id_cols_x:
-            cv2.line(img, (int(x), 0), (int(x), img.shape[0]-1), (255, 0, 0), 2)
-        for x in template.q_cols_x:
+        # columns (blue)
+        for x in tq.q_cols_x:
             cv2.line(img, (int(x), 0), (int(x), img.shape[0]-1), (255, 0, 0), 2)
 
         def draw_b(b: Bubble, color):
             cv2.circle(img, (int(b.x), int(b.y)), int(b.r), color, 2)
             cv2.circle(img, (int(b.x), int(b.y)), 3, color, -1)
 
-        # ID bubbles green
-        for c in range(4):
-            for r in range(10):
-                draw_b(cell_map[(100+c, r)], (0, 255, 0))
-
-        # Question bubbles:
-        # red filled, yellow cancelled, green blank
-        for r in range(template.q_count):
-            for c in range(template.choice_count):
+        for r in range(tq.q_count):
+            for c in range(tq.choice_count):
                 b = cell_map[(r, c)]
                 if b.cancelled:
-                    col = (0, 255, 255)
+                    col = (0, 255, 255)   # yellow
                 elif b.fill >= self.blank_fill_thr:
-                    col = (0, 0, 255)
+                    col = (0, 0, 255)     # red
                 else:
-                    col = (0, 255, 0)
+                    col = (0, 255, 0)     # green
                 draw_b(b, col)
 
         return img
@@ -554,8 +613,8 @@ def load_roster(roster_up) -> Dict[str, str]:
 
 def main():
     st.set_page_config(page_title="OMR Bubble Sheet", layout="wide")
-    st.title("✅ OMR Bubble Sheet — تدريب تلقائي + تصحيح")
-    st.caption("إصلاح خلط كود الطالب مع الأسئلة + منع X الكاذب في Answer Key")
+    st.title("✅ OMR Bubble Sheet — تدريب تلقائي + تصحيح (حل نهائي)")
+    st.caption("التدريب من Answer Key يكتشف الأسئلة فقط (بدون كود) لمنع الخلط نهائيًا.")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -591,15 +650,15 @@ def main():
     engine = OMRSmartEngine(
         blank_fill_thr=blank_thr,
         double_gap_thr=double_gap,
+        bubble_margin_ratio=0.22,
         x_hough_min_votes=x_votes,
         x_score_thr_student=x_thr_student,
-        bubble_margin_ratio=0.22
     )
 
     # ----------------------------
-    # 1) Train on Answer Key
+    # 1) TRAIN / EXTRACT ANSWER KEY (Questions ONLY)
     # ----------------------------
-    st.subheader("1) Answer Key (استخراج قبل التصحيح)")
+    st.subheader("1) Answer Key (استخراج قبل التصحيح) — أسئلة فقط")
     if key_up is None:
         st.info("ارفع Answer Key للبدء.")
         st.stop()
@@ -611,41 +670,39 @@ def main():
         st.stop()
 
     key_bgr = to_bgr(key_pages[0])
-    bubbles, dbg_b = engine.detect_bubbles(key_bgr)
+    bubbles_key, dbg_b = engine.detect_bubbles(key_bgr)
 
     if debug:
         st.write("Bubble detection debug:", dbg_b)
 
+    if len(bubbles_key) < 25:
+        st.error("الفقاعات المكتشفة قليلة جدًا. جرّب DPI=350 أو PDF أوضح/غير مقصوص.")
+        st.stop()
+
     try:
-        template = engine.infer_template(bubbles, img_shape=resize_max(key_bgr, 2400).shape[:2])
+        tq = engine.infer_key_questions(bubbles_key, img_shape=resize_max(key_bgr, 2400).shape[:2])
     except Exception as e:
-        st.error(f"❌ فشل التدريب/الاستخراج: {e}")
-        if debug:
-            st.write("Template debug (partial):", dbg_b)
+        st.error(f"❌ فشل استخراج الأسئلة من Answer Key: {e}")
         st.stop()
 
     if debug:
-        st.write("Template debug:", template.debug)
+        st.write("Key Question Template debug:", tq.debug)
 
-    cell_map_key = engine.evaluate_cells(key_bgr, template, for_key=True)
-    answer_key, df_key_view = engine.extract_answers(cell_map_key, template)
+    cell_map_key = engine.evaluate_questions(key_bgr, tq, for_key=True)
+    answer_key, df_key_view = engine.extract_answers(cell_map_key, tq)
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2 = st.columns(2)
     with k1:
-        st.metric("عدد الأسئلة المكتشف", template.q_count)
+        st.metric("عدد الأسئلة المكتشف", tq.q_count)
     with k2:
-        st.metric("عدد الخيارات المكتشف", template.choice_count)
-    with k3:
-        st.metric("أعمدة كود الطالب", 4)
-    with k4:
-        st.metric("صفوف كود الطالب", 10)
+        st.metric("عدد الخيارات المكتشف", tq.choice_count)
 
     st.markdown("### 🔑 Answer Key المستخرج (تأكد قبل التصحيح)")
     st.dataframe(df_key_view, width="stretch", height=320)
 
     if debug:
-        st.markdown("### Overlay (أخضر=كود، أحمر=مظلّل، أصفر=ملغي X، أزرق=أعمدة)")
-        ov = engine.draw_overlay(key_bgr, template, cell_map_key)
+        st.markdown("### Overlay (أحمر=مظلّل، أصفر=ملغي X، أزرق=أعمدة الأسئلة)")
+        ov = engine.draw_overlay_questions(key_bgr, tq, cell_map_key)
         st.image(cv2.cvtColor(ov, cv2.COLOR_BGR2RGB), use_container_width=True)
 
     if len(answer_key) == 0:
@@ -656,7 +713,7 @@ def main():
     st.divider()
 
     # ----------------------------
-    # 2) Grading
+    # 2) GRADING
     # ----------------------------
     st.subheader("2) التصحيح")
     if roster_up is None or not student_up:
@@ -683,11 +740,12 @@ def main():
             for pi, page in enumerate(pages, start=1):
                 img_bgr = to_bgr(page)
 
-                cell_map_student = engine.evaluate_cells(img_bgr, template, for_key=False)
-                sid = engine.decode_student_id(cell_map_student)
-                sname = roster.get(sid, "غير موجود")
+                bubbles_st, _ = engine.detect_bubbles(img_bgr)
+                sid = engine.decode_student_id(img_bgr, bubbles_st)
+                sname = roster.get(sid, "غير موجود") if sid != "UNKNOWN" else "UNKNOWN"
 
-                s_answers, _ = engine.extract_answers(cell_map_student, template)
+                cell_map_st = engine.evaluate_questions(img_bgr, tq, for_key=False)
+                s_answers, _ = engine.extract_answers(cell_map_st, tq)
 
                 correct = 0
                 total = len(answer_key)
@@ -714,13 +772,13 @@ def main():
                 })
 
                 er = {"file": up.name, "page": pi, "student_code": sid, "student_name": sname}
-                for q in range(1, template.q_count + 1):
+                for q in range(1, tq.q_count + 1):
                     er[f"Q{q}"] = s_answers.get(q, "")
                 export_rows.append(er)
 
                 if debug:
                     st.markdown(f"#### Overlay: {up.name} (page {pi})")
-                    ov2 = engine.draw_overlay(img_bgr, template, cell_map_student)
+                    ov2 = engine.draw_overlay_questions(img_bgr, tq, cell_map_st)
                     st.image(cv2.cvtColor(ov2, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         if not results:
