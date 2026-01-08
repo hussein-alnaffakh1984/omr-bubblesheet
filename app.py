@@ -578,63 +578,83 @@ def main():
             status = st.empty()
             
             results = []
-            unmatched_codes = []  # Track codes that weren't found
+            unmatched_codes = []
+            total_pages = 0
             
-            for idx, f in enumerate(sheets):
-                status.text(f"📝 {idx+1}/{len(sheets)}")
-                progress.progress((idx+1)/len(sheets))
+            # First, count total pages
+            for f in sheets:
+                try:
+                    b = read_bytes(f)
+                    pages = load_pages(b, f.name, 250)
+                    total_pages += len(pages)
+                except:
+                    pass
+            
+            st.info(f"📄 إجمالي الصفحات: {total_pages}")
+            
+            current_page = 0
+            
+            for file_idx, f in enumerate(sheets):
+                status.text(f"📝 معالجة ملف {file_idx+1}/{len(sheets)}: {f.name}")
                 
                 try:
                     b = read_bytes(f)
-                    p = load_pages(b, f.name, 250)
-                    if not p:
+                    pages = load_pages(b, f.name, 250)
+                    
+                    if not pages:
                         continue
                     
-                    bgr = pil_to_bgr(p[0])
-                    img = bgr_to_bytes(bgr)
-                    
-                    res = analyze_with_ai(img, api_key, False)
-                    
-                    if res.success and res.student_code:
-                        st_code = res.student_code.strip()
+                    # Process EACH page in the file
+                    for page_idx, page in enumerate(pages):
+                        current_page += 1
+                        status.text(f"📝 صفحة {current_page}/{total_pages} - ملف: {f.name} (صفحة {page_idx+1}/{len(pages)})")
+                        progress.progress(current_page / total_pages)
                         
-                        # Validate code format (digits only)
-                        if not st_code.isdigit():
-                            st.warning(f"⚠️ ورقة {idx+1}: كود غير صحيح '{st_code}' (يحتوي على أحرف)")
-                            continue
+                        bgr = pil_to_bgr(page)
+                        img = bgr_to_bytes(bgr)
                         
-                        # Allow codes of any length (4-10 digits typically)
-                        if len(st_code) < 4:
-                            st.warning(f"⚠️ ورقة {idx+1}: كود قصير جداً '{st_code}' (طوله {len(st_code)})")
-                            continue
+                        res = analyze_with_ai(img, api_key, False)
                         
-                        st_ans = res.answers
-                        
-                        student = find_student_by_code(st.session_state.students, st_code)
-                        
-                        if student:
-                            score, total, details = grade_student(st_ans, st.session_state.answer_key)
-                            pct = (score/total*100) if total > 0 else 0
+                        if res.success and res.student_code:
+                            st_code = res.student_code.strip()
                             
-                            results.append(GradingResult(
-                                student_id=student.student_id,
-                                name=student.name,
-                                detected_code=st_code,
-                                student_answers=st_ans,
-                                score=score,
-                                total=total,
-                                percentage=pct,
-                                details=details
-                            ))
-                            status.text(f"✅ {st_code}: {student.name}")
+                            # Validate code format (digits only)
+                            if not st_code.isdigit():
+                                st.warning(f"⚠️ صفحة {current_page}: كود غير صحيح '{st_code}' (يحتوي على أحرف)")
+                                continue
+                            
+                            # Allow codes of any length (4-10 digits typically)
+                            if len(st_code) < 4:
+                                st.warning(f"⚠️ صفحة {current_page}: كود قصير جداً '{st_code}' (طوله {len(st_code)})")
+                                continue
+                            
+                            st_ans = res.answers
+                            
+                            student = find_student_by_code(st.session_state.students, st_code)
+                            
+                            if student:
+                                score, total, details = grade_student(st_ans, st.session_state.answer_key)
+                                pct = (score/total*100) if total > 0 else 0
+                                
+                                results.append(GradingResult(
+                                    student_id=student.student_id,
+                                    name=student.name,
+                                    detected_code=st_code,
+                                    student_answers=st_ans,
+                                    score=score,
+                                    total=total,
+                                    percentage=pct,
+                                    details=details
+                                ))
+                                status.text(f"✅ صفحة {current_page}: {st_code} - {student.name} ({score}/{total})")
+                            else:
+                                unmatched_codes.append(st_code)
+                                st.warning(f"⚠️ صفحة {current_page}: الكود {st_code} غير موجود في القائمة")
                         else:
-                            unmatched_codes.append(st_code)
-                            st.warning(f"⚠️ الكود {st_code} غير موجود في القائمة")
-                    else:
-                        st.error(f"❌ فشل قراءة {f.name}")
+                            st.error(f"❌ فشل قراءة صفحة {current_page}")
                 
                 except Exception as e:
-                    st.error(f"❌ {f.name}: {e}")
+                    st.error(f"❌ خطأ في ملف {f.name}: {e}")
             
             st.session_state.results = results
             
