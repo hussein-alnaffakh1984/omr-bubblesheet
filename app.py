@@ -155,10 +155,10 @@ def find_bubble_centers_smart(bin_img: np.ndarray,
 def detect_bubble_regions_smart(centers: np.ndarray, w: int, h: int, 
                                 left_boundary_percent: float = 8.0) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
-    Smart region detection like a human would do:
-    1. Find question numbers area (far left, sparse)
-    2. Find answer bubbles (dense cluster after numbers)
-    3. Find ID bubbles (top right)
+    🧠 HUMAN-LIKE SMART DETECTION:
+    Think like a human: Question numbers are SPARSE on far left,
+    Answer bubbles are DENSE clusters after a clear GAP.
+    We FIND that gap automatically!
     """
     if centers.shape[0] < 20:
         raise ValueError("عدد الفقاعات قليل جداً")
@@ -174,10 +174,49 @@ def detect_bubble_regions_smart(centers: np.ndarray, w: int, h: int,
         "y_median": y_mid
     }
     
-    # Calculate left boundary
-    left_boundary = (left_boundary_percent / 100.0) * w
+    # 🎯 SMART APPROACH: Find the gap between question numbers and answers
+    # Step 1: Get all bubbles in the bottom-left area (questions region)
+    left_half_mask = (xs < x_mid) & (ys > 0.4 * h)
+    left_bubbles = centers[left_half_mask]
     
-    # ID section: top-right quadrant
+    if left_bubbles.shape[0] > 15:
+        # Step 2: Sort by x position
+        left_xs_sorted = np.sort(left_bubbles[:, 0])
+        
+        # Step 3: Find gaps between consecutive bubbles
+        gaps = np.diff(left_xs_sorted)
+        
+        # Step 4: Find the LARGEST gap in the first 20 bubbles
+        # This is likely the gap between question numbers and answer bubbles
+        search_range = min(20, len(gaps))
+        if search_range > 5:
+            # Look for the biggest gap
+            max_gap_idx = np.argmax(gaps[:search_range])
+            max_gap_size = gaps[max_gap_idx]
+            
+            # The boundary should be in the middle of this gap
+            boundary_pos = (left_xs_sorted[max_gap_idx] + left_xs_sorted[max_gap_idx + 1]) / 2
+            
+            # Validate: gap should be significant (at least 25 pixels)
+            if max_gap_size > 25:
+                left_boundary = boundary_pos
+                debug["detection_method"] = "auto_gap"
+                debug["gap_size"] = float(max_gap_size)
+            else:
+                # Fallback to percentage
+                left_boundary = (left_boundary_percent / 100.0) * w
+                debug["detection_method"] = "percentage"
+        else:
+            left_boundary = (left_boundary_percent / 100.0) * w
+            debug["detection_method"] = "percentage_fallback"
+    else:
+        left_boundary = (left_boundary_percent / 100.0) * w
+        debug["detection_method"] = "percentage_fallback"
+    
+    # Ensure boundary is reasonable (5-15% of width)
+    left_boundary = max(0.05 * w, min(left_boundary, 0.15 * w))
+    
+    # ID section: top-right quadrant (standard)
     id_mask = (xs > 0.6 * w) & (ys < 0.5 * h)
     id_centers = centers[id_mask]
     
@@ -185,18 +224,33 @@ def detect_bubble_regions_smart(centers: np.ndarray, w: int, h: int,
     if id_centers.shape[0] < 20:
         id_centers = centers[(xs > x_mid) & (ys < y_mid)]
     
-    # Questions section: after left boundary, in left half, bottom area
-    q_mask = (xs > left_boundary) & (xs < 0.55 * w) & (ys > 0.4 * h)
+    # Questions section: AFTER the detected boundary
+    right_boundary = 0.55 * w
+    q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)
     q_centers = centers[q_mask]
     
     # Fallback for questions
     if q_centers.shape[0] < 20:
         q_centers = centers[(xs > left_boundary) & (xs < x_mid) & (ys > y_mid)]
     
+    # Count filtered (question numbers)
+    filtered_mask = (xs <= left_boundary) & (ys > 0.4 * h)
+    filtered_count = np.sum(filtered_mask)
+    
     debug["id_count"] = id_centers.shape[0]
     debug["q_count"] = q_centers.shape[0]
     debug["left_boundary"] = left_boundary
-    debug["filtered_out"] = centers.shape[0] - id_centers.shape[0] - q_centers.shape[0]
+    debug["left_boundary_percent"] = (left_boundary / w) * 100
+    debug["filtered_out"] = filtered_count
+    
+    # 🔍 VALIDATION: Check if we got the right numbers
+    # We expect exactly 10 question numbers (or close)
+    if filtered_count < 8 or filtered_count > 12:
+        debug["warning"] = f"Expected ~10 question numbers, found {filtered_count}"
+    
+    # We expect 40 answer bubbles (10 questions × 4 choices)
+    if q_centers.shape[0] < 38 or q_centers.shape[0] > 42:
+        debug["warning"] = f"Expected ~40 answer bubbles, found {q_centers.shape[0]}"
     
     return id_centers, q_centers, debug
 
@@ -444,6 +498,20 @@ def auto_detect_smart(key_bgr: np.ndarray,
     notes.append(f"✅ منطقة الكود: {id_centers.shape[0]} فقاعة")
     notes.append(f"✅ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
     notes.append(f"✅ متجاهلة (أرقام): {reg_debug['filtered_out']} فقاعة")
+    
+    # Show detection method and boundary info
+    detection_method = reg_debug.get('detection_method', 'unknown')
+    if detection_method == 'auto_gap':
+        gap_size = reg_debug.get('gap_size', 0)
+        notes.append(f"🎯 **كشف ذكي**: تم إيجاد الفجوة تلقائياً! (فجوة: {gap_size:.1f} بكسل)")
+        notes.append(f"   → الحد الفاصل المحسوب: {reg_debug.get('left_boundary_percent', 0):.1f}%")
+    else:
+        notes.append(f"📏 استخدام النسبة اليدوية: {reg_debug.get('left_boundary_percent', 0):.1f}%")
+    
+    # Show warnings if validation failed
+    if 'warning' in reg_debug:
+        notes.append(f"⚠️ **تحذير**: {reg_debug['warning']}")
+        notes.append(f"   💡 قد تحتاج تعديل معايير الكشف أو الخط الفاصل")
     
     # Step 3: Estimate grid dimensions
     id_rows, id_cols, id_conf = estimate_grid_smart(id_centers, is_questions=False)
