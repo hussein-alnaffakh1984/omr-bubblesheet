@@ -1,7 +1,8 @@
 # app.py
 # ============================================================
-# ✅ Smart OMR (Auto-learn from Answer Key) + Ignore X Marks
-# ✅ Policy: "لو شطب خيار واحد + ظلّل خيار آخر → اختر المظلّل فقط"
+# ✅ Smart OMR (Auto-learn from Answer Key)
+# ✅ Student sheets: Ignore X-marked choice + pick filled choice
+# ✅ Answer key: NO X detection (key is read by fill only)
 # ============================================================
 
 import io
@@ -52,7 +53,7 @@ def bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
 # ==============================
 @dataclass
 class BubbleGrid:
-    centers: np.ndarray  # (rows, cols, 2) float
+    centers: np.ndarray  # (rows, cols, 2)
     rows: int
     cols: int
 
@@ -71,7 +72,7 @@ class LearnedTemplate:
 
 
 # ==============================
-# Preprocess (for learning bubble centers)
+# Detection preprocess
 # ==============================
 def preprocess_binary_for_detection(bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -115,7 +116,7 @@ def find_bubble_centers(bin_img: np.ndarray,
 
 
 # ==============================
-# Build grids
+# Grid building
 # ==============================
 def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
     idx = np.argsort(values)
@@ -153,7 +154,6 @@ def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid
             else:
                 grid[r, c] = (np.median(xs), np.median(ys))
 
-    # Ensure order
     row_meds = np.median(grid[:, :, 1], axis=1)
     col_meds = np.median(grid[:, :, 0], axis=0)
     grid = grid[np.argsort(row_meds)][:, np.argsort(col_meds)]
@@ -165,15 +165,12 @@ def split_id_questions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray,
     xs = centers[:, 0]
     ys = centers[:, 1]
 
-    # ID usually top-right
     id_mask = (xs > 0.55 * w) & (ys < 0.55 * h)
-    # Questions usually lower-left
     q_mask = (xs < 0.55 * w) & (ys > 0.40 * h)
 
     id_centers = centers[id_mask]
     q_centers = centers[q_mask]
 
-    # Fallback if strict
     if id_centers.shape[0] < 25:
         id_centers = centers[(xs > np.median(xs)) & (ys < np.median(ys))]
     if q_centers.shape[0] < 25:
@@ -183,7 +180,7 @@ def split_id_questions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray,
 
 
 # ==============================
-# ORB alignment (student -> key)
+# ORB alignment
 # ==============================
 def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray, bool, int]:
     h, w = ref_bgr.shape[:2]
@@ -212,7 +209,7 @@ def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray,
     src = np.float32([k1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     dst = np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
     if H is None:
         return cv2.resize(student_bgr, (w, h)), False, len(good)
 
@@ -221,10 +218,7 @@ def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray,
 
 
 # ==============================
-# SMART Bubble reading:
-# - Darkness (mean) chooses filled
-# - X-mark detector excludes crossed bubbles
-# - Policy: if X exists + a filled exists -> pick filled only
+# Bubble analysis
 # ==============================
 def bubble_roi(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> np.ndarray:
     h, w = gray.shape[:2]
@@ -268,18 +262,41 @@ def bubble_stats(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> dict:
     return {"mean": mean, "std": std, "xscore": score}
 
 
-def pick_choice_smart(stats_list: List[dict],
-                      labels: List[str],
-                      blank_mean_thresh: float,
-                      diff_thresh: float,
-                      x_std_thresh: float,
-                      x_score_thresh: float,
-                      filled_mean_thresh: float) -> Tuple[str, str, List[bool]]:
+# ==============================
+# Choice pickers
+# ==============================
+def pick_choice_key_only(stats_list: List[dict],
+                         labels: List[str],
+                         blank_mean_thresh: float,
+                         diff_thresh: float) -> Tuple[str, str]:
+    """Answer key: ignore X detection, pick by fill only."""
+    means = [s["mean"] for s in stats_list]
+    idx = np.argsort(means)  # darker first
+    best = int(idx[0])
+    second = int(idx[1]) if len(idx) > 1 else best
+
+    best_m = means[best]
+    second_m = means[second]
+
+    if best_m > blank_mean_thresh:
+        return "?", "BLANK"
+    if (second_m - best_m) < diff_thresh:
+        return "!", "DOUBLE"
+    return labels[best], "OK"
+
+
+def pick_choice_student_smart(stats_list: List[dict],
+                             labels: List[str],
+                             blank_mean_thresh: float,
+                             diff_thresh: float,
+                             x_std_thresh: float,
+                             x_score_thresh: float,
+                             filled_mean_thresh: float) -> Tuple[str, str, List[bool]]:
     """
-    Policy:
-    - cancelled (X) excluded.
-    - if any X exists and best (not-cancelled) looks filled -> choose it OK.
-    - double evaluated only among not-cancelled.
+    Student sheet policy:
+    - cancelled bubbles (X) are excluded.
+    - if any X exists AND best remaining looks filled -> choose it OK.
+    - double evaluated only among remaining (not-cancelled).
     """
     cancelled = []
     means = []
@@ -299,7 +316,7 @@ def pick_choice_smart(stats_list: List[dict],
     if best_m > blank_mean_thresh:
         return "?", "BLANK", cancelled
 
-    # ✅ Special policy for your case
+    # ✅ policy you asked for
     if any(cancelled) and best_m <= filled_mean_thresh:
         return labels[best], "OK", cancelled
 
@@ -333,7 +350,7 @@ def load_roster(file, id_digits: int) -> Dict[str, str]:
 
 
 # ==============================
-# Learn template from Answer Key
+# Template learning
 # ==============================
 def learn_template(key_bgr: np.ndarray,
                    id_rows: int, id_digits: int,
@@ -345,7 +362,6 @@ def learn_template(key_bgr: np.ndarray,
     centers = find_bubble_centers(bin_key, min_area=min_area, max_area=max_area, min_circularity=min_circ)
 
     id_centers, q_centers = split_id_questions(centers, w, h)
-
     id_grid = build_grid(id_centers, rows=id_rows, cols=id_digits)
     q_grid = build_grid(q_centers, rows=num_q, cols=num_choices)
 
@@ -360,17 +376,23 @@ def learn_template(key_bgr: np.ndarray,
         num_q=num_q, num_choices=num_choices,
         id_rows=id_rows, id_digits=id_digits
     )
-    dbg = {"bin_key": bin_key, "centers": centers, "id_centers": id_centers, "q_centers": q_centers}
+
+    dbg = {
+        "bin_key": bin_key,
+        "centers": centers,
+        "id_centers": id_centers,
+        "q_centers": q_centers
+    }
     return template, dbg
 
 
+# ==============================
+# Key extraction (NO X)
+# ==============================
 def extract_answer_key(template: LearnedTemplate,
                        choices: List[str],
                        blank_mean_thresh: float,
-                       diff_thresh: float,
-                       x_std_thresh: float,
-                       x_score_thresh: float,
-                       filled_mean_thresh: float) -> Tuple[Dict[int, str], pd.DataFrame]:
+                       diff_thresh: float) -> Tuple[Dict[int, str], pd.DataFrame]:
     gray = cv2.cvtColor(template.ref_bgr, cv2.COLOR_BGR2GRAY)
     key = {}
     rows_dbg = []
@@ -381,14 +403,13 @@ def extract_answer_key(template: LearnedTemplate,
             cx, cy = template.q_grid.centers[r, c]
             stats.append(bubble_stats(gray, int(cx), int(cy), win=18))
 
-        ans, status, cancelled = pick_choice_smart(
+        ans, status = pick_choice_key_only(
             stats, choices,
             blank_mean_thresh=blank_mean_thresh,
-            diff_thresh=diff_thresh,
-            x_std_thresh=x_std_thresh,
-            x_score_thresh=x_score_thresh,
-            filled_mean_thresh=filled_mean_thresh
+            diff_thresh=diff_thresh
         )
+        cancelled = [False] * len(choices)
+
         if status == "OK":
             key[r + 1] = ans
 
@@ -409,12 +430,16 @@ def extract_answer_key(template: LearnedTemplate,
     return key, df_dbg
 
 
+# ==============================
+# Student ID reading
+# ==============================
 def read_student_id(template: LearnedTemplate,
                     gray: np.ndarray,
                     blank_mean_thresh: float,
                     diff_thresh: float) -> Tuple[str, pd.DataFrame]:
     digits = []
     dbg_rows = []
+
     for c in range(template.id_grid.cols):
         means = []
         for r in range(template.id_grid.rows):
@@ -423,7 +448,7 @@ def read_student_id(template: LearnedTemplate,
             means.append(float(np.mean(roi)))
 
         labels = [str(i) for i in range(template.id_grid.rows)]
-        idx = np.argsort(means)  # darker first
+        idx = np.argsort(means)
         best = int(idx[0]); second = int(idx[1]) if len(idx) > 1 else best
         best_m = means[best]; second_m = means[second]
 
@@ -441,6 +466,9 @@ def read_student_id(template: LearnedTemplate,
     return "".join(digits), df_dbg
 
 
+# ==============================
+# Student answers reading (WITH X)
+# ==============================
 def read_student_answers(template: LearnedTemplate,
                          gray: np.ndarray,
                          choices: List[str],
@@ -450,13 +478,13 @@ def read_student_answers(template: LearnedTemplate,
                          x_score_thresh: float,
                          filled_mean_thresh: float) -> pd.DataFrame:
     out = []
-    for r in range(template.q_grid.rows):
+    for r in rangetemplate.q_grid.rows):
         stats = []
         for c in range(template.q_grid.cols):
             cx, cy = template.q_grid.centers[r, c]
             stats.append(bubble_stats(gray, int(cx), int(cy), win=18))
 
-        ans, status, cancelled = pick_choice_smart(
+        ans, status, cancelled = pick_choice_student_smart(
             stats, choices,
             blank_mean_thresh=blank_mean_thresh,
             diff_thresh=diff_thresh,
@@ -482,11 +510,11 @@ def read_student_answers(template: LearnedTemplate,
 
 
 # ==============================
-# Streamlit UI
+# UI
 # ==============================
 def main():
-    st.set_page_config(page_title="Smart OMR (X Policy)", layout="wide")
-    st.title("✅ Smart OMR: يتعلّم من الأنسر + يتجاهل الإجابة المشطوبة (X)")
+    st.set_page_config(page_title="Smart OMR (Key no-X, Student X)", layout="wide")
+    st.title("✅ Smart OMR: الأنسر بدون X + الطالب مع كشف X وسياسة الشطب")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -521,16 +549,16 @@ def main():
     with d3:
         min_circ = st.slider("min_circularity", 0.30, 0.95, 0.55, 0.01)
 
-    st.subheader("قراءة التظليل + كشف X (مع سياسة الشطب)")
+    st.subheader("Thresholds (Key + Student)")
     r1, r2, r3, r4, r5 = st.columns(5)
     with r1:
         blank_mean_thresh = st.slider("Blank mean threshold", 120, 240, 170, 1)
     with r2:
         diff_thresh = st.slider("Double diff threshold", 3, 60, 12, 1)
     with r3:
-        x_std_thresh = st.slider("X std threshold", 5.0, 80.0, 25.0, 1.0)
+        x_std_thresh = st.slider("X std threshold (student)", 5.0, 80.0, 25.0, 1.0)
     with r4:
-        x_score_thresh = st.slider("X line score threshold", 0.0, 10.0, 1.2, 0.1)
+        x_score_thresh = st.slider("X line score threshold (student)", 0.0, 10.0, 1.2, 0.1)
     with r5:
         filled_mean_thresh = st.slider("Filled mean threshold (X + Filled => choose Filled)", 80, 200, 150, 1)
 
@@ -548,7 +576,7 @@ def main():
         st.error(f"خطأ ملف الطلاب: {e}")
         return
 
-    # Load key
+    # Load key page
     try:
         key_pages = load_pages(read_bytes(key_file), key_file.name, dpi=int(dpi))
         if not key_pages:
@@ -572,24 +600,21 @@ def main():
         st.error(f"❌ فشل تعلم القالب: {e}")
         return
 
-    # Extract answer key
+    # Extract answer key (NO X)
     answer_key, df_key_dbg = extract_answer_key(
         template,
         choices=choices,
         blank_mean_thresh=float(blank_mean_thresh),
         diff_thresh=float(diff_thresh),
-        x_std_thresh=float(x_std_thresh),
-        x_score_thresh=float(x_score_thresh),
-        filled_mean_thresh=float(filled_mean_thresh)
     )
     st.write("🔑 Answer Key المستخرج:")
     st.write(answer_key)
 
     if debug:
         st.markdown("---")
-        st.subheader("Debug: Key learning")
+        st.subheader("Debug: Template learning on Key")
         st.image(bgr_to_rgb(key_bgr), caption="Answer Key (Original)", width="stretch")
-        st.image(dbg["bin_key"], caption="Binary (for detection only)", width="stretch")
+        st.image(dbg["bin_key"], caption="Binary (for bubble center detection)", width="stretch")
 
         vis = key_bgr.copy()
         for (x, y) in dbg["id_centers"]:
