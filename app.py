@@ -257,38 +257,46 @@ def split_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.n
     return id_c, q_c
 
 
-# =========================
-# Build question rows "by reality"
-# row is valid if it contains (k) aligned bubbles in X
-# =========================
 def build_question_rows(q_centers: np.ndarray, col_x: np.ndarray) -> np.ndarray:
+    """
+    Detect real question rows without forcing question count.
+    Row is valid if it hits most columns (>= k-1) using adaptive tolerances.
+    """
+    if q_centers.shape[0] < 10:
+        return np.array([], dtype=np.float32)
+
+    # candidate rows by Y clustering
     row_y_all = group_1d_positions(q_centers[:, 1])
     if len(row_y_all) == 0:
         return row_y_all
 
     k = len(col_x)
+
+    # ---- adaptive tolerances from data (instead of fixed 12/14)
+    # estimate typical bubble spacing in X and Y
+    xs = np.sort(q_centers[:, 0].astype(np.float32))
+    ys = np.sort(q_centers[:, 1].astype(np.float32))
+    dx = np.diff(xs); dx = dx[(dx > 2) & (dx < 200)]
+    dy = np.diff(ys); dy = dy[(dy > 2) & (dy < 200)]
+    tol_x = max(10.0, float(np.percentile(dx, 15)) * 0.60) if len(dx) else 14.0
+    tol_y = max(10.0, float(np.percentile(dy, 15)) * 0.60) if len(dy) else 12.0
+
     valid_rows = []
-
-    # tolerance relative to spacing
-    tol_y = 12
-
     for y0 in row_y_all:
         near = q_centers[np.abs(q_centers[:, 1] - y0) < tol_y]
-        if near.shape[0] < k:
+        if near.shape[0] < max(2, k - 1):
             continue
 
-        # count how many near each chosen column
         hits = 0
         for x0 in col_x:
-            if np.any(np.abs(near[:, 0] - x0) < 14):
+            if np.any(np.abs(near[:, 0] - x0) < tol_x):
                 hits += 1
 
-        # real question row should hit most columns
-        if hits >= k:
+        # ✅ لا نجبر "كل الأعمدة" — نخليها >= k-1
+        if hits >= max(2, k - 1):
             valid_rows.append(y0)
 
     return np.array(valid_rows, dtype=np.float32)
-
 
 # =========================
 # Alignment: student->key (ORB homography)
