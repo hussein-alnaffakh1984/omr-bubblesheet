@@ -276,7 +276,10 @@ def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
 
 
 def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid]:
-    if centers.shape[0] < int(rows * cols * 0.6):  # More lenient threshold
+    """
+    Build grid even with some missing bubbles by using interpolation
+    """
+    if centers.shape[0] < int(rows * cols * 0.5):  # Need at least 50%
         return None
 
     xs = centers[:, 0].astype(np.float32)
@@ -288,22 +291,66 @@ def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid
     grid = np.zeros((rows, cols, 2), dtype=np.float32)
     cnt = np.zeros((rows, cols), dtype=np.int32)
 
+    # Collect bubbles into grid cells
     for (x, y), r, c in zip(centers, rlab, clab):
         grid[r, c, 0] += x
         grid[r, c, 1] += y
         cnt[r, c] += 1
 
+    # Average positions for cells with bubbles
     for r in range(rows):
         for c in range(cols):
             if cnt[r, c] > 0:
                 grid[r, c] /= cnt[r, c]
-            else:
-                grid[r, c] = (np.median(xs), np.median(ys))
 
-    # Ensure ordering
-    row_meds = np.median(grid[:, :, 1], axis=1)
-    col_meds = np.median(grid[:, :, 0], axis=0)
-    grid = grid[np.argsort(row_meds)][:, np.argsort(col_meds)]
+    # Interpolate missing bubbles
+    # First, calculate row and column medians
+    row_meds_y = []
+    col_meds_x = []
+    
+    for r in range(rows):
+        filled_in_row = [grid[r, c, 1] for c in range(cols) if cnt[r, c] > 0]
+        if filled_in_row:
+            row_meds_y.append(np.median(filled_in_row))
+        else:
+            row_meds_y.append(0)  # Will fix later
+    
+    for c in range(cols):
+        filled_in_col = [grid[r, c, 0] for r in range(rows) if cnt[r, c] > 0]
+        if filled_in_col:
+            col_meds_x.append(np.median(filled_in_col))
+        else:
+            col_meds_x.append(0)  # Will fix later
+    
+    # Fix empty row/col medians
+    if any(x == 0 for x in row_meds_y):
+        valid_y = [y for y in row_meds_y if y > 0]
+        if valid_y:
+            y_spacing = np.median(np.diff(sorted(valid_y))) if len(valid_y) > 1 else 50
+            for i in range(len(row_meds_y)):
+                if row_meds_y[i] == 0:
+                    row_meds_y[i] = min(valid_y) + i * y_spacing
+    
+    if any(x == 0 for x in col_meds_x):
+        valid_x = [x for x in col_meds_x if x > 0]
+        if valid_x:
+            x_spacing = np.median(np.diff(sorted(valid_x))) if len(valid_x) > 1 else 50
+            for i in range(len(col_meds_x)):
+                if col_meds_x[i] == 0:
+                    col_meds_x[i] = min(valid_x) + i * x_spacing
+    
+    # Fill missing cells using row/col medians
+    for r in range(rows):
+        for c in range(cols):
+            if cnt[r, c] == 0:
+                grid[r, c, 0] = col_meds_x[c]
+                grid[r, c, 1] = row_meds_y[r]
+
+    # Ensure proper ordering
+    row_order = np.argsort([row_meds_y[r] for r in range(rows)])
+    col_order = np.argsort([col_meds_x[c] for c in range(cols)])
+    
+    grid = grid[row_order][:, col_order]
 
     return BubbleGrid(centers=grid, rows=rows, cols=cols)
 
@@ -397,6 +444,18 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
         raise ValueError("فشل بناء شبكة الكود. جرب تعديل معايير الكشف.")
     if q_grid is None:
         raise ValueError("فشل بناء شبكة الأسئلة. جرب تعديل معايير الكشف.")
+    
+    # Check for missing bubbles and warn
+    id_expected = id_rows_est * id_cols_est
+    id_actual = id_centers.shape[0]
+    if id_actual < id_expected:
+        notes.append(f"⚠️ ناقص {id_expected - id_actual} فقاعة من الكود - سيتم التقدير")
+    
+    q_expected = q_rows_est * q_cols_est
+    q_actual = q_centers.shape[0]
+    if q_actual < q_expected:
+        notes.append(f"⚠️ ناقص {q_expected - q_actual} فقاعة من الأسئلة - سيتم التقدير")
+        notes.append("   💡 جرب تقليل min_area أو زيادة max_area لكشف المزيد من الفقاعات")
     
     # Extract answer key by reading filled bubbles with DETAILED DEBUG
     answer_key = {}
@@ -679,14 +738,20 @@ def main():
     dpi = st.slider("DPI (جودة المسح)", 150, 400, 250, 10)
 
     # Detection parameters (for both modes)
-    with st.expander("⚙️ إعدادات اكتشاف الفقاعات"):
+    with st.expander("⚙️ إعدادات اكتشاف الفقاعات - **هام جداً!**", expanded=True):
+        st.warning("⚠️ إذا كان عدد الفقاعات المكتشفة ناقص، عدّل هذه الإعدادات:")
         d1, d2, d3 = st.columns(3)
         with d1:
-            min_area = st.number_input("min_area", 20, 2000, 120, 10)
+            min_area = st.number_input("min_area (كلما قل = يكشف فقاعات أصغر)", 20, 2000, 100, 10,
+                                      help="الحد الأدنى لمساحة الفقاعة - قلله إذا كانت الفقاعات صغيرة")
         with d2:
-            max_area = st.number_input("max_area", 1000, 30000, 9000, 500)
+            max_area = st.number_input("max_area (كلما كبر = يكشف فقاعات أكبر)", 1000, 30000, 10000, 500,
+                                      help="الحد الأقصى لمساحة الفقاعة - زوده إذا كانت الفقاعات كبيرة")
         with d3:
-            min_circ = st.slider("min_circularity", 0.30, 0.95, 0.55, 0.01)
+            min_circ = st.slider("min_circularity (كلما قل = يقبل أشكال أقل استدارة)", 0.30, 0.95, 0.50, 0.01,
+                               help="يقيس مدى استدارة الشكل - قلله إذا كانت الفقاعات بيضاوية")
+        
+        st.info("💡 **نصيحة:** ابدأ بتقليل min_area إلى 80-90 إذا كان عدد الفقاعات ناقص")
 
     # Reading parameters
     with st.expander("✅ إعدادات قراءة التظليل"):
@@ -793,10 +858,16 @@ def main():
                             cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 0), 2)
                         
                         # Add text labels
-                        cv2.putText(vis, f"ID: {id_ctrs.shape[0]} bubbles", (10, 30), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                        cv2.putText(vis, f"Q: {q_ctrs.shape[0]} bubbles", (10, 70), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        cv2.putText(vis, f"ID: {id_ctrs.shape[0]}/{auto_params.id_rows * auto_params.id_digits}", (10, 30), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        cv2.putText(vis, f"Q: {q_ctrs.shape[0]}/{auto_params.num_questions * auto_params.num_choices}", (10, 60), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        # Show missing count
+                        q_missing = (auto_params.num_questions * auto_params.num_choices) - q_ctrs.shape[0]
+                        if q_missing > 0:
+                            cv2.putText(vis, f"Missing: {q_missing} bubbles!", (10, 90), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         
                         col1, col2 = st.columns(2)
                         with col1:
@@ -804,8 +875,16 @@ def main():
                         with col2:
                             st.image(bgr_to_rgb(vis), caption="المناطق المكتشفة: 🔴 ID | 🟢 أسئلة", use_container_width=True)
                         
-                        st.info(f"📊 توزيع الفقاعات: ID={id_ctrs.shape[0]} | Questions={q_ctrs.shape[0]} | Total={all_centers.shape[0]}")
+                        missing_info = f"📊 توزيع الفقاعات: ID={id_ctrs.shape[0]} | Questions={q_ctrs.shape[0]} | Total={all_centers.shape[0]}"
+                        if q_missing > 0:
+                            st.error(f"{missing_info} | ⚠️ ناقص {q_missing} فقاعة!")
+                            st.warning("🔧 **لإصلاح المشكلة:** قلل min_area إلى 80-100 أو قلل min_circularity إلى 0.45")
+                        else:
+                            st.success(missing_info)
                         
+                        # Show binary image for debugging
+                        st.image(bin_key, caption="الصورة الثنائية (Binary) - الفقاعات تظهر بيضاء", use_container_width=True)
+                        st.info("💡 تحقق من الصورة الثنائية: هل كل الفقاعات تظهر بوضوح؟")
             else:
                 st.error("❌ لم يتم اكتشاف أي إجابات مظللة!")
                 st.warning("🔧 **حلول مقترحة:**")
