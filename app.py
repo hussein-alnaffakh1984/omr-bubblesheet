@@ -513,12 +513,11 @@ def main():
         if st.session_state.students:
             df = pd.DataFrame([
                 {"ID": s.student_id, "Name": s.name, "Code": s.code}
-                for s in st.session_state.students[:20]
+                for s in st.session_state.students  # عرض الكل!
             ])
             st.dataframe(df, width='stretch')
             
-            if len(st.session_state.students) > 20:
-                st.info(f"عرض 20 من {len(st.session_state.students)}")
+            st.info(f"✅ تم تحميل {len(st.session_state.students)} طالب")
     
     # ============================================================
     # TAB 3: Grading
@@ -627,11 +626,13 @@ def main():
                 st.code(codes_text)
                 
                 # Show available codes for comparison
-                with st.expander("🔍 الأكواد المتاحة في قائمة الطلاب (أول 20)"):
-                    available = [s.code for s in st.session_state.students[:20]]
-                    st.code(", ".join(available))
-                    if len(st.session_state.students) > 20:
-                        st.info(f"عرض 20 من {len(st.session_state.students)} طالب")
+                with st.expander("🔍 الأكواد المتاحة في قائمة الطلاب"):
+                    available = [s.code for s in st.session_state.students]
+                    # Show in chunks of 10 per line for better readability
+                    for i in range(0, len(available), 10):
+                        chunk = available[i:i+10]
+                        st.code(", ".join(chunk))
+                    st.info(f"الإجمالي: {len(st.session_state.students)} طالب")
                 
                 st.info("""
                 **💡 حلول:**
