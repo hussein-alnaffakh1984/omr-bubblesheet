@@ -1,5 +1,13 @@
+# ============================================================
+# Hybrid OMR (Rule-based) + Smart Auto-Template (No manual ROI)
+# Works best for your sheet pattern:
+# - Student ID grid: 4 digits x 10 rows (0..9), located on the right
+# - Questions grid: variable rows, choices in {2,4,5}, located left/middle
+# - Handles: (crossed bubble + filled other) => choose filled other
+# ============================================================
+
 import io
-import traceback
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -7,796 +15,872 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pdf2image import convert_from_bytes
 from PIL import Image
+from pdf2image import convert_from_bytes
 
 
-# ============================================================
-# Helpers: file reading / conversion
-# ============================================================
-def read_bytes(uploaded_file) -> bytes:
-    if uploaded_file is None:
-        return b""
-    try:
-        return uploaded_file.getbuffer().tobytes()
-    except Exception:
-        try:
-            return uploaded_file.read()
-        except Exception:
-            return b""
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def read_uploaded_bytes(up):
+    """Streamlit UploadedFile -> bytes (robust across versions)."""
+    if up is None:
+        return None
+    if hasattr(up, "getvalue"):
+        return up.getvalue()
+    return up.read()
 
 
-def load_pages(file_bytes: bytes, filename: str, dpi: int = 300) -> List[Image.Image]:
-    if filename.lower().endswith(".pdf"):
+def pil_from_bytes(file_bytes: bytes, filename: str, dpi: int = 300) -> List[Image.Image]:
+    """Return list of PIL pages (PDF->pages, Image->single)."""
+    name = (filename or "").lower()
+    if name.endswith(".pdf"):
         pages = convert_from_bytes(file_bytes, dpi=dpi)
-        return [p.convert("RGB") for p in pages]
-    return [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
+        return [p.convert("RGB") for p in pages] if pages else []
+    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    return [img]
 
 
-def pil_to_bgr(pil_img: Image.Image) -> np.ndarray:
+def to_bgr(pil_img: Image.Image) -> np.ndarray:
     arr = np.array(pil_img)
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
-def bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+def resize_max(img: np.ndarray, max_side: int = 2200) -> np.ndarray:
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m <= max_side:
+        return img
+    scale = max_side / m
+    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
-def safe_int(x) -> int:
-    try:
-        if isinstance(x, np.ndarray):
-            x = x.ravel()
-            return int(round(float(x[0]))) if x.size else 0
-        return int(round(float(x)))
-    except Exception:
-        return 0
+def gray_blur(img_bgr: np.ndarray) -> np.ndarray:
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    return g
 
 
-# ============================================================
-# Data structures
-# ============================================================
-@dataclass
-class BubbleGrid:
-    row_y: np.ndarray      # (R,)
-    col_x: np.ndarray      # (C,)
-    centers: np.ndarray    # (R,C,2)
-    rows: int
-    cols: int
-
-
-@dataclass
-class LearnedTemplate:
-    ref_bgr: np.ndarray
-    ref_w: int
-    ref_h: int
-    id_grid: BubbleGrid
-    q_grid: BubbleGrid
-    num_q: int
-    num_choices: int
-    id_rows: int = 10
-    id_digits: int = 4
-
-
-# ============================================================
-# Preprocessing & bubble centers
-# ============================================================
-def preprocess_binary(bgr: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    bin_img = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 31, 7
+def adaptive_bin_inv(gray: np.ndarray) -> np.ndarray:
+    # robust threshold (black marks -> white in binary)
+    return cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 7
     )
-    bin_img = cv2.medianBlur(bin_img, 3)
-    return bin_img
 
 
-def find_bubble_centers(bin_img: np.ndarray) -> np.ndarray:
-    cnts, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return np.zeros((0, 2), dtype=np.int32)
+# ----------------------------
+# Detection Models
+# ----------------------------
 
-    rec = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < 25:
-            continue
-        peri = cv2.arcLength(c, True)
-        if peri < 25:
-            continue
-        circ = 4.0 * np.pi * area / (peri * peri + 1e-6)
-        x, y, w, h = cv2.boundingRect(c)
-        ar = w / (h + 1e-6)
-        rec.append((area, circ, ar, c))
-
-    if not rec:
-        return np.zeros((0, 2), dtype=np.int32)
-
-    areas = np.array([r[0] for r in rec], dtype=np.float32)
-    loga = np.log(np.clip(areas, 1, None))
-    hist, edges = np.histogram(loga, bins=25)
-    pk = int(np.argmax(hist))
-    lo = float(edges[pk])
-    hi = float(edges[min(pk + 1, len(edges) - 1)])
-
-    area_lo = float(np.exp(lo)) * 0.45
-    area_hi = float(np.exp(hi)) * 3.0
-
-    centers = []
-    for area, circ, ar, c in rec:
-        if not (area_lo <= area <= area_hi):
-            continue
-        if circ < 0.35:
-            continue
-        if not (0.75 <= ar <= 1.35):
-            continue
-        M = cv2.moments(c)
-        if abs(M["m00"]) < 1e-6:
-            continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        centers.append((cx, cy))
-
-    return np.array(centers, dtype=np.int32) if centers else np.zeros((0, 2), dtype=np.int32)
+@dataclass
+class Bubble:
+    x: float
+    y: float
+    r: float
+    fill: float = 0.0
+    x_score: float = 0.0
+    cancelled: bool = False
 
 
-# ============================================================
-# 1D grouping / snapping (no sklearn)
-# ============================================================
-def robust_gap_tolerance(sorted_vals: np.ndarray) -> float:
-    if len(sorted_vals) < 6:
-        return 10.0
-    diffs = np.diff(sorted_vals)
-    diffs = diffs[diffs > 0]
-    if len(diffs) == 0:
-        return 10.0
-    p10 = np.percentile(diffs, 10)
-    p40 = np.percentile(diffs, 40)
-    small = diffs[(diffs >= p10) & (diffs <= p40)]
-    base = float(np.median(small)) if len(small) else float(np.median(diffs))
-    return max(6.0, base * 0.70)
+@dataclass
+class AutoTemplate:
+    # ID grid:
+    id_cols_x: List[float]          # 4 x positions
+    id_rows_y: List[float]          # 10 y positions
+    # Questions:
+    q_cols_x: List[float]           # 2/4/5 x positions
+    q_rows_y: List[float]           # N y positions (N questions)
+    # Some debug info:
+    choice_count: int               # 2/4/5
+    q_count: int
+    debug: Dict
 
 
-def group_1d_positions(values: np.ndarray) -> np.ndarray:
-    v = np.sort(values.astype(np.float32))
-    if len(v) == 0:
-        return np.array([], dtype=np.float32)
-    tol = robust_gap_tolerance(v)
-    groups = []
-    cur = [v[0]]
-    for x in v[1:]:
-        if (x - cur[-1]) <= tol:
-            cur.append(x)
-        else:
-            groups.append(cur)
-            cur = [x]
-    groups.append(cur)
-    centers = np.array([float(np.mean(g)) for g in groups], dtype=np.float32)
-    return np.sort(centers)
+# ----------------------------
+# Core OMR Engine
+# ----------------------------
 
+class OMRSmartEngine:
 
-def select_best_columns(col_x: np.ndarray, k: int) -> np.ndarray:
-    col_x = np.sort(col_x.astype(np.float32))
-    n = len(col_x)
-    if n <= k:
-        return col_x
-    best = None
-    best_score = 1e18
-    for i in range(0, n - k + 1):
-        win = col_x[i:i+k]
-        span = float(win[-1] - win[0])
-        dif = np.diff(win)
-        sstd = float(np.std(dif)) if len(dif) else 0.0
-        score = span + 80.0 * sstd
-        if score < best_score:
-            best_score = score
-            best = win
-    return np.array(best, dtype=np.float32) if best is not None else col_x[:k]
+    def __init__(
+        self,
+        blank_fill_thr: float = 0.14,
+        double_gap_thr: float = 0.03,
+        x_hough_min_votes: int = 12,
+        x_score_thr_student: float = 1.20,
+        x_score_thr_key: float = 0.90,
+        bubble_margin_ratio: float = 0.22
+    ):
+        self.blank_fill_thr = float(blank_fill_thr)
+        self.double_gap_thr = float(double_gap_thr)
+        self.x_hough_min_votes = int(x_hough_min_votes)
+        self.x_score_thr_student = float(x_score_thr_student)
+        self.x_score_thr_key = float(x_score_thr_key)
+        self.bubble_margin_ratio = float(bubble_margin_ratio)
 
+    # -------- bubble finding --------
 
-def snap_to_grid(centers_xy: np.ndarray, row_y: np.ndarray, col_x: np.ndarray) -> np.ndarray:
-    R = len(row_y)
-    C = len(col_x)
-    grid = np.zeros((R, C, 2), dtype=np.float32)
-    cnt = np.zeros((R, C), dtype=np.int32)
+    def detect_bubbles(self, img_bgr: np.ndarray) -> Tuple[List[Bubble], Dict]:
+        """
+        Detect circular bubbles using contour circularity.
+        Returns list of bubble centers and radii.
+        """
+        dbg = {}
+        img = resize_max(img_bgr, max_side=2400)
+        g = gray_blur(img)
+        b = adaptive_bin_inv(g)
 
-    for xy in centers_xy:
-        x = float(xy[0]); y = float(xy[1])
-        ri = int(np.argmin(np.abs(row_y - y)))
-        ci = int(np.argmin(np.abs(col_x - x)))
-        grid[ri, ci, 0] += x
-        grid[ri, ci, 1] += y
-        cnt[ri, ci] += 1
+        # Clean small noise
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        b2 = cv2.morphologyEx(b, cv2.MORPH_OPEN, k, iterations=1)
 
-    for r in range(R):
-        for c in range(C):
-            if cnt[r, c] > 0:
-                grid[r, c] /= cnt[r, c]
-            else:
-                grid[r, c] = (col_x[c], row_y[r])
-    return grid
+        contours, _ = cv2.findContours(b2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        bubbles: List[Bubble] = []
+        h, w = b2.shape[:2]
 
-# ============================================================
-# Split regions (ID vs Questions)
-# ============================================================
-def split_regions(centers: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    xs = centers[:, 0].astype(np.float32)
-    splits = np.percentile(xs, [30, 35, 40, 45, 50, 55, 60, 65])
+        # dynamic thresholds by image size
+        min_area = max(80, int(0.00002 * (h * w)))
+        max_area = int(0.0035 * (h * w))  # avoid huge regions
 
-    def score_id(block: np.ndarray) -> float:
-        if block.shape[0] < 25:
-            return -1e9
-        ry = group_1d_positions(block[:, 1])
-        cx = group_1d_positions(block[:, 0])
-        return -abs(len(ry) - 10) * 60 - abs(len(cx) - 4) * 120 + block.shape[0] * 0.2
+        dbg["min_area"] = min_area
+        dbg["max_area"] = max_area
 
-    def score_q(block: np.ndarray) -> float:
-        if block.shape[0] < 25:
-            return -1e9
-        ry = group_1d_positions(block[:, 1])
-        cx = group_1d_positions(block[:, 0])
-        return len(ry) * 8 + block.shape[0] * 0.05 - min(abs(len(cx) - k) for k in (2, 4, 5)) * 80
-
-    best = None
-    best_score = -1e18
-
-    for s in splits:
-        left = centers[centers[:, 0] <= s]
-        right = centers[centers[:, 0] > s]
-
-        sc1 = score_id(right) + score_q(left)
-        sc2 = score_id(left) + score_q(right)
-
-        if sc1 > best_score:
-            best_score = sc1
-            best = (right, left)
-        if sc2 > best_score:
-            best_score = sc2
-            best = (left, right)
-
-    return best if best is not None else (centers, centers)
-
-
-# ============================================================
-# Choose columns for choices robustly (avoid ID leakage)
-# ============================================================
-def sanitize_q_centers(q_centers: np.ndarray) -> np.ndarray:
-    qx = q_centers[:, 0].astype(np.float32)
-    x_lo, x_hi = np.percentile(qx, 10), np.percentile(qx, 90)
-    return q_centers[(qx >= x_lo) & (qx <= x_hi)]
-
-
-def top_x_peaks(q_centers: np.ndarray, k: int) -> np.ndarray:
-    xs = q_centers[:, 0].astype(np.float32)
-    clusters = group_1d_positions(xs)
-    if len(clusters) == 0:
-        return np.array([], dtype=np.float32)
-
-    xs_sort = np.sort(xs)
-    dx = np.diff(xs_sort)
-    dx = dx[(dx > 2) & (dx < 250)]
-    tol_x = max(10.0, float(np.percentile(dx, 15)) * 0.60) if len(dx) else 14.0
-
-    counts = []
-    for x0 in clusters:
-        cnt = int(np.sum(np.abs(xs - x0) < tol_x))
-        counts.append((cnt, x0))
-    counts.sort(reverse=True, key=lambda t: t[0])
-    picked = [x for _, x in counts[:k]]
-    return np.sort(np.array(picked, dtype=np.float32))
-
-
-def pick_choice_columns(q_centers: np.ndarray) -> np.ndarray:
-    q_centers = sanitize_q_centers(q_centers)
-    qx = q_centers[:, 0].astype(np.float32)
-
-    candidates = []
-    for k in (2, 4, 5):
-        cols_k = top_x_peaks(q_centers, k)
-        if len(cols_k) != k:
-            continue
-        dif = np.diff(cols_k)
-        if len(dif) >= 2:
-            med = float(np.median(dif))
-            if np.max(dif) > 1.8 * med:
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < min_area or area > max_area:
                 continue
-        score = 0
-        for x0 in cols_k:
-            score += int(np.sum(np.abs(qx - x0) < 14))
-        candidates.append((score, cols_k))
+            per = cv2.arcLength(c, True)
+            if per <= 0:
+                continue
+            circularity = 4 * math.pi * (area / (per * per + 1e-9))
+            # circles with inner text are not perfect => allow lower circularity
+            if circularity < 0.30:
+                continue
 
-    if not candidates:
-        raise ValueError("لم أستطع تحديد أعمدة الخيارات (2/4/5) بدون خلط مع كود الطالب.")
-    candidates.sort(reverse=True, key=lambda t: t[0])
-    return candidates[0][1]
+            (x, y), r = cv2.minEnclosingCircle(c)
+            if r < 6:
+                continue
+
+            bubbles.append(Bubble(x=float(x), y=float(y), r=float(r)))
+
+        dbg["bubbles_found"] = len(bubbles)
+        dbg["img_shape"] = (h, w)
+        return bubbles, dbg
+
+    # -------- grid inference --------
+
+    @staticmethod
+    def _cluster_1d(values: np.ndarray, eps: float) -> List[float]:
+        """
+        Simple 1D clustering: sort values and group by distance <= eps.
+        Returns cluster centers.
+        """
+        if len(values) == 0:
+            return []
+        v = np.sort(values.astype(float))
+        groups = [[v[0]]]
+        for x in v[1:]:
+            if abs(x - groups[-1][-1]) <= eps:
+                groups[-1].append(x)
+            else:
+                groups.append([x])
+        centers = [float(np.mean(g)) for g in groups]
+        return centers
+
+    @staticmethod
+    def _snap_to_centers(val: float, centers: List[float]) -> int:
+        """Return index of nearest center."""
+        if not centers:
+            return -1
+        d = [abs(val - c) for c in centers]
+        return int(np.argmin(d))
+
+    def infer_template(self, bubbles: List[Bubble], img_shape: Tuple[int, int]) -> AutoTemplate:
+        """
+        Infer ID grid (4x10) and Question grid (Nx{2,4,5}) automatically.
+        Strategy:
+        - Cluster X positions into columns.
+        - Find a 4-column group in rightmost region that yields ~10 Y clusters.
+        - Remaining columns -> test choices in {2,4,5} by selecting best-fitting group and Y cluster count.
+        """
+        h, w = img_shape
+        xs = np.array([b.x for b in bubbles], dtype=float)
+        ys = np.array([b.y for b in bubbles], dtype=float)
+        rs = np.array([b.r for b in bubbles], dtype=float)
+
+        if len(bubbles) < 30:
+            raise ValueError("عدد الفقاعات المكتشفة قليل جداً. ارفع DPI أو تأكد وضوح الصورة.")
+
+        # eps based on median radius
+        r_med = float(np.median(rs))
+        eps_x = max(10.0, r_med * 2.2)
+        eps_y = max(10.0, r_med * 2.2)
+
+        col_centers = self._cluster_1d(xs, eps=eps_x)
+        row_centers_all = self._cluster_1d(ys, eps=eps_y)
+
+        if len(col_centers) < 6:
+            raise ValueError("لم أستطع تكوين أعمدة كافية. قد تكون الصفحة مقصوصة أو DPI منخفض.")
+
+        # Build mapping: each bubble -> (col_idx, row_idx)
+        # For row clustering we will re-cluster locally per candidate
+        debug = {
+            "r_med": r_med,
+            "eps_x": eps_x,
+            "eps_y": eps_y,
+            "col_centers_total": len(col_centers),
+            "row_centers_total": len(row_centers_all),
+        }
+
+        # Candidate ID columns: likely rightmost columns
+        col_centers_sorted = sorted(col_centers)
+        right_band = w * 0.55  # ID is on right in your sheet
+        right_cols = [c for c in col_centers_sorted if c >= right_band]
+
+        # If not enough right cols, relax:
+        if len(right_cols) < 4:
+            right_band = w * 0.45
+            right_cols = [c for c in col_centers_sorted if c >= right_band]
+
+        # Choose best 4 columns for ID by scoring 10-row regularity
+        best_id = None
+        best_id_score = -1e9
+
+        def score_id(cols4: List[float]) -> Tuple[float, List[float]]:
+            # collect bubbles near these cols
+            idx = []
+            for i, b in enumerate(bubbles):
+                if min(abs(b.x - c) for c in cols4) <= eps_x:
+                    idx.append(i)
+            if len(idx) < 30:
+                return -1e9, []
+            y_local = np.array([bubbles[i].y for i in idx], dtype=float)
+            y_centers = self._cluster_1d(y_local, eps=eps_y)
+
+            # Want 10 rows
+            row_count = len(y_centers)
+            if row_count < 8 or row_count > 12:
+                return -1e9, y_centers
+
+            # regular spacing
+            y_centers_sorted = sorted(y_centers)
+            diffs = np.diff(y_centers_sorted) if len(y_centers_sorted) >= 2 else np.array([9999.0])
+            cv = float(np.std(diffs) / (np.mean(diffs) + 1e-9))
+            # score: closeness to 10 and low CV
+            score = -abs(row_count - 10) * 5.0 - cv * 10.0 + len(idx) * 0.05
+            return score, y_centers_sorted
+
+        # generate 4-col combinations from right_cols (limit)
+        right_cols = right_cols[-8:]  # keep last 8 max to avoid combin explosion
+
+        from itertools import combinations
+        for comb in combinations(right_cols, 4):
+            cols4 = sorted(list(comb))
+            s, y_centers = score_id(cols4)
+            if s > best_id_score:
+                best_id_score = s
+                best_id = (cols4, y_centers)
+
+        if best_id is None or len(best_id[1]) < 8:
+            raise ValueError("فشل اكتشاف كود الطالب (4×10). تأكد أن الصفحة كاملة وغير مقصوصة.")
+
+        id_cols_x, id_rows_y = best_id
+        # Force rows to exactly 10 by trimming/merging if needed:
+        # If 11-12, drop extreme outliers; if 8-9, keep as-is (will degrade)
+        if len(id_rows_y) > 10:
+            id_rows_y = id_rows_y[:10]
+        debug["id_cols_x"] = id_cols_x
+        debug["id_rows_detected"] = len(id_rows_y)
+
+        # Remove ID bubbles from candidate question bubbles
+        def is_near_any(x, centers, eps):
+            return (min(abs(x - c) for c in centers) <= eps) if centers else False
+
+        q_candidate = []
+        for b in bubbles:
+            if is_near_any(b.x, id_cols_x, eps_x) and is_near_any(b.y, id_rows_y, eps_y):
+                continue
+            q_candidate.append(b)
+
+        if len(q_candidate) < 20:
+            raise ValueError("لم يتبقّ فقاعات كافية للأسئلة بعد فصل الكود. ربما تم اكتشاف الكود خطأ.")
+
+        q_xs = np.array([b.x for b in q_candidate], dtype=float)
+        q_ys = np.array([b.y for b in q_candidate], dtype=float)
+
+        q_cols_all = self._cluster_1d(q_xs, eps=eps_x)
+        q_cols_all = sorted(q_cols_all)
+
+        # Question choices candidates: 2/4/5
+        best_q = None
+        best_q_score = -1e9
+
+        def score_questions(cols_k: List[float]) -> Tuple[float, List[float], int]:
+            # collect bubbles near these cols
+            idx = []
+            for i, b in enumerate(q_candidate):
+                if min(abs(b.x - c) for c in cols_k) <= eps_x:
+                    idx.append(i)
+            if len(idx) < 10 * len(cols_k):
+                return -1e9, [], 0
+
+            y_local = np.array([q_candidate[i].y for i in idx], dtype=float)
+            y_centers = self._cluster_1d(y_local, eps=eps_y)
+            y_centers = sorted(y_centers)
+
+            # Must be at least 5 questions
+            if len(y_centers) < 5:
+                return -1e9, y_centers, len(y_centers)
+
+            # Score by regularity & density
+            diffs = np.diff(y_centers) if len(y_centers) >= 2 else np.array([9999.0])
+            cv = float(np.std(diffs) / (np.mean(diffs) + 1e-9))
+            density = len(idx) / (len(cols_k) * max(len(y_centers), 1))
+            # ideal density around 1 bubble per cell; allow some missing
+            score = -cv * 10.0 + density * 4.0 + len(y_centers) * 0.10 + len(idx) * 0.01
+            return score, y_centers, len(y_centers)
+
+        # Prefer columns not in far-right band to avoid mixing with ID
+        q_cols_filtered = [c for c in q_cols_all if c < w * 0.70]
+        if len(q_cols_filtered) < 2:
+            q_cols_filtered = q_cols_all
+
+        # test k in {2,4,5} using combinations of nearby columns (limit)
+        q_cols_filtered = q_cols_filtered[:12]
+        for k in [2, 4, 5]:
+            if len(q_cols_filtered) < k:
+                continue
+            for comb in combinations(q_cols_filtered, k):
+                cols_k = sorted(list(comb))
+                s, y_centers, nrows = score_questions(cols_k)
+                if s > best_q_score:
+                    best_q_score = s
+                    best_q = (cols_k, y_centers, k)
+
+        if best_q is None:
+            raise ValueError("فشل اكتشاف شبكة الأسئلة. جرّب DPI أعلى أو صورة أوضح.")
+
+        q_cols_x, q_rows_y, choice_count = best_q
+        q_count = len(q_rows_y)
+
+        debug["q_cols_x"] = q_cols_x
+        debug["q_rows_detected"] = q_count
+        debug["choice_count"] = choice_count
+        debug["bubbles_total"] = len(bubbles)
+        debug["bubbles_q_candidate"] = len(q_candidate)
+
+        return AutoTemplate(
+            id_cols_x=id_cols_x,
+            id_rows_y=id_rows_y,
+            q_cols_x=q_cols_x,
+            q_rows_y=q_rows_y,
+            choice_count=choice_count,
+            q_count=q_count,
+            debug=debug
+        )
+
+    # -------- scoring fill and X cancellation --------
+
+    def _extract_cell_roi(self, bin_img: np.ndarray, cx: float, cy: float, r: float) -> np.ndarray:
+        h, w = bin_img.shape[:2]
+        rr = max(8, int(r * 1.15))
+        x1 = max(0, int(cx - rr))
+        y1 = max(0, int(cy - rr))
+        x2 = min(w, int(cx + rr))
+        y2 = min(h, int(cy + rr))
+        return bin_img[y1:y2, x1:x2]
+
+    def fill_ratio(self, cell_bin: np.ndarray) -> float:
+        if cell_bin.size == 0:
+            return 0.0
+        h, w = cell_bin.shape[:2]
+        mh = int(h * self.bubble_margin_ratio)
+        mw = int(w * self.bubble_margin_ratio)
+        if h - 2 * mh <= 0 or w - 2 * mw <= 0:
+            inner = cell_bin
+        else:
+            inner = cell_bin[mh:h - mh, mw:w - mw]
+        return float(np.mean(inner > 0))  # binary_inv => ink becomes white(255)
+
+    def x_cancellation_score(self, cell_gray: np.ndarray) -> float:
+        """
+        Detect 'X' by counting diagonal line evidence inside bubble ROI.
+        Return a score, larger => more likely X.
+        """
+        if cell_gray.size == 0:
+            return 0.0
+
+        # edges
+        edges = cv2.Canny(cell_gray, 60, 140)
+        lines = cv2.HoughLinesP(
+            edges, 1, np.pi / 180,
+            threshold=self.x_hough_min_votes,
+            minLineLength=max(6, int(min(cell_gray.shape[:2]) * 0.25)),
+            maxLineGap=6
+        )
+        if lines is None:
+            return 0.0
+
+        # Count diagonals (around 45 or 135 degrees)
+        diag = 0
+        total = 0
+        for l in lines[:, 0, :]:
+            x1, y1, x2, y2 = map(int, l)
+            dx = x2 - x1
+            dy = y2 - y1
+            ang = abs(math.degrees(math.atan2(dy, dx + 1e-9)))
+            total += 1
+            if 25 <= ang <= 65 or 115 <= ang <= 155:
+                diag += 1
+
+        if total == 0:
+            return 0.0
+        return float(diag / total) * 2.0 + float(diag)
+
+    def evaluate_bubbles(self, img_bgr: np.ndarray, template: AutoTemplate, for_key: bool) -> Dict[Tuple[int, int], Bubble]:
+        """
+        Compute fill & cancelled for each grid cell, return mapping:
+        - For ID: key=(digit_col, row)
+        - For Q : key=(q_row, choice_col)
+        """
+        img = resize_max(img_bgr, max_side=2400)
+        g = gray_blur(img)
+        b = adaptive_bin_inv(g)
+
+        out: Dict[Tuple[int, int], Bubble] = {}
+
+        x_thr = self.x_score_thr_key if for_key else self.x_score_thr_student
+
+        # helper for cell evaluation
+        def eval_cell(cx, cy, r_guess):
+            cell_bin = self._extract_cell_roi(b, cx, cy, r_guess)
+            fill = self.fill_ratio(cell_bin)
+            cell_gray = self._extract_cell_roi(g, cx, cy, r_guess)
+            xs = self.x_cancellation_score(cell_gray)
+            cancelled = (xs >= x_thr)
+            return fill, xs, cancelled
+
+        # ID cells (4x10)
+        # radius guess from grid spacing
+        id_r_guess = max(10.0, float(np.median(np.diff(sorted(template.id_rows_y))) * 0.32)) if len(template.id_rows_y) >= 2 else 14.0
+        for c in range(len(template.id_cols_x)):
+            for r in range(len(template.id_rows_y)):
+                cx = template.id_cols_x[c]
+                cy = template.id_rows_y[r]
+                fill, xs, cancelled = eval_cell(cx, cy, id_r_guess)
+                out[(100 + c, r)] = Bubble(x=cx, y=cy, r=id_r_guess, fill=fill, x_score=xs, cancelled=cancelled)
+
+        # Q cells (N x choices)
+        q_r_guess = max(10.0, float(np.median(np.diff(sorted(template.q_rows_y))) * 0.32)) if len(template.q_rows_y) >= 2 else 14.0
+        for rr in range(len(template.q_rows_y)):
+            cy = template.q_rows_y[rr]
+            for cc in range(len(template.q_cols_x)):
+                cx = template.q_cols_x[cc]
+                fill, xs, cancelled = eval_cell(cx, cy, q_r_guess)
+                out[(rr, cc)] = Bubble(x=cx, y=cy, r=q_r_guess, fill=fill, x_score=xs, cancelled=cancelled)
+
+        return out
+
+    # -------- decision logic for a question row --------
+
+    def decide_choice(self, bubbles_row: List[Bubble]) -> Dict:
+        """
+        Apply rules:
+        - cancelled bubbles are ignored if there exists a non-cancelled filled bubble
+        - if multiple filled -> choose max fill if gap sufficient else DOUBLE
+        - if none above blank threshold -> BLANK
+        """
+        fills = np.array([b.fill for b in bubbles_row], dtype=float)
+        canc = np.array([1 if b.cancelled else 0 for b in bubbles_row], dtype=int)
+
+        # candidates: non-cancelled
+        idx_non_cancel = [i for i in range(len(bubbles_row)) if canc[i] == 0]
+        idx_cancel = [i for i in range(len(bubbles_row)) if canc[i] == 1]
+
+        def pick_from(indices):
+            if not indices:
+                return {"answer_idx": None, "status": "BLANK", "fills": fills.tolist()}
+            sub = [(i, fills[i]) for i in indices]
+            sub.sort(key=lambda t: t[1], reverse=True)
+            top_i, top_f = sub[0]
+            second_f = sub[1][1] if len(sub) > 1 else 0.0
+
+            if top_f < self.blank_fill_thr:
+                return {"answer_idx": None, "status": "BLANK", "fills": fills.tolist()}
+
+            # double mark if second is close & above threshold
+            if second_f >= self.blank_fill_thr and (top_f - second_f) <= self.double_gap_thr:
+                return {"answer_idx": None, "status": "DOUBLE", "fills": fills.tolist()}
+
+            return {"answer_idx": top_i, "status": "OK", "fills": fills.tolist()}
+
+        # Prefer non-cancelled first
+        res = pick_from(idx_non_cancel)
+        if res["status"] == "OK":
+            return res
+
+        # If non-cancelled blank/double, check if there is a strong filled cancelled only (rare)
+        # But requirement says: cancelled should be ignored => treat as blank if only cancelled marks exist
+        # So we DO NOT pick from cancelled.
+        return res
+
+    # -------- decode student id --------
+
+    def decode_student_id(self, cell_map: Dict[Tuple[int, int], Bubble], template: AutoTemplate) -> Tuple[str, Dict]:
+        digits = []
+        dbg = {"digit_fills": []}
+        for col in range(4):
+            fills = []
+            for row in range(10):
+                b = cell_map.get((100 + col, row))
+                fills.append(0.0 if b is None else b.fill)
+
+            # choose max fill, ignore cancelled for ID (ID shouldn't have X)
+            best_row = int(np.argmax(fills))
+            best_fill = float(fills[best_row])
+
+            if best_fill < self.blank_fill_thr:
+                digits.append("X")
+            else:
+                digits.append(str(best_row))
+            dbg["digit_fills"].append(fills)
+
+        return "".join(digits), dbg
+
+    # -------- extract answers from key/student --------
+
+    def extract_answers(self, cell_map: Dict[Tuple[int, int], Bubble], template: AutoTemplate) -> Tuple[Dict[int, str], Dict]:
+        """
+        Returns {q_num: 'A'/'B'/...}
+        q_num is 1..N (top to bottom)
+        """
+        choices = "ABCDE"[:template.choice_count]
+        answers = {}
+        dbg = {"rows": []}
+
+        for r in range(template.q_count):
+            row_bubs = [cell_map[(r, c)] for c in range(template.choice_count)]
+            decision = self.decide_choice(row_bubs)
+            if decision["status"] == "OK":
+                answers[r + 1] = choices[decision["answer_idx"]]
+            dbg["rows"].append({
+                "q": r + 1,
+                "status": decision["status"],
+                "fills": decision["fills"],
+                "cancelled": [bool(b.cancelled) for b in row_bubs],
+            })
+
+        return answers, dbg
+
+    # -------- overlay drawing --------
+
+    def draw_overlay(self, img_bgr: np.ndarray, template: AutoTemplate, cell_map: Dict[Tuple[int, int], Bubble], mode: str) -> np.ndarray:
+        """
+        mode: 'key' or 'student'
+        - Draw vertical lines at column centers
+        - Draw circles and fill/cancel status
+        """
+        img = resize_max(img_bgr, max_side=2400).copy()
+
+        # columns lines
+        for x in template.id_cols_x:
+            cv2.line(img, (int(x), 0), (int(x), img.shape[0] - 1), (255, 0, 0), 2)
+        for x in template.q_cols_x:
+            cv2.line(img, (int(x), 0), (int(x), img.shape[0] - 1), (255, 0, 0), 2)
+
+        # draw bubbles centers
+        def draw_b(b: Bubble, color):
+            cv2.circle(img, (int(b.x), int(b.y)), int(b.r), color, 2)
+            cv2.circle(img, (int(b.x), int(b.y)), 3, color, -1)
+
+        # ID bubbles in green
+        for col in range(4):
+            for row in range(10):
+                b = cell_map.get((100 + col, row))
+                if b:
+                    draw_b(b, (0, 255, 0))
+
+        # Question bubbles: red if filled, yellow if cancelled, green if blank
+        for r in range(template.q_count):
+            for c in range(template.choice_count):
+                b = cell_map.get((r, c))
+                if not b:
+                    continue
+                if b.cancelled:
+                    col = (0, 255, 255)
+                elif b.fill >= self.blank_fill_thr:
+                    col = (0, 0, 255)
+                else:
+                    col = (0, 255, 0)
+                draw_b(b, col)
+
+        return img
 
 
-def build_question_rows(q_centers: np.ndarray, col_x: np.ndarray) -> np.ndarray:
-    row_y_all = group_1d_positions(q_centers[:, 1])
-    if len(row_y_all) == 0:
-        return row_y_all
+# ----------------------------
+# Streamlit UI
+# ----------------------------
 
-    xs = q_centers[:, 0].astype(np.float32)
-    ys = q_centers[:, 1].astype(np.float32)
-
-    xs_sort = np.sort(xs); ys_sort = np.sort(ys)
-    dx = np.diff(xs_sort); dx = dx[(dx > 2) & (dx < 250)]
-    dy = np.diff(ys_sort); dy = dy[(dy > 2) & (dy < 250)]
-    tol_x = max(10.0, float(np.percentile(dx, 15)) * 0.60) if len(dx) else 14.0
-    tol_y = max(10.0, float(np.percentile(dy, 15)) * 0.60) if len(dy) else 12.0
-
-    k = len(col_x)
-    need = max(2, k - 1)
-
-    valid = []
-    for y0 in row_y_all:
-        near = q_centers[np.abs(q_centers[:, 1] - y0) < tol_y]
-        if near.shape[0] < need:
-            continue
-        hits = 0
-        for x0 in col_x:
-            if np.any(np.abs(near[:, 0] - x0) < tol_x):
-                hits += 1
-        if hits >= need:
-            valid.append(y0)
-    return np.array(valid, dtype=np.float32)
-
-
-# ============================================================
-# Train template from Answer Key
-# ============================================================
-def learn_template_from_key(key_bgr: np.ndarray) -> Tuple[LearnedTemplate, dict]:
-    h, w = key_bgr.shape[:2]
-    bin_img = preprocess_binary(key_bgr)
-    centers = find_bubble_centers(bin_img)
-
-    if centers.shape[0] < 40:
-        raise ValueError("عدد الفقاعات المكتشفة قليل جداً. ارفع DPI أو تأكد وضوح الصورة.")
-
-    id_centers, q_centers = split_regions(centers)
-    if id_centers.shape[0] < 25:
-        raise ValueError("فشل اكتشاف منطقة كود الطالب تلقائياً.")
-    if q_centers.shape[0] < 25:
-        raise ValueError("فشل اكتشاف منطقة الأسئلة تلقائياً.")
-
-    # ID: force 10 rows and 4 columns
-    id_row_y = group_1d_positions(id_centers[:, 1])
-    id_col_x = group_1d_positions(id_centers[:, 0])
-
-    if len(id_row_y) > 10:
-        while len(id_row_y) > 10:
-            dif = np.diff(id_row_y)
-            j = int(np.argmin(dif))
-            merged = (id_row_y[j] + id_row_y[j + 1]) / 2.0
-            id_row_y = np.delete(id_row_y, [j, j + 1])
-            id_row_y = np.sort(np.append(id_row_y, merged))
-    elif len(id_row_y) < 10:
-        step = float(np.median(np.diff(id_row_y))) if len(id_row_y) >= 2 else 20.0
-        while len(id_row_y) < 10:
-            id_row_y = np.append(id_row_y, id_row_y[-1] + step)
-        id_row_y = np.sort(id_row_y)
-
-    if len(id_col_x) >= 4:
-        id_col_x = select_best_columns(id_col_x, 4)
+def load_roster(roster_up) -> Dict[str, str]:
+    if roster_up is None:
+        return {}
+    b = read_uploaded_bytes(roster_up)
+    if b is None:
+        return {}
+    name = roster_up.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(b))
     else:
-        raise ValueError("لم يتم اكتشاف 4 أعمدة للكود. تأكد من وضوح منطقة الكود.")
+        df = pd.read_excel(io.BytesIO(b))
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    id_cent = snap_to_grid(id_centers, id_row_y, id_col_x)
-    id_grid = BubbleGrid(id_row_y, id_col_x, id_cent, rows=10, cols=4)
+    # expected: student_code, student_name
+    if "student_code" not in df.columns or "student_name" not in df.columns:
+        raise ValueError("ملف قائمة الطلاب يجب أن يحتوي عمودين: student_code و student_name")
 
-    # Questions: pick 2/4/5 robustly
-    q_col_x = pick_choice_columns(q_centers)
-    num_choices = int(len(q_col_x))
+    codes = df["student_code"].astype(str).str.strip()
+    names = df["student_name"].astype(str).str.strip()
+    return dict(zip(codes, names))
 
-    q_row_y = build_question_rows(q_centers, q_col_x)
-    if len(q_row_y) < 3:
-        raise ValueError("لم يتم اكتشاف صفوف أسئلة كافية. ربما الصفحة مقصوصة أو غير واضحة.")
 
-    q_cent = snap_to_grid(q_centers, q_row_y, q_col_x)
-    q_grid = BubbleGrid(q_row_y, q_col_x, q_cent, rows=len(q_row_y), cols=num_choices)
+def answers_to_df(ans: Dict[int, str]) -> pd.DataFrame:
+    if not ans:
+        return pd.DataFrame(columns=["Q", "Answer"])
+    return pd.DataFrame({"Q": list(ans.keys()), "Answer": list(ans.values())})
 
-    template = LearnedTemplate(
-        ref_bgr=key_bgr, ref_w=w, ref_h=h,
-        id_grid=id_grid,
-        q_grid=q_grid,
-        num_q=len(q_row_y),
-        num_choices=num_choices,
+
+def main():
+    st.set_page_config(page_title="Hybrid OMR + Smart Auto Training", layout="wide")
+
+    st.title("✅ Hybrid OMR + ذكاء: تدريب تلقائي + تصحيح (2/4/5 خيارات)")
+    st.caption("يدعم: كشف كود الطالب 4×10 + كشف عدد الأسئلة + قاعدة الإلغاء (X)")
+
+    # Controls
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        dpi = st.selectbox("DPI للـ PDF", [200, 250, 300, 350], index=2)
+    with c2:
+        debug = st.checkbox("Debug (عرض تفاصيل)", value=True)
+    with c3:
+        strict_mode = st.checkbox("وضع صارم (DOUBLE/BLANK = خطأ)", value=True)
+
+    st.divider()
+
+    # Uploaders
+    colA, colB, colC = st.columns(3)
+    with colA:
+        roster_up = st.file_uploader("📋 ملف الطلاب (Excel/CSV)", type=["xlsx", "xls", "csv"])
+    with colB:
+        key_up = st.file_uploader("🔑 Answer Key (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
+    with colC:
+        student_up = st.file_uploader("📚 أوراق الطلاب (PDF/صور) - يمكن PDF متعدد الصفحات", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
+
+    st.divider()
+
+    # Threshold sliders (optional but stable defaults)
+    st.subheader("Thresholds (Fill + X)")
+    t1, t2, t3, t4, t5, t6 = st.columns(6)
+    with t1:
+        blank_thr = st.slider("Blank fill threshold", 0.05, 0.35, 0.14, 0.01)
+    with t2:
+        double_gap = st.slider("Double gap threshold", 0.00, 0.15, 0.03, 0.01)
+    with t3:
+        x_std_student = st.slider("X score (student)", 0.20, 3.00, 1.20, 0.05)
+    with t4:
+        x_std_key = st.slider("X score (key)", 0.20, 3.00, 0.90, 0.05)
+    with t5:
+        min_votes = st.slider("X Hough votes", 6, 30, 12, 1)
+    with t6:
+        margin_ratio = st.slider("Bubble inner margin", 0.10, 0.40, 0.22, 0.01)
+
+    engine = OMRSmartEngine(
+        blank_fill_thr=blank_thr,
+        double_gap_thr=double_gap,
+        x_hough_min_votes=min_votes,
+        x_score_thr_student=x_std_student,
+        x_score_thr_key=x_std_key,
+        bubble_margin_ratio=margin_ratio
     )
 
-    dbg = {
-        "centers_total": int(centers.shape[0]),
-        "id_centers": int(id_centers.shape[0]),
-        "q_centers": int(q_centers.shape[0]),
-        "id_rows": 10,
-        "id_digits": 4,
-        "q_rows": int(len(q_row_y)),
-        "q_cols": int(num_choices),
-        "q_col_x": [float(x) for x in q_col_x],
-    }
-    return template, dbg
+    # ----------------------------
+    # Train/Extract from Answer Key
+    # ----------------------------
+    st.subheader("📌 1) تدريب/استخراج من Answer Key")
+    if key_up is None:
+        st.info("ارفع ملف Answer Key أولاً ليتم التدريب التلقائي واستخراج الإجابات.")
+        st.stop()
 
+    try:
+        key_bytes = read_uploaded_bytes(key_up)
+        key_pages = pil_from_bytes(key_bytes, key_up.name, dpi=int(dpi))
+        if not key_pages:
+            st.error("تعذر قراءة ملف الـ Answer Key.")
+            st.stop()
 
-# ============================================================
-# Bubble scoring: fill + X-cancel detection
-# ============================================================
-def crop_roi(bgr: np.ndarray, x: int, y: int, size: int) -> np.ndarray:
-    h, w = bgr.shape[:2]
-    half = size // 2
-    x1 = max(0, x - half)
-    y1 = max(0, y - half)
-    x2 = min(w, x + half)
-    y2 = min(h, y + half)
-    roi = bgr[y1:y2, x1:x2]
-    return roi
+        key_pil = key_pages[0]
+        key_bgr = to_bgr(key_pil)
 
+        bubbles, dbg1 = engine.detect_bubbles(key_bgr)
+        template = engine.infer_template(bubbles, img_shape=resize_max(key_bgr, 2400).shape[:2])
 
-def fill_ratio_from_roi(roi_bgr: np.ndarray) -> float:
-    if roi_bgr.size == 0:
-        return 0.0
-    bin_roi = preprocess_binary(roi_bgr)
-    hh, ww = bin_roi.shape[:2]
-    mh = int(hh * 0.25)
-    mw = int(ww * 0.25)
-    inner = bin_roi[mh:hh-mh, mw:ww-mw]
-    if inner.size == 0:
-        return 0.0
-    return float(np.mean(inner > 0))
+        cell_map_key = engine.evaluate_bubbles(key_bgr, template, for_key=True)
+        answer_key, dbg_key = engine.extract_answers(cell_map_key, template)
 
-
-def x_cancel_score(roi_bgr: np.ndarray) -> float:
-    """
-    Detect X mark in the bubble ROI by looking for diagonal line evidence.
-    Returns score ~0..1 higher = more likely X.
-    """
-    if roi_bgr.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    # edges
-    edges = cv2.Canny(gray, 50, 150)
-    # Hough lines
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=25,
-                            minLineLength=max(10, roi_bgr.shape[1]//3),
-                            maxLineGap=6)
-    if lines is None:
-        return 0.0
-
-    # count diagonal-ish lines (around 45 or 135 degrees)
-    diag = 0
-    total = 0
-    for l in lines:
-        x1, y1, x2, y2 = l[0]
-        dx = x2 - x1
-        dy = y2 - y1
-        ang = np.degrees(np.arctan2(dy, dx + 1e-6))
-        ang = (ang + 180) % 180  # 0..180
-        total += 1
-        if 25 <= ang <= 65 or 115 <= ang <= 155:
-            diag += 1
-
-    if total == 0:
-        return 0.0
-    return float(diag / total)
-
-
-def detect_choice_for_row(
-    bgr: np.ndarray,
-    centers_row: np.ndarray,  # (C,2)
-    choices: str,
-    blank_thr: float,
-    double_gap: float,
-    x_thr: float
-) -> Dict:
-    fills = []
-    x_scores = []
-
-    for c in range(centers_row.shape[0]):
-        x, y = centers_row[c]
-        x = safe_int(x); y = safe_int(y)
-        roi = crop_roi(bgr, x, y, size=34)
-        fills.append(fill_ratio_from_roi(roi))
-        x_scores.append(x_cancel_score(roi))
-
-    fills = np.array(fills, dtype=np.float32)
-    x_scores = np.array(x_scores, dtype=np.float32)
-
-    # mark cancelled
-    cancelled = x_scores >= x_thr
-
-    # prefer non-cancelled
-    candidates = np.where(~cancelled)[0]
-    if candidates.size == 0:
-        # all cancelled -> treat as blank
-        return {"answer": "?", "status": "CANCELLED", "fills": fills.tolist(), "x": x_scores.tolist()}
-
-    # choose best fill among non-cancelled
-    idx_sorted = candidates[np.argsort(-fills[candidates])]
-    top = int(idx_sorted[0])
-    top_fill = float(fills[top])
-    second_fill = float(fills[idx_sorted[1]]) if idx_sorted.size > 1 else 0.0
-
-    if top_fill < blank_thr:
-        return {"answer": "?", "status": "BLANK", "fills": fills.tolist(), "x": x_scores.tolist()}
-
-    # double check only among non-cancelled
-    if idx_sorted.size > 1:
-        if (top_fill - second_fill) < double_gap:
-            return {"answer": "!", "status": "DOUBLE", "fills": fills.tolist(), "x": x_scores.tolist()}
-
-    return {"answer": choices[top], "status": "OK", "fills": fills.tolist(), "x": x_scores.tolist()}
-
-
-def extract_student_id(bgr: np.ndarray, template: LearnedTemplate, blank_thr_id: float) -> str:
-    digits = []
-    for c in range(template.id_digits):
-        # 10 rows digits 0..9
-        vals = []
-        for r in range(template.id_rows):
-            x, y = template.id_grid.centers[r, c]
-            roi = crop_roi(bgr, safe_int(x), safe_int(y), size=30)
-            vals.append(fill_ratio_from_roi(roi))
-        vals = np.array(vals, dtype=np.float32)
-        if float(np.max(vals)) < blank_thr_id:
-            digits.append("X")
-        else:
-            digits.append(str(int(np.argmax(vals))))
-    return "".join(digits)
-
-
-def extract_answers(bgr: np.ndarray, template: LearnedTemplate,
-                    blank_thr: float, double_gap: float, x_thr: float) -> Tuple[Dict[int, str], Dict[int, Dict]]:
-    choices = "ABCDE"[:template.num_choices]
-    ans = {}
-    dbg = {}
-    for q in range(template.num_q):
-        row_cent = template.q_grid.centers[q, :, :]
-        res = detect_choice_for_row(bgr, row_cent, choices, blank_thr, double_gap, x_thr)
-        dbg[q+1] = res
-        ans[q+1] = res["answer"]
-    return ans, dbg
-
-
-# ============================================================
-# Build overlay preview
-# ============================================================
-def make_overlay(template: LearnedTemplate) -> np.ndarray:
-    vis = template.ref_bgr.copy()
-
-    # question points (green)
-    for r in range(template.q_grid.rows):
-        for c in range(template.q_grid.cols):
-            x, y = template.q_grid.centers[r, c]
-            cv2.circle(vis, (safe_int(x), safe_int(y)), 6, (0, 255, 0), 2)
-
-    # ID points (red)
-    for r in range(template.id_grid.rows):
-        for c in range(template.id_grid.cols):
-            x, y = template.id_grid.centers[r, c]
-            cv2.circle(vis, (safe_int(x), safe_int(y)), 6, (0, 0, 255), 2)
-
-    # choice columns (blue)
-    for x0 in template.q_grid.col_x:
-        cv2.line(vis, (safe_int(x0), 0), (safe_int(x0), template.ref_h), (255, 0, 0), 2)
-
-    return vis
-
-
-# ============================================================
-# Streamlit App
-# ============================================================
-def main():
-    st.set_page_config(page_title="OMR Hybrid (Auto + X-Rule)", layout="wide")
-    st.title("✅ OMR ذكي: تدريب تلقائي + عرض Answer Key قبل التصحيح + قاعدة X")
-
-    # --- State
-    if "trained" not in st.session_state:
-        st.session_state.trained = False
-        st.session_state.template = None
-        st.session_state.train_dbg = None
-        st.session_state.overlay = None
-        st.session_state.answer_key = None
-        st.session_state.last_error = ""
-
-    # --- Inputs
-    c1, c2, c3 = st.columns([2, 1, 1])
-    with c1:
-        key_file = st.file_uploader("🔑 Answer Key (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
-    with c2:
-        dpi = st.selectbox("DPI للـ PDF", [200, 250, 300, 350, 400], index=2)
-    with c3:
-        debug = st.checkbox("Debug", value=True)
-
-    st.markdown("### ⚙️ عتبات الكشف (يمكنك تركها كما هي)")
-    t1, t2, t3, t4 = st.columns(4)
-    with t1:
-        blank_thr = st.slider("Blank fill threshold", 0.02, 0.35, 0.14, 0.01)
-    with t2:
-        double_gap = st.slider("Double gap threshold", 0.00, 0.20, 0.03, 0.01)
-    with t3:
-        x_thr = st.slider("X cancel threshold", 0.10, 0.90, 0.55, 0.05)
-    with t4:
-        id_blank = st.slider("ID blank threshold", 0.02, 0.35, 0.10, 0.01)
-
-    st.markdown("---")
-
-    # --- Train button
-    if st.button("🚀 تدريب/إعادة تدريب من الأنسر", type="primary"):
-        if not key_file:
-            st.error("❌ ارفع Answer Key أولاً")
-        else:
-            try:
-                st.session_state.last_error = ""
-                pages = load_pages(read_bytes(key_file), key_file.name, dpi=int(dpi))
-                key_bgr = pil_to_bgr(pages[0])
-
-                template, train_dbg = learn_template_from_key(key_bgr)
-
-                # Extract answer key from the same key image (with X-rule too)
-                key_answers, key_debug = extract_answers(key_bgr, template, blank_thr, double_gap, x_thr)
-
-                st.session_state.template = template
-                st.session_state.train_dbg = train_dbg
-                st.session_state.overlay = make_overlay(template)
-                st.session_state.answer_key = key_answers
-                st.session_state.trained = True
-
-                st.success("✅ التدريب نجح + تم استخراج Answer Key.")
-            except Exception as e:
-                st.session_state.trained = False
-                st.session_state.last_error = traceback.format_exc()
-                st.error(f"❌ فشل التدريب: {e}")
-
-    # --- Show training results
-    if st.session_state.trained and st.session_state.template is not None:
-        t = st.session_state.template
-        st.markdown("---")
-        a, b, c, d = st.columns(4)
-        with a:
-            st.metric("عدد الأسئلة المكتشف", int(t.num_q))
-        with b:
-            st.metric("عدد الخيارات المكتشف", int(t.num_choices))
-        with c:
+        # SHOW detected counts
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("عدد الأسئلة المكتشف", template.q_count)
+        with k2:
+            st.metric("عدد الخيارات المكتشف", template.choice_count)
+        with k3:
             st.metric("خانات كود الطالب", 4)
-        with d:
+        with k4:
             st.metric("صفوف كود الطالب", 10)
 
-        st.caption(f"Debug: {st.session_state.train_dbg}")
+        if debug:
+            st.write("Debug:", template.debug)
+
+        # Show Answer Key BEFORE grading (user request)
+        st.markdown("### 🔑 Answer Key المستخرج (تأكد قبل التصحيح)")
+        df_key = answers_to_df(answer_key)
+        st.dataframe(df_key, width="stretch", height=280)
+        st.json({str(k): v for k, v in answer_key.items()})
 
         # Overlay
-        if debug and st.session_state.overlay is not None:
-            st.markdown("### Overlay (أخضر=أسئلة، أحمر=كود، أزرق=أعمدة الخيارات)")
-            st.image(bgr_to_rgb(st.session_state.overlay), width="stretch")
+        if debug:
+            st.markdown("### Overlay (أخضر=كود، أحمر=مظلّل، أصفر=ملغي X، أزرق=أعمدة)")
+            ov = engine.draw_overlay(key_bgr, template, cell_map_key, mode="key")
+            st.image(cv2.cvtColor(ov, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-        # ✅ Show Answer Key BEFORE grading (requested)
-        st.markdown("### 🔑 Answer Key المستخرج (تأكد قبل التصحيح)")
-        ak = st.session_state.answer_key or {}
-        df_ak = pd.DataFrame(
-            [{"Question": q, "Correct": ans} for q, ans in sorted(ak.items(), key=lambda x: x[0])]
-        )
-        st.dataframe(df_ak, width="stretch", height=320)
+        if template.q_count < 5:
+            st.error("التدريب فشل: عدد الأسئلة المكتشف قليل جداً. جرّب DPI أعلى أو ملف أوضح.")
+            st.stop()
 
-        # Download answer key as CSV
-        ak_csv = df_ak.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ تحميل Answer Key CSV", ak_csv, "answer_key.csv", mime="text/csv")
+    except Exception as e:
+        st.error(f"❌ فشل التدريب/الاستخراج: {e}")
+        if debug:
+            import traceback
+            st.code(traceback.format_exc())
+        st.stop()
 
-        st.markdown("---")
+    st.success("✅ التدريب نجح واستخراج الإجابات تم.")
 
-        # ============================================================
-        # Roster
-        # ============================================================
-        st.header("📋 ملف الطلاب (Roster)")
-        roster_file = st.file_uploader("ارفع ملف Excel/CSV للطلاب", type=["xlsx", "xls", "csv"])
-        roster_map = {}
+    st.divider()
 
-        if roster_file:
+    # ----------------------------
+    # 2) Roster + Student Sheets
+    # ----------------------------
+    st.subheader("📌 2) التصحيح (Roster + أوراق الطلاب)")
+
+    if roster_up is None or not student_up:
+        st.info("ارفع ملف الطلاب + أوراق الطلاب لإكمال التصحيح.")
+        st.stop()
+
+    try:
+        roster = load_roster(roster_up)
+        st.success(f"تم تحميل قائمة الطلاب: {len(roster)} طالب")
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+    if st.button("🚀 ابدأ التصحيح الآن", type="primary"):
+        results = []
+        export_rows = []
+
+        for up in student_up:
             try:
-                if roster_file.name.lower().endswith(".csv"):
-                    df = pd.read_csv(roster_file)
-                else:
-                    df = pd.read_excel(roster_file)
+                b = read_uploaded_bytes(up)
+                pages = pil_from_bytes(b, up.name, dpi=int(dpi))
+                if not pages:
+                    continue
 
-                df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-                st.write("معاينة ملف الطلاب:")
-                st.dataframe(df.head(10), width="stretch")
+                for pi, page in enumerate(pages, start=1):
+                    img_bgr = to_bgr(page)
 
-                code_col = st.selectbox("اختر عمود كود الطالب", df.columns, index=0)
-                name_col = st.selectbox("اختر عمود اسم الطالب", df.columns, index=1 if len(df.columns) > 1 else 0)
+                    # evaluate with same template learned from key
+                    cell_map_student = engine.evaluate_bubbles(img_bgr, template, for_key=False)
 
-                roster_map = dict(
-                    zip(df[code_col].astype(str).str.strip(), df[name_col].astype(str).str.strip())
-                )
-                st.success(f"✅ تم تحميل {len(roster_map)} طالب")
+                    student_id, dbg_id = engine.decode_student_id(cell_map_student, template)
+                    student_name = roster.get(student_id, "غير موجود")
+
+                    student_answers, dbg_ans = engine.extract_answers(cell_map_student, template)
+
+                    # grading
+                    correct = 0
+                    total = len(answer_key)
+
+                    for q, k_ans in answer_key.items():
+                        s_ans = student_answers.get(q, None)
+
+                        if s_ans is None:
+                            if strict_mode:
+                                # strict: missing counts as wrong
+                                continue
+                            else:
+                                continue
+
+                        if s_ans == k_ans:
+                            correct += 1
+
+                    percent = (correct / total * 100.0) if total else 0.0
+                    passed = percent >= 50.0
+
+                    row = {
+                        "file": up.name,
+                        "page": pi,
+                        "student_code": student_id,
+                        "student_name": student_name,
+                        "score": correct,
+                        "total": total,
+                        "percentage": round(percent, 2),
+                        "status": "ناجح" if passed else "راسب"
+                    }
+                    results.append(row)
+
+                    # optional export per question
+                    er = {"file": up.name, "page": pi, "student_code": student_id, "student_name": student_name}
+                    for q in range(1, template.q_count + 1):
+                        er[f"Q{q}"] = student_answers.get(q, "")
+                    export_rows.append(er)
+
+                    if debug:
+                        st.markdown(f"#### Debug Overlay: {up.name} (page {pi})")
+                        ov2 = engine.draw_overlay(img_bgr, template, cell_map_student, mode="student")
+                        st.image(cv2.cvtColor(ov2, cv2.COLOR_BGR2RGB), use_container_width=True)
+
             except Exception as e:
-                st.error(f"❌ خطأ في قراءة ملف الطلاب: {e}")
+                st.warning(f"تعذر تصحيح {up.name}: {e}")
+                if debug:
+                    import traceback
+                    st.code(traceback.format_exc())
+                continue
 
-        # ============================================================
-        # Student sheets
-        # ============================================================
-        st.header("📝 أوراق الطلاب")
-        student_files = st.file_uploader(
-            "ارفع أوراق الطلاب (PDF/صور) — يمكن رفع عدة ملفات",
-            type=["pdf", "png", "jpg", "jpeg"],
-            accept_multiple_files=True
+        if not results:
+            st.error("لم يتم إنتاج نتائج. تأكد من ملفات الطلاب ودقة الـ DPI.")
+            st.stop()
+
+        df_res = pd.DataFrame(results)
+        st.success("✅ اكتمل التصحيح")
+        st.dataframe(df_res, width="stretch", height=260)
+
+        # Exports
+        st.markdown("### 📥 تحميل النتائج")
+        out_xlsx = io.BytesIO()
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            df_res.to_excel(writer, index=False, sheet_name="Summary")
+            pd.DataFrame(export_rows).to_excel(writer, index=False, sheet_name="Answers")
+
+        st.download_button(
+            "⬇️ تحميل النتائج (Excel)",
+            data=out_xlsx.getvalue(),
+            file_name="results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-        strict = st.checkbox("✓ وضع صارم (BLANK/DOUBLE/CANCELLED تُحسب خطأ)", value=True)
-
-        if st.button("✅ ابدأ التصحيح", type="primary"):
-            if not roster_map:
-                st.error("❌ ارفع ملف الطلاب أولاً واختر الأعمدة")
-            elif not student_files:
-                st.error("❌ ارفع أوراق الطلاب")
-            else:
-                results_rows = []
-                with st.spinner("⏳ جاري التصحيح..."):
-                    for f in student_files:
-                        try:
-                            pages = load_pages(read_bytes(f), f.name, dpi=int(dpi))
-                            bgr = pil_to_bgr(pages[0])
-
-                            student_id = extract_student_id(bgr, t, blank_thr_id=id_blank)
-                            student_name = roster_map.get(student_id, "غير موجود")
-
-                            stu_answers, stu_dbg = extract_answers(bgr, t, blank_thr, double_gap, x_thr)
-
-                            # grade
-                            correct = 0
-                            total = len(ak)
-                            for q, corr in ak.items():
-                                got = stu_answers.get(q, "?")
-                                if strict:
-                                    # strict: only OK counts, else wrong
-                                    st_status = stu_dbg[q]["status"]
-                                    if st_status != "OK":
-                                        continue
-                                if got == corr:
-                                    correct += 1
-
-                            perc = (correct / total * 100.0) if total > 0 else 0.0
-
-                            results_rows.append({
-                                "file": f.name,
-                                "student_id": student_id,
-                                "student_name": student_name,
-                                "score": correct,
-                                "total": total,
-                                "percentage": round(perc, 2),
-                                "passed": "✓" if perc >= 50 else "✗"
-                            })
-
-                        except Exception as e:
-                            results_rows.append({
-                                "file": f.name,
-                                "student_id": "ERROR",
-                                "student_name": str(e),
-                                "score": 0,
-                                "total": len(ak),
-                                "percentage": 0,
-                                "passed": "✗"
-                            })
-
-                df_res = pd.DataFrame(results_rows)
-                st.success("✅ اكتمل التصحيح")
-                st.dataframe(df_res, width="stretch", height=280)
-
-                # Export Excel
-                buf = io.BytesIO()
-                df_res.to_excel(buf, index=False)
-                st.download_button(
-                    "⬇️ تحميل النتائج Excel",
-                    buf.getvalue(),
-                    "results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-    # error details
-    if st.session_state.last_error:
-        st.markdown("---")
-        st.error("حدث خطأ. افتح التفاصيل بالأسفل.")
-        with st.expander("تفاصيل الخطأ (Traceback)"):
-            st.code(st.session_state.last_error)
 
 
 if __name__ == "__main__":
