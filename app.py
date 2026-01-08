@@ -126,7 +126,7 @@ def find_bubble_centers(bin_img: np.ndarray,
 def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
     Automatically detect ID and Question regions using clustering
-    Filters out question numbers on the left
+    Filters out question numbers on the far left
     Returns: (id_centers, q_centers, debug_info)
     """
     if centers.shape[0] < 20:
@@ -152,15 +152,46 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
     }
     
     # More precise splitting using better boundaries
-    # ID section: typically top-right, tighter boundaries
+    # ID section: typically top-right
     id_mask = (xs > 0.6 * w) & (ys < 0.5 * h)
     
-    # Questions section: bottom-left BUT EXCLUDE far left (question numbers)
-    # Question numbers are typically in leftmost 15% of the page
-    # The actual answer bubbles start around 20% from left
-    left_boundary = 0.15 * w  # Ignore leftmost 15% (question numbers area)
-    right_boundary = 0.5 * w  # Questions are in left half
+    # Questions section: Find the leftmost answer bubble, not the question numbers
+    # Strategy: Question numbers are isolated on far left, answer bubbles form a dense cluster
+    # Let's find where the main cluster starts
     
+    # Get left half bubbles
+    left_bubbles = centers[(xs < x_mid) & (ys > 0.4 * h)]
+    
+    if left_bubbles.shape[0] > 0:
+        # Sort by x position
+        left_xs = np.sort(left_bubbles[:, 0])
+        
+        # Find the gap between question numbers and answer bubbles
+        # Question numbers are typically 1-10 bubbles on far left
+        # Then there's a gap, then answer bubbles (40-60 bubbles) start
+        
+        if len(left_xs) > 15:
+            # Look at x-position differences
+            x_diffs = np.diff(left_xs)
+            
+            # Find the largest gap in first 30% of bubbles (should be between Q nums and answers)
+            search_range = min(15, len(x_diffs) // 3)
+            if search_range > 0:
+                max_gap_idx = np.argmax(x_diffs[:search_range])
+                # The boundary should be after this gap
+                left_boundary = (left_xs[max_gap_idx] + left_xs[max_gap_idx + 1]) / 2
+            else:
+                left_boundary = 0.08 * w
+        else:
+            left_boundary = 0.08 * w
+    else:
+        left_boundary = 0.08 * w
+    
+    # Make sure boundary is reasonable
+    left_boundary = max(0.05 * w, min(left_boundary, 0.15 * w))
+    
+    # Questions section: after the boundary, in left half
+    right_boundary = 0.5 * w  # Questions are in left half
     q_mask = (xs > left_boundary) & (xs < right_boundary) & (ys > 0.45 * h)
     
     id_centers = centers[id_mask]
@@ -172,19 +203,21 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
         id_centers = centers[(xs > x_mid) & (ys < y_mid)]
     
     if q_centers.shape[0] < 20:
-        # More lenient but still exclude far left
+        # More lenient
+        left_boundary = 0.08 * w
         q_centers = centers[(xs > left_boundary) & (xs < right_boundary) & (ys > 0.4 * h)]
     
     if q_centers.shape[0] < 20:
-        # Last resort: quadrant-based but still filter left edge
+        # Last resort: quadrant-based but still filter obvious left edge
+        left_boundary = 0.05 * w
         q_centers = centers[(xs > left_boundary) & (xs < x_mid) & (ys > y_mid)]
     
     debug["id_count"] = id_centers.shape[0]
     debug["q_count"] = q_centers.shape[0]
     debug["left_boundary"] = left_boundary
     debug["filtered_out"] = centers.shape[0] - id_centers.shape[0] - q_centers.shape[0]
-    debug["id_expected_multiples"] = [30, 40, 50, 60, 70, 80]  # 10×3, 10×4, etc.
-    debug["q_expected_multiples"] = [40, 50, 60]  # 10×4, 10×5, 10×6
+    debug["id_expected_multiples"] = [30, 40, 50, 60, 70, 80]
+    debug["q_expected_multiples"] = [40, 50, 60]
     
     return id_centers, q_centers, debug
 
@@ -437,6 +470,8 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
     id_centers, q_centers, region_debug = detect_bubble_regions(centers, w, h)
     notes.append(f"✓ منطقة الكود: {id_centers.shape[0]} فقاعة")
     notes.append(f"✓ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
+    notes.append(f"✓ فقاعات متجاهلة (أرقام الأسئلة): {region_debug['filtered_out']}")
+    notes.append(f"  → الحد الفاصل التلقائي: {region_debug['left_boundary']:.1f} بكسل")
     
     # Estimate ID grid dimensions
     id_rows_est, id_cols_est, id_conf = estimate_grid_dimensions(id_centers, is_questions=False)
@@ -871,13 +906,15 @@ def main():
                         
                         # Draw filtered bubbles (question numbers) in GRAY
                         all_xs = all_centers[:, 0]
-                        left_bound = 0.15 * key_bgr.shape[1]
+                        left_bound = reg_debug.get("left_boundary", 0.08 * key_bgr.shape[1])
                         filtered = all_centers[all_xs <= left_bound]
                         for (x, y) in filtered:
                             cv2.circle(vis, (int(x), int(y)), 8, (128, 128, 128), 2)
                         
                         # Draw boundary line
-                        cv2.line(vis, (int(left_bound), 0), (int(left_bound), key_bgr.shape[0]), (255, 0, 255), 2)
+                        cv2.line(vis, (int(left_bound), 0), (int(left_bound), key_bgr.shape[0]), (255, 0, 255), 3)
+                        cv2.putText(vis, f"Boundary", (int(left_bound) + 5, 30), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
                         
                         # Add text labels
                         cv2.putText(vis, f"ID: {id_ctrs.shape[0]}/{auto_params.id_rows * auto_params.id_digits}", (10, 30), 
