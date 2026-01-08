@@ -2,7 +2,7 @@
 import io
 import traceback
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -13,11 +13,9 @@ from PIL import Image
 
 
 # =========================
-# Safe converters
+# Utils
 # =========================
 def safe_float(x) -> float:
-    if isinstance(x, (list, tuple)):
-        x = np.array(x)
     if isinstance(x, np.ndarray):
         x = x.ravel()
         return float(x[0]) if x.size else 0.0
@@ -31,9 +29,6 @@ def safe_int(x) -> int:
     return int(round(safe_float(x)))
 
 
-# =========================
-# IO helpers
-# =========================
 def read_bytes(uploaded_file) -> bytes:
     if uploaded_file is None:
         return b""
@@ -102,7 +97,7 @@ def preprocess_binary(bgr: np.ndarray) -> np.ndarray:
 
 
 # =========================
-# Bubble center detection (robust, auto)
+# Bubble detection (STRONGER FILTER)
 # =========================
 def find_bubble_centers(bin_img: np.ndarray) -> np.ndarray:
     cnts, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -112,20 +107,22 @@ def find_bubble_centers(bin_img: np.ndarray) -> np.ndarray:
     records = []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < 20:
+        if area < 25:
             continue
         peri = cv2.arcLength(c, True)
-        if peri < 20:
+        if peri < 25:
             continue
+
         circ = 4.0 * np.pi * area / (peri * peri + 1e-6)
         x, y, w, h = cv2.boundingRect(c)
         ar = w / (h + 1e-6)
+
         records.append((area, circ, ar, c))
 
     if not records:
         return np.zeros((0, 2), dtype=np.int32)
 
-    # learn typical sizes
+    # learn typical size window
     areas = np.array([r[0] for r in records], dtype=np.float32)
     loga = np.log(np.clip(areas, 1, None))
     hist, edges = np.histogram(loga, bins=25)
@@ -133,17 +130,19 @@ def find_bubble_centers(bin_img: np.ndarray) -> np.ndarray:
     lo = float(edges[peak])
     hi = float(edges[min(peak + 1, len(edges) - 1)])
 
-    area_lo = float(np.exp(lo)) * 0.5
-    area_hi = float(np.exp(hi)) * 2.5
+    area_lo = float(np.exp(lo)) * 0.45
+    area_hi = float(np.exp(hi)) * 3.0
 
     centers = []
     for area, circ, ar, c in records:
+        # IMPORTANT: stricter to avoid text/number/X contours
         if not (area_lo <= area <= area_hi):
             continue
-        if circ < 0.18:
+        if circ < 0.35:
             continue
-        if not (0.55 <= ar <= 1.80):
+        if not (0.75 <= ar <= 1.35):
             continue
+
         M = cv2.moments(c)
         if abs(M["m00"]) < 1e-6:
             continue
@@ -155,7 +154,7 @@ def find_bubble_centers(bin_img: np.ndarray) -> np.ndarray:
 
 
 # =========================
-# Clustering helpers (no sklearn)
+# Clustering (no sklearn)
 # =========================
 def robust_gap_tolerance(sorted_vals: np.ndarray) -> float:
     if len(sorted_vals) < 6:
@@ -218,73 +217,117 @@ def select_best_columns(col_x: np.ndarray, k: int) -> np.ndarray:
     if n <= k:
         return col_x
     best = None
-    best_span = 1e18
-    best_std = 1e18
+    best_score = 1e18
     for i in range(0, n - k + 1):
         win = col_x[i:i+k]
         span = float(win[-1] - win[0])
         dif = np.diff(win)
         sstd = float(np.std(dif)) if len(dif) else 0.0
-        # prioritize tight span + regular spacing
         score = span + 80.0 * sstd
-        if score < (best_span + 80.0 * best_std):
+        if score < best_score:
+            best_score = score
             best = win
-            best_span = span
-            best_std = sstd
     return np.array(best, dtype=np.float32) if best is not None else col_x[:k]
 
 
 # =========================
-# Split ID vs Questions region (heuristic)
+# Smart region split (validated)
 # =========================
 def split_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
-    xs = centers[:, 0]
-    ys = centers[:, 1]
+    if centers.shape[0] < 40:
+        return centers, centers
 
-    # heuristics that usually work on OMR sheets
-    id_mask = (xs > 0.55 * w) & (ys < 0.65 * h)
-    q_mask = (ys > 0.20 * h) & (xs < 0.90 * w)
+    xs = centers[:, 0].astype(np.float32)
+    x_splits = np.percentile(xs, [35, 40, 45, 50, 55, 60, 65])
 
-    id_c = centers[id_mask]
-    q_c = centers[q_mask]
+    def score_id(block: np.ndarray) -> float:
+        if block.shape[0] < 30:
+            return -1e9
+        ry = group_1d_positions(block[:, 1])
+        cx = group_1d_positions(block[:, 0])
+        return -abs(len(ry) - 10) * 70 - abs(len(cx) - 4) * 120 + block.shape[0] * 0.2
 
-    # fallback
-    if id_c.shape[0] < 25:
-        id_c = centers[(xs > np.median(xs)) & (ys < np.median(ys))]
-    if q_c.shape[0] < 25:
-        q_c = centers[(ys > np.median(ys))]
+    def score_q(block: np.ndarray) -> float:
+        if block.shape[0] < 25:
+            return -1e9
+        ry = group_1d_positions(block[:, 1])
+        cx = group_1d_positions(block[:, 0])
+        bestc = min([abs(len(cx) - k) for k in (2, 4, 5)]) if len(cx) else 99
+        return len(ry) * 10 - bestc * 60 + block.shape[0] * 0.05
 
+    best = None
+    best_score = -1e18
+
+    for s in x_splits:
+        left = centers[centers[:, 0] <= s]
+        right = centers[centers[:, 0] > s]
+
+        sc1 = score_id(right) + score_q(left)   # right=id, left=q
+        sc2 = score_id(left) + score_q(right)   # left=id, right=q
+
+        if sc1 > best_score:
+            best_score = sc1
+            best = (right, left)
+        if sc2 > best_score:
+            best_score = sc2
+            best = (left, right)
+
+    id_c, q_c = best if best is not None else (centers, centers)
     return id_c, q_c
 
 
-def build_question_rows(q_centers: np.ndarray, col_x: np.ndarray) -> np.ndarray:
-    """
-    Detect real question rows without forcing question count.
-    Row is valid if it hits most columns (>= k-1) using adaptive tolerances.
-    """
-    if q_centers.shape[0] < 10:
+# =========================
+# Strong column picking by FREQUENCY (prevents question-number column)
+# =========================
+def top_x_peaks(q_centers: np.ndarray, k: int) -> np.ndarray:
+    xs = q_centers[:, 0].astype(np.float32)
+    x_clusters = group_1d_positions(xs)
+    if len(x_clusters) == 0:
         return np.array([], dtype=np.float32)
 
-    # candidate rows by Y clustering
+    # adaptive tol_x
+    xs_sort = np.sort(xs)
+    dx = np.diff(xs_sort)
+    dx = dx[(dx > 2) & (dx < 200)]
+    tol_x = max(10.0, float(np.percentile(dx, 15)) * 0.60) if len(dx) else 14.0
+
+    counts = []
+    for x0 in x_clusters:
+        cnt = int(np.sum(np.abs(xs - x0) < tol_x))
+        counts.append((cnt, x0))
+
+    counts.sort(reverse=True, key=lambda t: t[0])
+    picked = [x for _, x in counts[:k]]
+    return np.sort(np.array(picked, dtype=np.float32))
+
+
+def build_question_rows(q_centers: np.ndarray, col_x: np.ndarray) -> np.ndarray:
+    if q_centers.shape[0] < 10 or len(col_x) < 2:
+        return np.array([], dtype=np.float32)
+
     row_y_all = group_1d_positions(q_centers[:, 1])
     if len(row_y_all) == 0:
         return row_y_all
 
-    k = len(col_x)
+    xs = q_centers[:, 0].astype(np.float32)
+    ys = q_centers[:, 1].astype(np.float32)
 
-    # ---- adaptive tolerances from data (instead of fixed 12/14)
-    # estimate typical bubble spacing in X and Y
-    xs = np.sort(q_centers[:, 0].astype(np.float32))
-    ys = np.sort(q_centers[:, 1].astype(np.float32))
-    dx = np.diff(xs); dx = dx[(dx > 2) & (dx < 200)]
-    dy = np.diff(ys); dy = dy[(dy > 2) & (dy < 200)]
+    xs_sort = np.sort(xs)
+    ys_sort = np.sort(ys)
+
+    dx = np.diff(xs_sort); dx = dx[(dx > 2) & (dx < 250)]
+    dy = np.diff(ys_sort); dy = dy[(dy > 2) & (dy < 250)]
+
     tol_x = max(10.0, float(np.percentile(dx, 15)) * 0.60) if len(dx) else 14.0
     tol_y = max(10.0, float(np.percentile(dy, 15)) * 0.60) if len(dy) else 12.0
+
+    k = len(col_x)
+    need = max(2, k - 1)  # not strict "k"
 
     valid_rows = []
     for y0 in row_y_all:
         near = q_centers[np.abs(q_centers[:, 1] - y0) < tol_y]
-        if near.shape[0] < max(2, k - 1):
+        if near.shape[0] < need:
             continue
 
         hits = 0
@@ -292,14 +335,14 @@ def build_question_rows(q_centers: np.ndarray, col_x: np.ndarray) -> np.ndarray:
             if np.any(np.abs(near[:, 0] - x0) < tol_x):
                 hits += 1
 
-        # ✅ لا نجبر "كل الأعمدة" — نخليها >= k-1
-        if hits >= max(2, k - 1):
+        if hits >= need:
             valid_rows.append(y0)
 
     return np.array(valid_rows, dtype=np.float32)
 
+
 # =========================
-# Alignment: student->key (ORB homography)
+# Alignment (ORB)
 # =========================
 def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray, bool, int]:
     h, w = ref_bgr.shape[:2]
@@ -388,8 +431,8 @@ def bubble_stats(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> dict:
 
 
 # =========================
-# Smart pick: (most filled) + ignore cancelled(X)
-# and remove printed-letter baseline per row
+# Smart pick: most shaded wins + ignore X cancelled
+# + baseline removal (letters A/B/C/D)
 # =========================
 def pick_choice_smart(stats_list: List[dict], labels: List[str],
                       blank_norm: float,
@@ -403,11 +446,9 @@ def pick_choice_smart(stats_list: List[dict], labels: List[str],
 
     cancelled = (stds >= x_std) & (xs >= x_score)
 
-    # baseline from the lowest half of fills (printed A/B/C/D)
     sorted_f = np.sort(fills)
-    k = max(1, len(sorted_f)//2)
+    k = max(1, len(sorted_f) // 2)
     baseline = float(np.median(sorted_f[:k]))
-
     norm = np.clip(fills - baseline, 0.0, 1.0)
 
     cand = [i for i in range(len(labels)) if not cancelled[i]]
@@ -422,7 +463,7 @@ def pick_choice_smart(stats_list: List[dict], labels: List[str],
     if best_v < blank_norm:
         return "?", "BLANK", cancelled.tolist(), norm.tolist()
 
-    # If close, still pick the best (you want "most shaded wins")
+    # if close, still pick the best (your rule)
     if second_v > blank_norm and (best_v / (second_v + 1e-9)) < close_ratio:
         return labels[best], "OK_CLOSE", cancelled.tolist(), norm.tolist()
 
@@ -445,37 +486,34 @@ def load_roster(file) -> Dict[str, str]:
     codes = (
         df["student_code"].astype(str).str.strip()
         .str.replace(".0", "", regex=False)
-        .str.zfill(4)  # fixed 4 digits
+        .str.zfill(4)
     )
     names = df["student_name"].astype(str).str.strip()
     return dict(zip(codes, names))
 
 
 # =========================
-# Learn template from Answer Key (AUTO, real)
-# - ID fixed: 10x4
-# - choices auto: 2 or 4 or 5
-# - rows auto: only valid question rows
+# Learn template from Answer Key (AUTO REAL)
 # =========================
 def learn_template_from_key(key_bgr: np.ndarray) -> Tuple[LearnedTemplate, dict]:
     h, w = key_bgr.shape[:2]
     bin_img = preprocess_binary(key_bgr)
     centers = find_bubble_centers(bin_img)
-    if centers.shape[0] < 30:
+
+    if centers.shape[0] < 40:
         raise ValueError("عدد الفقاعات المكتشفة قليل جداً. ارفع DPI أو تأكد وضوح الصورة.")
 
     id_centers, q_centers = split_regions(centers, w, h)
-
     if id_centers.shape[0] < 30:
         raise ValueError("فشل اكتشاف منطقة كود الطالب تلقائياً.")
     if q_centers.shape[0] < 25:
         raise ValueError("فشل اكتشاف منطقة الأسئلة تلقائياً.")
 
-    # ---- ID grid (force 10 rows, 4 cols by best window)
+    # ---- ID grid: force 10 rows + choose best 4 cols
     id_row_y = group_1d_positions(id_centers[:, 1])
     id_col_x = group_1d_positions(id_centers[:, 0])
 
-    # make rows ~10 by merging if needed
+    # merge/synthesize to 10 rows
     if len(id_row_y) > 10:
         while len(id_row_y) > 10:
             dif = np.diff(id_row_y)
@@ -489,7 +527,6 @@ def learn_template_from_key(key_bgr: np.ndarray) -> Tuple[LearnedTemplate, dict]
             id_row_y = np.append(id_row_y, id_row_y[-1] + step)
         id_row_y = np.sort(id_row_y)
 
-    # choose best 4 columns
     if len(id_col_x) >= 4:
         id_col_x = select_best_columns(id_col_x, 4)
     else:
@@ -498,22 +535,19 @@ def learn_template_from_key(key_bgr: np.ndarray) -> Tuple[LearnedTemplate, dict]
     id_grid_centers = snap_to_grid(id_centers, id_row_y, id_col_x)
     id_grid = BubbleGrid(id_row_y, id_col_x, id_grid_centers, rows=10, cols=4)
 
-    # ---- Question columns: auto choose among {2,4,5}
-    q_col_all = group_1d_positions(q_centers[:, 0])
-    if len(q_col_all) < 2:
-        raise ValueError("تعذر اكتشاف أعمدة الخيارات.")
-
+    # ---- Question columns: choose among 2/4/5 using frequency peaks
     best_cols = None
-    best_score = 1e18
-    for k in [2, 4, 5]:
-        if len(q_col_all) < k:
+    best_score = -1e18
+
+    for k in (2, 4, 5):
+        cols_k = top_x_peaks(q_centers, k)
+        if len(cols_k) != k:
             continue
-        cols_k = select_best_columns(q_col_all, k)
-        span = float(cols_k[-1] - cols_k[0])
-        dif = np.diff(cols_k)
-        sstd = float(np.std(dif)) if len(dif) else 0.0
-        score = span + 80.0 * sstd
-        if score < best_score:
+        # score by total hits around these cols
+        score = 0
+        for x0 in cols_k:
+            score += int(np.sum(np.abs(q_centers[:, 0] - x0) < 14))
+        if score > best_score:
             best_score = score
             best_cols = cols_k
 
@@ -523,7 +557,7 @@ def learn_template_from_key(key_bgr: np.ndarray) -> Tuple[LearnedTemplate, dict]
     q_col_x = best_cols
     num_choices = int(len(q_col_x))
 
-    # ---- Question rows: real rows only (must hit all chosen columns)
+    # ---- Question rows: real rows only (based on hitting columns)
     q_row_y = build_question_rows(q_centers, q_col_x)
     if len(q_row_y) < 3:
         raise ValueError("لم يتم اكتشاف صفوف أسئلة كافية. ربما الصفحة مقصوصة أو غير واضحة.")
@@ -533,7 +567,8 @@ def learn_template_from_key(key_bgr: np.ndarray) -> Tuple[LearnedTemplate, dict]
 
     template = LearnedTemplate(
         ref_bgr=key_bgr, ref_w=w, ref_h=h,
-        id_grid=id_grid, q_grid=q_grid,
+        id_grid=id_grid,
+        q_grid=q_grid,
         num_q=len(q_row_y),
         num_choices=num_choices,
         id_rows=10, id_digits=4
@@ -547,18 +582,18 @@ def learn_template_from_key(key_bgr: np.ndarray) -> Tuple[LearnedTemplate, dict]
         "id_digits": 4,
         "q_rows": int(len(q_row_y)),
         "q_cols": int(num_choices),
+        "q_col_x": [float(x) for x in q_col_x],
     }
     return template, dbg
 
 
 # =========================
-# Extract Answer Key from template (SMART)
+# Extract Answer Key
 # =========================
 def extract_answer_key(template: LearnedTemplate) -> Tuple[Dict[int, str], pd.DataFrame, dict]:
     gray = cv2.cvtColor(template.ref_bgr, cv2.COLOR_BGR2GRAY)
     choices = list("ABCDEFGH"[:template.num_choices])
 
-    # thresholds (stable defaults)
     blank_norm = 0.06
     close_ratio = 1.12
     x_std_key = 18.0
@@ -632,11 +667,11 @@ def read_student_id(template: LearnedTemplate, gray: np.ndarray) -> str:
         best_f = float(fills[best])
         second_f = float(fills[second])
 
-        # conservative decision
+        # conservative
         if best_f < 0.08 or (best_f - second_f) < 0.04:
             digit = "X"
         else:
-            digit = str(best)  # row index corresponds to digit 0..9
+            digit = str(best)  # row index = digit
 
         digits.append(digit)
 
@@ -644,11 +679,10 @@ def read_student_id(template: LearnedTemplate, gray: np.ndarray) -> str:
 
 
 # =========================
-# Read student answers (SMART, your rules)
+# Read student answers
 # =========================
 def read_student_answers(template: LearnedTemplate, gray: np.ndarray, params: dict) -> pd.DataFrame:
     choices = params["choices"]
-
     rows = []
     for r in range(template.q_grid.rows):
         stats = []
@@ -670,11 +704,11 @@ def read_student_answers(template: LearnedTemplate, gray: np.ndarray, params: di
 
 
 # =========================
-# Main UI
+# UI
 # =========================
 def main():
-    st.set_page_config(page_title="AUTO OMR (Real Training)", layout="wide")
-    st.title("✅ OMR ذكي: اكتشاف عدد الأسئلة + عدد الخيارات تلقائياً (2/4/5) + قاعدة X")
+    st.set_page_config(page_title="AUTO OMR (Robust)", layout="wide")
+    st.title("✅ OMR ذكي: اكتشاف الأسئلة + عدد الخيارات (2/4/5) + قاعدة X (إهمال الملغي)")
 
     if "trained" not in st.session_state:
         st.session_state.trained = False
@@ -708,16 +742,24 @@ def main():
             template, train_dbg = learn_template_from_key(key_bgr)
             answer_key, df_key_dbg, params = extract_answer_key(template)
 
-            # preview overlay
+            # overlay preview
             vis = key_bgr.copy()
+
+            # draw question grid points
             for r in range(template.q_grid.rows):
                 for c in range(template.q_grid.cols):
                     x, y = template.q_grid.centers[r, c]
                     cv2.circle(vis, (safe_int(x), safe_int(y)), 6, (0, 255, 0), 2)
+
+            # draw ID grid points
             for r in range(template.id_grid.rows):
                 for c in range(template.id_grid.cols):
                     x, y = template.id_grid.centers[r, c]
                     cv2.circle(vis, (safe_int(x), safe_int(y)), 6, (0, 0, 255), 2)
+
+            # draw vertical lines for chosen choice columns (helps verify)
+            for x0 in template.q_grid.col_x:
+                cv2.line(vis, (safe_int(x0), 0), (safe_int(x0), template.ref_h), (255, 0, 0), 2)
 
             st.session_state.template = template
             st.session_state.answer_key = answer_key
@@ -727,7 +769,7 @@ def main():
             st.session_state.train_dbg = train_dbg
             st.session_state.trained = True
 
-            st.success("✅ تم التدريب (اكتشاف الأسئلة والخيارات والكود) بنجاح.")
+            st.success("✅ تم التدريب بنجاح.")
         except Exception as e:
             st.error(f"❌ فشل التدريب التلقائي: {e}")
             with st.expander("تفاصيل الخطأ (Traceback)"):
@@ -753,15 +795,17 @@ def main():
     with cD:
         st.metric("صفوف كود الطالب", 10)
 
-    st.caption(f"Detected centers: {st.session_state.train_dbg}")
+    st.caption(f"Debug: {st.session_state.train_dbg}")
 
     st.markdown("### 🔑 Answer Key المستخرج")
     st.json(answer_key)
 
     if debug:
-        st.markdown("### جدول Debug (مهم لمراجعة الأسئلة التي فشلت)")
+        st.markdown("### 🖼️ Overlay للتحقق (أخضر=أسئلة، أحمر=كود، أزرق=أعمدة الخيارات)")
+        st.image(bgr_to_rgb(st.session_state.preview_img), width="stretch")
+
+        st.markdown("### جدول Debug (مهم لمعرفة أين يحدث BLANK أو OK_CLOSE)")
         st.dataframe(df_key_dbg, width="stretch", height=450)
-        st.image(bgr_to_rgb(st.session_state.preview_img), caption="Green=Questions, Red=ID", width="stretch")
 
     st.markdown("---")
     st.subheader("✅ التصحيح")
@@ -770,7 +814,6 @@ def main():
         st.warning("ارفع ملف الطلاب + أوراق الطلاب للبدء.")
         return
 
-    # roster
     try:
         roster = load_roster(roster_file)
         st.success(f"✅ تم تحميل قائمة الطلاب: {len(roster)}")
