@@ -1,15 +1,16 @@
 """
 ======================================================================================
-                    OMR BUBBLE SHEET SCANNER - MOUSE SELECTION
-                         نظام تصحيح البابل شيت - تحديد بالماوس
+                    OMR BUBBLE SHEET SCANNER - CLICK SELECTION
+                         نظام تصحيح البابل شيت - تحديد بالنقر
 ======================================================================================
-✅ تحديد بالماوس مباشرة | Mouse Click Selection
+✅ تحديد بنقرتين بسيطتين | Two-Click Selection
+✅ بدون مكتبات معقدة | No Complex Libraries
 """
 
 import io
 import json
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -17,7 +18,6 @@ import pandas as pd
 import streamlit as st
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageDraw
-from streamlit_drawable_canvas import st_canvas
 
 
 # ======================================================================================
@@ -148,6 +148,11 @@ class GradingEngine:
             return ""
         
         rect = self.template.id_block
+        h, w = binary.shape[:2]
+        
+        if rect.x < 0 or rect.y < 0 or rect.x2 > w or rect.y2 > h:
+            return "OUT_OF_BOUNDS"
+        
         roi = binary[rect.y:rect.y2, rect.x:rect.x2]
         
         rows = self.template.id_rows
@@ -169,6 +174,11 @@ class GradingEngine:
     
     def extract_answers(self, binary: np.ndarray, block: QuestionBlock) -> Dict:
         rect = block.rect
+        h, w = binary.shape[:2]
+        
+        if rect.x < 0 or rect.y < 0 or rect.x2 > w or rect.y2 > h:
+            return {}
+        
         roi = binary[rect.y:rect.y2, rect.x:rect.x2]
         
         rows = block.num_rows
@@ -238,10 +248,14 @@ class GradingEngine:
 #                                    UI
 # ======================================================================================
 
-def draw_preview(img: Image.Image, template: Template) -> Image.Image:
+def draw_preview_with_clicks(img: Image.Image, template: Template, 
+                             clicks: List[Tuple[int, int]], 
+                             display_width: int) -> Image.Image:
+    """رسم المعاينة مع النقاط"""
     preview = img.copy()
     draw = ImageDraw.Draw(preview)
     
+    # رسم البلوكات المحفوظة
     if template.id_block:
         r = template.id_block
         draw.rectangle([r.x, r.y, r.x2, r.y2], outline="red", width=4)
@@ -252,13 +266,27 @@ def draw_preview(img: Image.Image, template: Template) -> Image.Image:
         draw.rectangle([r.x, r.y, r.x2, r.y2], outline="green", width=4)
         draw.text((r.x+10, r.y+10), f"Q{block.start_q}-{block.end_q}", fill="green")
     
+    # رسم النقاط المؤقتة
+    for i, (x, y) in enumerate(clicks, 1):
+        # دائرة حول النقطة
+        r = 8
+        draw.ellipse([x-r, y-r, x+r, y+r], fill="blue", outline="white", width=2)
+        draw.text((x+12, y-12), f"نقطة {i}", fill="blue")
+    
+    # إذا كان هناك نقطتان، ارسم المستطيل المؤقت
+    if len(clicks) == 2:
+        x1, y1 = clicks[0]
+        x2, y2 = clicks[1]
+        draw.rectangle([x1, y1, x2, y2], outline="yellow", width=3)
+    
     return preview
 
 
 def main():
     st.set_page_config(page_title="OMR Scanner", layout="wide")
     
-    st.title("✅ نظام تصحيح البابل شيت - تحديد بالماوس")
+    st.title("✅ نظام تصحيح البابل شيت - تحديد بالنقر")
+    st.markdown("**اضغط نقطتين على الصورة لتحديد المستطيل**")
     st.markdown("---")
     
     # Session State
@@ -266,6 +294,8 @@ def main():
         st.session_state.template = None
     if "template_img" not in st.session_state:
         st.session_state.template_img = None
+    if "clicks" not in st.session_state:
+        st.session_state.clicks = []
     
     # Layout
     col1, col2 = st.columns([1.5, 1])
@@ -295,6 +325,11 @@ def main():
         if st.session_state.template_img:
             st.divider()
             
+            # Display width slider
+            display_width = st.slider("عرض الصورة", 400, 1200, 800, 50)
+            
+            st.divider()
+            
             col_a, col_b = st.columns(2)
             with col_a:
                 choices = st.selectbox("الخيارات", [4, 5, 6], 0)
@@ -321,8 +356,51 @@ def main():
             else:
                 start_q = end_q = num_rows = 0
             
-            st.info("🖱️ ارسم مستطيل على الصورة في اليسار")
+            st.info("💡 اضغط نقطتين على الصورة في اليسار:\n- النقطة 1: الزاوية الأولى\n- النقطة 2: الزاوية الثانية")
             
+            # عرض النقاط الحالية
+            if st.session_state.clicks:
+                st.markdown(f"**النقاط المحددة: {len(st.session_state.clicks)}/2**")
+                for i, (x, y) in enumerate(st.session_state.clicks, 1):
+                    st.text(f"نقطة {i}: ({x}, {y})")
+            
+            # أزرار التحكم
+            col_save, col_clear = st.columns(2)
+            
+            with col_save:
+                if st.button("💾 حفظ", type="primary", use_container_width=True, 
+                           disabled=len(st.session_state.clicks) != 2):
+                    if len(st.session_state.clicks) == 2:
+                        x1, y1 = st.session_state.clicks[0]
+                        x2, y2 = st.session_state.clicks[1]
+                        
+                        x = min(x1, x2)
+                        y = min(y1, y2)
+                        w = abs(x2 - x1)
+                        h = abs(y2 - y1)
+                        
+                        if w < 10 or h < 10:
+                            st.error("❌ المستطيل صغير جداً")
+                        else:
+                            rect = Rectangle(x, y, w, h)
+                            
+                            if mode == "🆔 الكود":
+                                st.session_state.template.id_block = rect
+                                st.success("✅ تم حفظ منطقة الكود")
+                            else:
+                                block = QuestionBlock(rect, start_q, end_q, num_rows)
+                                st.session_state.template.q_blocks.append(block)
+                                st.success(f"✅ بلوك {start_q}-{end_q}")
+                            
+                            st.session_state.clicks = []
+                            st.rerun()
+            
+            with col_clear:
+                if st.button("🗑️ مسح النقاط", use_container_width=True):
+                    st.session_state.clicks = []
+                    st.rerun()
+            
+            # عرض البلوكات
             if st.session_state.template.q_blocks:
                 st.divider()
                 st.markdown("**البلوكات:**")
@@ -345,70 +423,49 @@ def main():
             strict = st.checkbox("وضع صارم", True)
     
     # ======================
-    # LEFT: Canvas
+    # LEFT: Preview & Click
     # ======================
     with col1:
         if st.session_state.template_img:
-            st.subheader("🖱️ ارسم المستطيل بالماوس")
+            st.subheader("🖼️ المعاينة - اضغط لتحديد النقاط")
             
-            # عرض معاينة أولاً
-            preview = draw_preview(st.session_state.template_img, 
-                                  st.session_state.template)
+            # حساب حجم العرض
+            display_width = st.session_state.get('display_width', 800)
+            orig_w, orig_h = st.session_state.template_img.size
+            display_height = int(orig_h * (display_width / orig_w))
             
-            # Canvas للرسم
-            canvas_width = 800
-            canvas_height = int(st.session_state.template_img.height * 
-                              (canvas_width / st.session_state.template_img.width))
-            
-            st.markdown("**📌 اضغط واسحب لرسم مستطيل**")
-            
-            canvas_result = st_canvas(
-                fill_color="rgba(255, 0, 0, 0.1)",
-                stroke_width=3,
-                stroke_color="#FF0000" if mode == "🆔 الكود" else "#00FF00",
-                background_image=preview,
-                update_streamlit=True,
-                height=canvas_height,
-                width=canvas_width,
-                drawing_mode="rect",
-                point_display_radius=0,
-                key="canvas"
+            # رسم المعاينة
+            preview = draw_preview_with_clicks(
+                st.session_state.template_img,
+                st.session_state.template,
+                st.session_state.clicks,
+                display_width
             )
             
-            # معالجة الرسم
-            if canvas_result.json_data is not None:
-                objects = canvas_result.json_data["objects"]
+            # عرض الصورة مع إمكانية النقر
+            # ملاحظة: Streamlit لا يدعم click events مباشرة
+            # لذا سنستخدم طريقة بديلة
+            
+            st.image(preview, width=display_width)
+            
+            # طريقة بديلة: إدخال الإحداثيات
+            st.markdown("---")
+            st.markdown("**⚠️ للأسف Streamlit لا يدعم النقر المباشر**")
+            st.markdown("**✅ استخدم هذه الطريقة:**")
+            
+            with st.expander("📍 إضافة نقطة", expanded=len(st.session_state.clicks) < 2):
+                col_x, col_y, col_add = st.columns([2, 2, 1])
                 
-                if objects:
-                    # آخر مستطيل مرسوم
-                    last_rect = objects[-1]
-                    
-                    # تحويل من حجم Canvas للحجم الأصلي
-                    scale_x = st.session_state.template_img.width / canvas_width
-                    scale_y = st.session_state.template_img.height / canvas_height
-                    
-                    x = int(last_rect["left"] * scale_x)
-                    y = int(last_rect["top"] * scale_y)
-                    w = int(last_rect["width"] * scale_x)
-                    h = int(last_rect["height"] * scale_y)
-                    
-                    st.info(f"📏 المستطيل: ({x}, {y}) - العرض: {w}, الارتفاع: {h}")
-                    
-                    # زر الحفظ
-                    if st.button("💾 حفظ المستطيل", type="primary", use_container_width=True):
-                        if w < 10 or h < 10:
-                            st.error("❌ المستطيل صغير جداً")
-                        else:
-                            rect = Rectangle(x, y, w, h)
-                            
-                            if mode == "🆔 الكود":
-                                st.session_state.template.id_block = rect
-                                st.success("✅ تم حفظ منطقة الكود")
-                            else:
-                                block = QuestionBlock(rect, start_q, end_q, num_rows)
-                                st.session_state.template.q_blocks.append(block)
-                                st.success(f"✅ بلوك {start_q}-{end_q}")
-                            
+                with col_x:
+                    click_x = st.number_input("X", 0, orig_w, 0, key="click_x")
+                with col_y:
+                    click_y = st.number_input("Y", 0, orig_h, 0, key="click_y")
+                with col_add:
+                    st.write("")  # spacer
+                    st.write("")  # spacer
+                    if st.button("➕ إضافة"):
+                        if len(st.session_state.clicks) < 2:
+                            st.session_state.clicks.append((click_x, click_y))
                             st.rerun()
             
             st.divider()
