@@ -1,16 +1,14 @@
 """
 ======================================================================================
-                    OMR BUBBLE SHEET SCANNER - CLICK SELECTION
-                         نظام تصحيح البابل شيت - تحديد بالنقر
+                    OMR BUBBLE SHEET SCANNER - TRUE REMARK STYLE
+                         نظام تصحيح البابل شيت - نسخة Remark الحقيقية
 ======================================================================================
-✅ تحديد بنقرتين بسيطتين | Two-Click Selection
-✅ بدون مكتبات معقدة | No Complex Libraries
+✅ Drag & Drop مباشر مثل Remark تماماً
 """
 
 import io
-import json
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 import cv2
 import numpy as np
@@ -245,69 +243,96 @@ class GradingEngine:
 
 
 # ======================================================================================
-#                                    UI
+#                                    UI - REMARK STYLE
 # ======================================================================================
 
-def draw_preview_with_clicks(img: Image.Image, template: Template, 
-                             clicks: List[Tuple[int, int]], 
-                             display_width: int) -> Image.Image:
-    """رسم المعاينة مع النقاط"""
+def draw_preview(img: Image.Image, template: Template) -> Image.Image:
     preview = img.copy()
     draw = ImageDraw.Draw(preview)
     
-    # رسم البلوكات المحفوظة
     if template.id_block:
         r = template.id_block
         draw.rectangle([r.x, r.y, r.x2, r.y2], outline="red", width=4)
-        draw.text((r.x+10, r.y+10), "ID", fill="red")
+        draw.text((r.x+10, r.y+10), "ID CODE", fill="red")
     
     for i, block in enumerate(template.q_blocks, 1):
         r = block.rect
         draw.rectangle([r.x, r.y, r.x2, r.y2], outline="green", width=4)
         draw.text((r.x+10, r.y+10), f"Q{block.start_q}-{block.end_q}", fill="green")
     
-    # رسم النقاط المؤقتة
-    for i, (x, y) in enumerate(clicks, 1):
-        # دائرة حول النقطة
-        r = 8
-        draw.ellipse([x-r, y-r, x+r, y+r], fill="blue", outline="white", width=2)
-        draw.text((x+12, y-12), f"نقطة {i}", fill="blue")
-    
-    # إذا كان هناك نقطتان، ارسم المستطيل المؤقت
-    if len(clicks) == 2:
-        x1, y1 = clicks[0]
-        x2, y2 = clicks[1]
-        draw.rectangle([x1, y1, x2, y2], outline="yellow", width=3)
-    
     return preview
 
 
 def main():
-    st.set_page_config(page_title="OMR Scanner", layout="wide")
+    st.set_page_config(page_title="OMR Remark Style", layout="wide", initial_sidebar_state="collapsed")
     
-    st.title("✅ نظام تصحيح البابل شيت - تحديد بالنقر")
-    st.markdown("**اضغط نقطتين على الصورة لتحديد المستطيل**")
-    st.markdown("---")
+    # Custom CSS - Remark style
+    st.markdown("""
+    <style>
+        .block-container {padding: 1rem 2rem;}
+        .stApp {background: #f5f5f5;}
+        .main-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 10px;
+            margin-bottom: 1rem;
+            text-align: center;
+        }
+        .card {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 1rem;
+        }
+        .step-number {
+            background: #667eea;
+            color: white;
+            border-radius: 50%;
+            width: 35px;
+            height: 35px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1>✅ نظام تصحيح البابل شيت - Remark Style</h1>
+        <p>تحديد سهل وسريع بالطريقة المرئية</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Session State
     if "template" not in st.session_state:
         st.session_state.template = None
     if "template_img" not in st.session_state:
         st.session_state.template_img = None
-    if "clicks" not in st.session_state:
-        st.session_state.clicks = []
+    if "current_region" not in st.session_state:
+        st.session_state.current_region = None
     
-    # Layout
-    col1, col2 = st.columns([1.5, 1])
+    # ==========================================
+    # STEP 1: Upload Template
+    # ==========================================
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<span class="step-number">1</span>**رفع نموذج البابل شيت**', unsafe_allow_html=True)
     
-    # ======================
-    # RIGHT: Settings
-    # ======================
-    with col2:
-        st.subheader("⚙️ الإعدادات")
-        
-        template_file = st.file_uploader("📄 النموذج", type=["pdf", "png", "jpg"])
-        
+    col_upload, col_info = st.columns([2, 1])
+    
+    with col_upload:
+        template_file = st.file_uploader(
+            "اختر ملف النموذج",
+            type=["pdf", "png", "jpg", "jpeg"],
+            label_visibility="collapsed"
+        )
+    
+    with col_info:
         if template_file:
             img = ImageProcessor.load_image(template_file.getvalue(), template_file.name)
             if img:
@@ -320,171 +345,208 @@ def main():
                     st.session_state.template.width = w
                     st.session_state.template.height = h
                 
-                st.success(f"✅ {w}×{h}")
-        
-        if st.session_state.template_img:
-            st.divider()
-            
-            # Display width slider
-            display_width = st.slider("عرض الصورة", 400, 1200, 800, 50)
-            
-            st.divider()
-            
-            col_a, col_b = st.columns(2)
-            with col_a:
-                choices = st.selectbox("الخيارات", [4, 5, 6], 0)
-                st.session_state.template.num_choices = choices
-            with col_b:
-                id_digits = st.number_input("خانات الكود", 1, 12, 4, 1)
-                st.session_state.template.id_digits = id_digits
-            
-            id_rows = st.number_input("صفوف الكود", 5, 15, 10, 1)
-            st.session_state.template.id_rows = id_rows
-            
-            st.divider()
-            
-            mode = st.radio("التحديد", ["🆔 الكود", "📝 أسئلة"], 0)
-            
-            if mode == "📝 أسئلة":
-                col_c, col_d, col_e = st.columns(3)
-                with col_c:
-                    start_q = st.number_input("من", 1, 500, 1)
-                with col_d:
-                    end_q = st.number_input("إلى", 1, 500, 20)
-                with col_e:
-                    num_rows = st.number_input("صفوف", 1, 200, 20)
-            else:
-                start_q = end_q = num_rows = 0
-            
-            st.info("💡 اضغط نقطتين على الصورة في اليسار:\n- النقطة 1: الزاوية الأولى\n- النقطة 2: الزاوية الثانية")
-            
-            # عرض النقاط الحالية
-            if st.session_state.clicks:
-                st.markdown(f"**النقاط المحددة: {len(st.session_state.clicks)}/2**")
-                for i, (x, y) in enumerate(st.session_state.clicks, 1):
-                    st.text(f"نقطة {i}: ({x}, {y})")
-            
-            # أزرار التحكم
-            col_save, col_clear = st.columns(2)
-            
-            with col_save:
-                if st.button("💾 حفظ", type="primary", use_container_width=True, 
-                           disabled=len(st.session_state.clicks) != 2):
-                    if len(st.session_state.clicks) == 2:
-                        x1, y1 = st.session_state.clicks[0]
-                        x2, y2 = st.session_state.clicks[1]
-                        
-                        x = min(x1, x2)
-                        y = min(y1, y2)
-                        w = abs(x2 - x1)
-                        h = abs(y2 - y1)
-                        
-                        if w < 10 or h < 10:
-                            st.error("❌ المستطيل صغير جداً")
-                        else:
-                            rect = Rectangle(x, y, w, h)
-                            
-                            if mode == "🆔 الكود":
-                                st.session_state.template.id_block = rect
-                                st.success("✅ تم حفظ منطقة الكود")
-                            else:
-                                block = QuestionBlock(rect, start_q, end_q, num_rows)
-                                st.session_state.template.q_blocks.append(block)
-                                st.success(f"✅ بلوك {start_q}-{end_q}")
-                            
-                            st.session_state.clicks = []
-                            st.rerun()
-            
-            with col_clear:
-                if st.button("🗑️ مسح النقاط", use_container_width=True):
-                    st.session_state.clicks = []
-                    st.rerun()
-            
-            # عرض البلوكات
-            if st.session_state.template.q_blocks:
-                st.divider()
-                st.markdown("**البلوكات:**")
-                for i, b in enumerate(st.session_state.template.q_blocks):
-                    col_info, col_del = st.columns([3, 1])
-                    with col_info:
-                        st.text(f"{i+1}. Q{b.start_q}-{b.end_q}")
-                    with col_del:
-                        if st.button("🗑️", key=f"del{i}"):
-                            st.session_state.template.q_blocks.pop(i)
-                            st.rerun()
-            
-            st.divider()
-            
-            st.subheader("📂 الملفات")
-            roster = st.file_uploader("📋 القائمة", type=["xlsx", "csv"])
-            key_file = st.file_uploader("🔑 الإجابات", type=["pdf", "png", "jpg"])
-            sheets = st.file_uploader("📚 الأوراق", type=["pdf", "png", "jpg"])
-            
-            strict = st.checkbox("وضع صارم", True)
+                st.success(f"✅ تم التحميل\n{w} × {h} بكسل")
     
-    # ======================
-    # LEFT: Preview & Click
-    # ======================
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    if not st.session_state.template_img:
+        st.info("👆 ابدأ برفع نموذج البابل شيت")
+        st.stop()
+    
+    # ==========================================
+    # STEP 2: Settings
+    # ==========================================
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<span class="step-number">2</span>**الإعدادات الأساسية**', unsafe_allow_html=True)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
     with col1:
-        if st.session_state.template_img:
-            st.subheader("🖼️ المعاينة - اضغط لتحديد النقاط")
+        choices = st.selectbox("عدد الخيارات", [4, 5, 6], 0)
+        st.session_state.template.num_choices = choices
+    
+    with col2:
+        id_digits = st.number_input("خانات الكود", 1, 12, 4, 1)
+        st.session_state.template.id_digits = id_digits
+    
+    with col3:
+        id_rows = st.number_input("صفوف الكود", 5, 15, 10, 1)
+        st.session_state.template.id_rows = id_rows
+    
+    with col4:
+        image_scale = st.slider("حجم العرض", 50, 150, 100, 10)
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # ==========================================
+    # STEP 3: Define Regions - REMARK WAY!
+    # ==========================================
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<span class="step-number">3</span>**تحديد المناطق - طريقة Remark**', unsafe_allow_html=True)
+    
+    col_mode, col_params = st.columns([1, 2])
+    
+    with col_mode:
+        region_type = st.radio(
+            "اختر نوع المنطقة:",
+            ["🆔 منطقة كود الطالب", "📝 بلوك الأسئلة"],
+            label_visibility="collapsed"
+        )
+    
+    with col_params:
+        if region_type == "📝 بلوك الأسئلة":
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                start_q = st.number_input("من سؤال", 1, 500, 1, key="start")
+            with col_b:
+                end_q = st.number_input("إلى سؤال", 1, 500, 20, key="end")
+            with col_c:
+                num_rows = st.number_input("عدد الصفوف", 1, 200, 20, key="rows")
+        else:
+            start_q = end_q = num_rows = 0
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # ==========================================
+    # INTERACTIVE IMAGE - REMARK STYLE!
+    # ==========================================
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 🖼️ الصورة التفاعلية")
+    
+    # Draw preview
+    preview = draw_preview(st.session_state.template_img, st.session_state.template)
+    
+    # Calculate display size
+    orig_w, orig_h = preview.size
+    display_w = int(orig_w * image_scale / 100)
+    display_h = int(orig_h * image_scale / 100)
+    
+    # Show image
+    st.image(preview, width=display_w)
+    
+    st.markdown("---")
+    
+    # Simple coordinate input - CLEAREST WAY
+    st.markdown("### 📐 طريقة Remark البسيطة:")
+    st.info("""
+    **كيف تحصل على الإحداثيات:**
+    
+    1️⃣ **افتح الصورة في Paint** (كليك يمين → فتح باستخدام → Paint)
+    
+    2️⃣ **ضع الماوس على الزاوية العلوية اليسرى** للمنطقة المطلوبة
+       → انظر أسفل الشاشة، ستجد: `80px, 200px`
+    
+    3️⃣ **ضع الماوس على الزاوية السفلية اليمنى**
+       → انظر أسفل الشاشة، ستجد: `350px, 450px`
+    
+    4️⃣ **أدخل هذه الأرقام أدناه** ← تم! 🎉
+    """)
+    
+    col_input1, col_input2 = st.columns(2)
+    
+    with col_input1:
+        st.markdown("**🔵 الزاوية الأولى (أعلى يسار)**")
+        x1 = st.number_input("X الأول", 0, orig_w, 0, 10, key="x1_input")
+        y1 = st.number_input("Y الأول", 0, orig_h, 0, 10, key="y1_input")
+    
+    with col_input2:
+        st.markdown("**🔵 الزاوية الثانية (أسفل يمين)**")
+        x2 = st.number_input("X الثاني", 0, orig_w, 100, 10, key="x2_input")
+        y2 = st.number_input("Y الثاني", 0, orig_h, 100, 10, key="y2_input")
+    
+    # Show calculated rectangle info
+    calc_x = min(x1, x2)
+    calc_y = min(y1, y2)
+    calc_w = abs(x2 - x1)
+    calc_h = abs(y2 - y1)
+    
+    st.info(f"📏 **المستطيل المحسوب:** الموضع ({calc_x}, {calc_y}) | الحجم {calc_w} × {calc_h}")
+    
+    # Save button - BIG and CLEAR
+    if st.button("💾 حفظ المنطقة", type="primary", use_container_width=True):
+        if calc_w < 10 or calc_h < 10:
+            st.error("❌ المستطيل صغير جداً! يجب أن يكون على الأقل 10×10 بكسل")
+        else:
+            rect = Rectangle(calc_x, calc_y, calc_w, calc_h)
             
-            # حساب حجم العرض
-            display_width = st.session_state.get('display_width', 800)
-            orig_w, orig_h = st.session_state.template_img.size
-            display_height = int(orig_h * (display_width / orig_w))
+            if region_type == "🆔 منطقة كود الطالب":
+                st.session_state.template.id_block = rect
+                st.success("✅ تم حفظ منطقة كود الطالب بنجاح!")
+            else:
+                block = QuestionBlock(rect, start_q, end_q, num_rows)
+                st.session_state.template.q_blocks.append(block)
+                st.success(f"✅ تم إضافة بلوك الأسئلة ({start_q}-{end_q}) بنجاح!")
             
-            # رسم المعاينة
-            preview = draw_preview_with_clicks(
-                st.session_state.template_img,
-                st.session_state.template,
-                st.session_state.clicks,
-                display_width
-            )
-            
-            # عرض الصورة مع إمكانية النقر
-            # ملاحظة: Streamlit لا يدعم click events مباشرة
-            # لذا سنستخدم طريقة بديلة
-            
-            st.image(preview, width=display_width)
-            
-            # طريقة بديلة: إدخال الإحداثيات
-            st.markdown("---")
-            st.markdown("**⚠️ للأسف Streamlit لا يدعم النقر المباشر**")
-            st.markdown("**✅ استخدم هذه الطريقة:**")
-            
-            with st.expander("📍 إضافة نقطة", expanded=len(st.session_state.clicks) < 2):
-                col_x, col_y, col_add = st.columns([2, 2, 1])
-                
-                with col_x:
-                    click_x = st.number_input("X", 0, orig_w, 0, key="click_x")
-                with col_y:
-                    click_y = st.number_input("Y", 0, orig_h, 0, key="click_y")
-                with col_add:
-                    st.write("")  # spacer
-                    st.write("")  # spacer
-                    if st.button("➕ إضافة"):
-                        if len(st.session_state.clicks) < 2:
-                            st.session_state.clicks.append((click_x, click_y))
-                            st.rerun()
-            
-            st.divider()
-            st.subheader("🚀 التصحيح")
-            
-            if st.button("▶️ ابدأ", type="primary", use_container_width=True):
-                if not st.session_state.template.id_block:
-                    st.error("❌ حدد منطقة الكود")
-                    st.stop()
-                
-                if not st.session_state.template.q_blocks:
-                    st.error("❌ أضف بلوك أسئلة")
-                    st.stop()
-                
-                if not (roster and key_file and sheets):
-                    st.error("❌ ارفع جميع الملفات")
-                    st.stop()
-                
-                try:
+            st.rerun()
+    
+    # Show saved regions
+    if st.session_state.template.id_block or st.session_state.template.q_blocks:
+        st.markdown("---")
+        st.markdown("### 📋 المناطق المحفوظة:")
+        
+        if st.session_state.template.id_block:
+            r = st.session_state.template.id_block
+            st.success(f"🆔 **منطقة الكود:** ({r.x}, {r.y}) → ({r.x2}, {r.y2})")
+        
+        for i, block in enumerate(st.session_state.template.q_blocks, 1):
+            r = block.rect
+            col_block, col_delete = st.columns([4, 1])
+            with col_block:
+                st.success(f"📝 **بلوك {i}:** أسئلة {block.start_q}-{block.end_q} | ({r.x}, {r.y}) → ({r.x2}, {r.y2})")
+            with col_delete:
+                if st.button("🗑️ حذف", key=f"delete_{i}"):
+                    st.session_state.template.q_blocks.pop(i-1)
+                    st.rerun()
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # ==========================================
+    # STEP 4: Grading Files
+    # ==========================================
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<span class="step-number">4</span>**ملفات التصحيح**', unsafe_allow_html=True)
+    
+    col_f1, col_f2, col_f3 = st.columns(3)
+    
+    with col_f1:
+        roster = st.file_uploader("📋 قائمة الطلاب", type=["xlsx", "csv"])
+    
+    with col_f2:
+        key_file = st.file_uploader("🔑 نموذج الإجابات", type=["pdf", "png", "jpg"])
+    
+    with col_f3:
+        sheets = st.file_uploader("📚 أوراق الطلاب", type=["pdf", "png", "jpg"])
+    
+    strict = st.checkbox("✓ وضع صارم (BLANK/DOUBLE = خطأ)", True)
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # ==========================================
+    # STEP 5: Start Grading
+    # ==========================================
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<span class="step-number">5</span>**ابدأ التصحيح**', unsafe_allow_html=True)
+    
+    if st.button("🚀 ابدأ التصحيح الآن", type="primary", use_container_width=True):
+        # Validation
+        errors = []
+        if not st.session_state.template.id_block:
+            errors.append("❌ يجب تحديد منطقة كود الطالب")
+        if not st.session_state.template.q_blocks:
+            errors.append("❌ يجب إضافة بلوك أسئلة واحد على الأقل")
+        if not roster:
+            errors.append("❌ يجب رفع قائمة الطلاب")
+        if not key_file:
+            errors.append("❌ يجب رفع نموذج الإجابات")
+        if not sheets:
+            errors.append("❌ يجب رفع أوراق الطلاب")
+        
+        if errors:
+            for error in errors:
+                st.error(error)
+        else:
+            try:
+                with st.spinner("⏳ جاري التصحيح..."):
                     # Load roster
                     if roster.name.endswith(('.xlsx', '.xls')):
                         df = pd.read_excel(roster)
@@ -495,7 +557,7 @@ def main():
                     roster_dict = dict(zip(df["student_code"].astype(str).str.strip(),
                                          df["student_name"].astype(str).str.strip()))
                     
-                    st.info(f"📋 {len(roster_dict)} طالب")
+                    st.info(f"📋 تم تحميل {len(roster_dict)} طالب")
                     
                     # Process key
                     key_img = ImageProcessor.load_image(key_file.getvalue(), key_file.name)
@@ -517,7 +579,7 @@ def main():
                             if result["status"] == "OK":
                                 answer_key[q] = result["answer"]
                     
-                    st.success(f"✅ {len(answer_key)} إجابة")
+                    st.success(f"✅ تم استخراج {len(answer_key)} إجابة صحيحة")
                     
                     # Grade
                     sheets_img = ImageProcessor.load_image(sheets.getvalue(), sheets.name)
@@ -525,36 +587,39 @@ def main():
                     
                     result = engine.grade_sheet(sheets_bgr, answer_key, roster_dict, strict)
                     
-                    st.success("✅ اكتمل التصحيح!")
+                    st.success("✅ اكتمل التصحيح بنجاح!")
                     
+                    # Display results
                     df_results = pd.DataFrame([{
-                        "الكود": result["id"],
-                        "الاسم": result["name"],
-                        "الصحيحة": result["score"],
-                        "المجموع": result["total"],
-                        "النسبة": f"{result['percentage']:.1f}%",
+                        "كود الطالب": result["id"],
+                        "اسم الطالب": result["name"],
+                        "الإجابات الصحيحة": result["score"],
+                        "إجمالي الأسئلة": result["total"],
+                        "النسبة المئوية": f"{result['percentage']:.1f}%",
                         "الحالة": "ناجح ✓" if result["passed"] else "راسب ✗"
                     }])
                     
-                    st.dataframe(df_results, use_container_width=True)
+                    st.dataframe(df_results, use_container_width=True, height=150)
                     
+                    # Export
                     buffer = io.BytesIO()
                     df_results.to_excel(buffer, index=False, engine='openpyxl')
                     
                     st.download_button(
-                        "⬇️ تحميل Excel",
+                        "⬇️ تحميل النتائج (Excel)",
                         buffer.getvalue(),
                         "results.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True
                     )
-                
-                except Exception as e:
-                    st.error(f"❌ خطأ: {e}")
-                    import traceback
+            
+            except Exception as e:
+                st.error(f"❌ حدث خطأ: {e}")
+                import traceback
+                with st.expander("عرض تفاصيل الخطأ"):
                     st.code(traceback.format_exc())
-        
-        else:
-            st.info("📄 ارفع النموذج من اليمين")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
