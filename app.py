@@ -69,25 +69,47 @@ def call_claude_api(image_b64: str, prompt: str, api_key: str) -> Dict:
     import json
     
     if not api_key or len(api_key) < 20:
-        st.warning("⚠️ API Key غير صالح - تشغيل في وضع Demo")
+        st.error("❌ API Key غير صالح أو غير موجود")
+        st.info("💡 أدخل API Key في الشريط الجانبي للتفعيل")
         return {
             "answers": {},
-            "confidence": "demo",
-            "notes": ["API Key required for actual analysis"],
+            "confidence": "no_api",
+            "notes": ["API Key مطلوب للتحليل الفعلي"],
+            "api_ready": False
+        }
+    
+    if not api_key.startswith("sk-ant-"):
+        st.error("❌ تنسيق API Key غير صحيح")
+        st.info("💡 يجب أن يبدأ المفتاح بـ: sk-ant-...")
+        return {
+            "answers": {},
+            "confidence": "invalid_key",
+            "notes": ["تنسيق API Key غير صحيح"],
             "api_ready": False
         }
     
     try:
-        # ACTUAL API CALL
-        # Note: This requires the anthropic package
-        # pip install anthropic
+        # Check if anthropic is installed
+        try:
+            import anthropic
+        except ImportError:
+            st.error("❌ مكتبة anthropic غير مثبتة")
+            st.code("pip install anthropic", language="bash")
+            st.info("💡 قم بتثبيت المكتبة ثم أعد تشغيل البرنامج")
+            return {
+                "answers": {},
+                "confidence": "missing_library",
+                "notes": ["Install: pip install anthropic"],
+                "api_ready": False
+            }
         
-        import anthropic
-        
+        # Create client
         client = anthropic.Anthropic(api_key=api_key)
         
-        st.info("🔄 إرسال الصورة إلى Claude...")
+        st.info("🔄 إرسال الصورة إلى Claude API...")
+        st.info(f"📊 حجم الصورة: {len(image_b64) / 1024:.1f} KB")
         
+        # Make API call
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=2000,
@@ -112,20 +134,33 @@ def call_claude_api(image_b64: str, prompt: str, api_key: str) -> Dict:
             ],
         )
         
+        st.success("✅ تم استلام الرد من Claude!")
+        st.info(f"📝 Tokens: {message.usage.input_tokens} input, {message.usage.output_tokens} output")
+        
         # Extract response
         response_text = message.content[0].text
         
-        st.success("✅ تم استلام الرد من Claude!")
+        # Show raw response in expander
+        with st.expander("🔍 الرد الخام من Claude"):
+            st.code(response_text, language="json")
         
         # Parse JSON from response
-        # Claude might return JSON with markdown backticks
         json_text = response_text
         if "```json" in response_text:
             json_text = response_text.split("```json")[1].split("```")[0].strip()
         elif "```" in response_text:
             json_text = response_text.split("```")[1].split("```")[0].strip()
         
-        result = json.loads(json_text)
+        try:
+            result = json.loads(json_text)
+        except json.JSONDecodeError:
+            # Try to find JSON in the text
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', response_text)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                raise
         
         return {
             "answers": result.get("answers", {}),
@@ -135,32 +170,45 @@ def call_claude_api(image_b64: str, prompt: str, api_key: str) -> Dict:
             "raw_response": response_text
         }
         
-    except ImportError:
-        st.error("❌ مكتبة anthropic غير مثبتة")
-        st.code("pip install anthropic")
+    except anthropic.AuthenticationError:
+        st.error("❌ خطأ في المصادقة: API Key غير صحيح")
+        st.info("💡 تأكد من نسخ المفتاح بشكل صحيح من console.anthropic.com")
         return {
             "answers": {},
-            "confidence": "error",
-            "notes": ["Install anthropic package: pip install anthropic"],
+            "confidence": "auth_error",
+            "notes": ["API Key غير صحيح - راجع المفتاح"],
+            "api_ready": False
+        }
+    
+    except anthropic.RateLimitError:
+        st.error("❌ تم تجاوز الحد المسموح من الطلبات")
+        st.info("💡 انتظر دقيقة وحاول مرة أخرى")
+        return {
+            "answers": {},
+            "confidence": "rate_limit",
+            "notes": ["Rate limit exceeded - انتظر قليلاً"],
             "api_ready": False
         }
     
     except json.JSONDecodeError as e:
-        st.error(f"❌ فشل تحليل JSON: {e}")
-        st.code(f"Response: {response_text[:500]}")
+        st.error(f"❌ فشل تحليل JSON من رد Claude")
+        st.code(f"خطأ: {str(e)}")
+        with st.expander("الرد الكامل"):
+            st.code(response_text if 'response_text' in locals() else "No response")
         return {
             "answers": {},
-            "confidence": "error",
+            "confidence": "parse_error",
             "notes": [f"JSON parse error: {str(e)}"],
             "api_ready": False
         }
     
     except Exception as e:
-        st.error(f"❌ خطأ في API: {str(e)}")
+        st.error(f"❌ خطأ غير متوقع: {type(e).__name__}")
+        st.code(str(e))
         return {
             "answers": {},
             "confidence": "error",
-            "notes": [f"API error: {str(e)}"],
+            "notes": [f"Error: {str(e)}"],
             "api_ready": False
         }
 
@@ -330,11 +378,19 @@ def main():
             api_key = st.text_input(
                 "🔑 Anthropic API Key",
                 type="password",
-                help="احصل على API Key من: https://console.anthropic.com"
+                help="احصل على API Key من: https://console.anthropic.com",
+                placeholder="sk-ant-..."
             )
             
-            if api_key:
-                st.success("✅ API Key متصل!")
+            if api_key and len(api_key) > 20:
+                # Validate key format
+                if api_key.startswith("sk-ant-"):
+                    st.success("✅ API Key متصل!")
+                    st.info(f"🔑 المفتاح: {api_key[:15]}...{api_key[-4:]}")
+                else:
+                    st.warning("⚠️ تنسيق المفتاح غير صحيح - يجب أن يبدأ بـ sk-ant-")
+            elif api_key:
+                st.warning("⚠️ المفتاح قصير جداً")
             else:
                 st.warning("⚠️ أدخل API Key للتفعيل الكامل")
                 st.info("""
@@ -342,6 +398,13 @@ def main():
                 - سيعمل البرنامج في وضع Demo
                 - يمكنك رؤية كيف يعمل
                 - للاستخدام الفعلي: احتاج API Key
+                
+                **للحصول على API Key:**
+                1. اذهب إلى https://console.anthropic.com
+                2. سجل الدخول أو أنشئ حساب
+                3. اذهب إلى Settings > API Keys
+                4. أنشئ مفتاح جديد
+                5. انسخه والصقه هنا
                 """)
         else:
             api_key = ""
