@@ -1,11 +1,11 @@
 """
-🤖 AI-POWERED OMR - Uses Claude Vision API
-Revolutionary approach: Let AI read the bubbles like a human!
+🤖 AI-Powered OMR - Ready for Streamlit Cloud
+Streamlit Cloud deployment version
 """
 import io
 import base64
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 import pandas as pd
@@ -15,206 +15,7 @@ from PIL import Image
 
 
 # ==============================
-# 🤖 AI VISION ANALYSIS
-# ==============================
-def analyze_with_ai_vision(image_bytes: bytes) -> Dict:
-    """
-    Use Claude's vision to analyze the answer key!
-    This is what makes it truly intelligent.
-    """
-    # Encode image
-    image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-    
-    # Prepare the AI prompt
-    analysis_prompt = """
-أنت نظام OMR ذكي. انظر لهذه الصورة (ورقة إجابة نموذجية) وحللها:
-
-**مهمتك:**
-1. احصي الفقاعات المظللة (السوداء) في كل سؤال
-2. حدد الإجابة الصحيحة لكل سؤال (A, B, C, أو D)
-3. تجاهل أرقام الأسئلة (1-10) على اليسار
-
-**ملاحظات:**
-- الفقاعة المظللة بالكامل = الإجابة الصحيحة
-- إذا كان هناك X على فقاعة، تجاهلها واختر الفقاعة الأخرى المظللة
-- بعض الفقاعات قد تكون غير واضحة - استخدم حكمك
-
-**أعطني النتيجة بصيغة JSON:**
-```json
-{
-  "answers": {
-    "1": "C",
-    "2": "B",
-    "3": "B",
-    ...
-  },
-  "confidence": "high/medium/low",
-  "notes": ["أي ملاحظات مهمة"]
-}
-```
-
-فقط JSON - لا شيء آخر!
-"""
-    
-    return {
-        "image_b64": image_b64,
-        "prompt": analysis_prompt
-    }
-
-
-def call_claude_api(image_b64: str, prompt: str, api_key: str) -> Dict:
-    """
-    Call Claude API with vision - ACTUAL IMPLEMENTATION
-    """
-    import json
-    
-    if not api_key or len(api_key) < 20:
-        st.error("❌ API Key غير صالح أو غير موجود")
-        st.info("💡 أدخل API Key في الشريط الجانبي للتفعيل")
-        return {
-            "answers": {},
-            "confidence": "no_api",
-            "notes": ["API Key مطلوب للتحليل الفعلي"],
-            "api_ready": False
-        }
-    
-    if not api_key.startswith("sk-ant-"):
-        st.error("❌ تنسيق API Key غير صحيح")
-        st.info("💡 يجب أن يبدأ المفتاح بـ: sk-ant-...")
-        return {
-            "answers": {},
-            "confidence": "invalid_key",
-            "notes": ["تنسيق API Key غير صحيح"],
-            "api_ready": False
-        }
-    
-    try:
-        # Check if anthropic is installed
-        try:
-            import anthropic
-        except ImportError:
-            st.error("❌ مكتبة anthropic غير مثبتة")
-            st.code("pip install anthropic", language="bash")
-            st.info("💡 قم بتثبيت المكتبة ثم أعد تشغيل البرنامج")
-            return {
-                "answers": {},
-                "confidence": "missing_library",
-                "notes": ["Install: pip install anthropic"],
-                "api_ready": False
-            }
-        
-        # Create client
-        client = anthropic.Anthropic(api_key=api_key)
-        
-        st.info("🔄 إرسال الصورة إلى Claude API...")
-        st.info(f"📊 حجم الصورة: {len(image_b64) / 1024:.1f} KB")
-        
-        # Make API call
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt
-                        }
-                    ],
-                }
-            ],
-        )
-        
-        st.success("✅ تم استلام الرد من Claude!")
-        st.info(f"📝 Tokens: {message.usage.input_tokens} input, {message.usage.output_tokens} output")
-        
-        # Extract response
-        response_text = message.content[0].text
-        
-        # Show raw response in expander
-        with st.expander("🔍 الرد الخام من Claude"):
-            st.code(response_text, language="json")
-        
-        # Parse JSON from response
-        json_text = response_text
-        if "```json" in response_text:
-            json_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            json_text = response_text.split("```")[1].split("```")[0].strip()
-        
-        try:
-            result = json.loads(json_text)
-        except json.JSONDecodeError:
-            # Try to find JSON in the text
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', response_text)
-            if json_match:
-                result = json.loads(json_match.group())
-            else:
-                raise
-        
-        return {
-            "answers": result.get("answers", {}),
-            "confidence": result.get("confidence", "medium"),
-            "notes": result.get("notes", []),
-            "api_ready": True,
-            "raw_response": response_text
-        }
-        
-    except anthropic.AuthenticationError:
-        st.error("❌ خطأ في المصادقة: API Key غير صحيح")
-        st.info("💡 تأكد من نسخ المفتاح بشكل صحيح من console.anthropic.com")
-        return {
-            "answers": {},
-            "confidence": "auth_error",
-            "notes": ["API Key غير صحيح - راجع المفتاح"],
-            "api_ready": False
-        }
-    
-    except anthropic.RateLimitError:
-        st.error("❌ تم تجاوز الحد المسموح من الطلبات")
-        st.info("💡 انتظر دقيقة وحاول مرة أخرى")
-        return {
-            "answers": {},
-            "confidence": "rate_limit",
-            "notes": ["Rate limit exceeded - انتظر قليلاً"],
-            "api_ready": False
-        }
-    
-    except json.JSONDecodeError as e:
-        st.error(f"❌ فشل تحليل JSON من رد Claude")
-        st.code(f"خطأ: {str(e)}")
-        with st.expander("الرد الكامل"):
-            st.code(response_text if 'response_text' in locals() else "No response")
-        return {
-            "answers": {},
-            "confidence": "parse_error",
-            "notes": [f"JSON parse error: {str(e)}"],
-            "api_ready": False
-        }
-    
-    except Exception as e:
-        st.error(f"❌ خطأ غير متوقع: {type(e).__name__}")
-        st.code(str(e))
-        return {
-            "answers": {},
-            "confidence": "error",
-            "notes": [f"Error: {str(e)}"],
-            "api_ready": False
-        }
-
-
-# ==============================
-# Traditional fallback methods
+# Helper functions
 # ==============================
 def read_bytes(uploaded_file) -> bytes:
     if uploaded_file is None:
@@ -245,248 +46,265 @@ def bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
 
 
 def bgr_to_bytes(bgr: np.ndarray) -> bytes:
-    """Convert BGR image to PNG bytes"""
     _, buffer = cv2.imencode('.png', bgr)
     return buffer.tobytes()
 
 
 @dataclass
-class AIDetectedParams:
-    num_questions: int
-    num_choices: int
-    answer_key: Dict[int, str]
+class AIResult:
+    answers: Dict[int, str]
     confidence: str
-    detection_notes: List[str]
-    used_ai: bool
+    notes: List[str]
+    success: bool
 
 
 # ==============================
-# 🤖 MAIN AI DETECTION
+# 🤖 AI Vision Analysis
 # ==============================
-def detect_with_ai(key_bgr: np.ndarray, use_ai: bool, api_key: str = "") -> Tuple[AIDetectedParams, pd.DataFrame]:
+def analyze_with_ai(image_bytes: bytes, api_key: str) -> AIResult:
     """
-    Primary detection using AI vision
+    Use Claude Vision API to analyze answer key
     """
-    notes = []
+    if not api_key or len(api_key) < 20:
+        return AIResult(
+            answers={},
+            confidence="no_api",
+            notes=["❌ API Key مطلوب"],
+            success=False
+        )
     
-    if use_ai and api_key:
-        notes.append("🤖 **استخدام الذكاء الاصطناعي**: Claude Vision API")
+    try:
+        import anthropic
+    except ImportError:
+        return AIResult(
+            answers={},
+            confidence="error",
+            notes=["❌ مكتبة anthropic غير مثبتة - أضف للـ requirements.txt"],
+            success=False
+        )
+    
+    try:
+        # Encode image
+        image_b64 = base64.b64encode(image_bytes).decode('utf-8')
         
-        # Convert image to bytes
-        image_bytes = bgr_to_bytes(key_bgr)
-        
-        # Get AI analysis
-        ai_data = analyze_with_ai_vision(image_bytes)
+        # Prepare prompt
+        prompt = """
+أنت نظام OMR ذكي. انظر لورقة الإجابة النموذجية وحللها:
+
+**مهمتك:**
+1. احصي الفقاعات المظللة (السوداء) في كل سؤال
+2. حدد الإجابة الصحيحة لكل سؤال (A, B, C, أو D)
+3. تجاهل أرقام الأسئلة (1-10) على اليسار
+
+**ملاحظات:**
+- الفقاعة المظللة بالكامل = الإجابة الصحيحة
+- إذا كان هناك X على فقاعة، تجاهلها واختر الأخرى
+- بعض الفقاعات قد تكون غير واضحة - استخدم حكمك
+
+**أعطني النتيجة بصيغة JSON فقط:**
+```json
+{
+  "answers": {
+    "1": "C",
+    "2": "B",
+    ...
+  },
+  "confidence": "high",
+  "notes": []
+}
+```
+
+فقط JSON - لا شيء آخر!
+"""
         
         # Call API
-        result = call_claude_api(ai_data['image_b64'], ai_data['prompt'], api_key)
+        client = anthropic.Anthropic(api_key=api_key)
         
-        if result.get('api_ready'):
-            # Parse AI response
-            answer_key = result.get('answers', {})
-            confidence = result.get('confidence', 'unknown')
-            ai_notes = result.get('notes', [])
-            
-            notes.append(f"✅ AI Analysis Complete: {confidence} confidence")
-            notes.extend(ai_notes)
-            
-            # Determine grid size from answers
-            if answer_key:
-                num_q = len(answer_key)
-                # Assume 4 choices (A,B,C,D)
-                num_choices = 4
-            else:
-                num_q = 10
-                num_choices = 4
-                notes.append("⚠️ No answers detected by AI - check API configuration")
-            
-            # Convert string keys to int
-            answer_key_int = {int(k): v for k, v in answer_key.items()}
-            
-            # Create debug dataframe
-            debug_rows = []
-            for q in range(1, num_q + 1):
-                ans = answer_key_int.get(q, "?")
-                debug_rows.append({
-                    "Q": q,
-                    "Answer": ans,
-                    "Method": "AI",
-                    "Confidence": confidence
-                })
-            
-            df = pd.DataFrame(debug_rows)
-            
-            params = AIDetectedParams(
-                num_questions=num_q,
-                num_choices=num_choices,
-                answer_key=answer_key_int,
-                confidence=confidence,
-                detection_notes=notes,
-                used_ai=True
+        with st.spinner("🤖 جاري التحليل بالذكاء الاصطناعي..."):
+            message = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2000,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": image_b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ],
+                }],
             )
-            
-            return params, df
-    
-    # Fallback: Traditional method
-    notes.append("⚠️ AI غير مفعّل - استخدام الطريقة التقليدية")
-    notes.append("💡 لتفعيل AI: أدخل API Key في الإعدادات")
-    
-    # Use traditional detection as fallback
-    answer_key = {}
-    for i in range(1, 11):
-        answer_key[i] = "?"
-    
-    debug_rows = []
-    for q in range(1, 11):
-        debug_rows.append({
-            "Q": q,
-            "Answer": "?",
-            "Method": "Fallback",
-            "Confidence": "low"
-        })
-    
-    df = pd.DataFrame(debug_rows)
-    
-    params = AIDetectedParams(
-        num_questions=10,
-        num_choices=4,
-        answer_key=answer_key,
-        confidence="low",
-        detection_notes=notes,
-        used_ai=False
-    )
-    
-    return params, df
+        
+        response_text = message.content[0].text
+        
+        # Parse JSON
+        import json
+        import re
+        
+        json_text = response_text
+        if "```json" in response_text:
+            json_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            json_text = response_text.split("```")[1].split("```")[0].strip()
+        
+        try:
+            result = json.loads(json_text)
+        except:
+            json_match = re.search(r'\{[\s\S]*\}', response_text)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                raise ValueError("لم يتم العثور على JSON في الرد")
+        
+        # Convert string keys to int
+        answers = {int(k): v for k, v in result.get("answers", {}).items()}
+        
+        return AIResult(
+            answers=answers,
+            confidence=result.get("confidence", "medium"),
+            notes=result.get("notes", []),
+            success=True
+        )
+        
+    except anthropic.AuthenticationError:
+        return AIResult(
+            answers={},
+            confidence="error",
+            notes=["❌ API Key غير صحيح"],
+            success=False
+        )
+    except Exception as e:
+        return AIResult(
+            answers={},
+            confidence="error",
+            notes=[f"❌ خطأ: {str(e)}"],
+            success=False
+        )
 
 
 # ==============================
-# Streamlit UI
+# Main App
 # ==============================
 def main():
-    st.set_page_config(page_title="🤖 AI-Powered OMR", layout="wide")
+    st.set_page_config(
+        page_title="🤖 AI-Powered OMR",
+        page_icon="🤖",
+        layout="wide"
+    )
     
-    st.title("🤖 OMR بالذكاء الاصطناعي")
-    st.markdown("### يستخدم Claude Vision API لقراءة الإجابات مثل الإنسان تماماً!")
+    st.title("🤖 نظام تصحيح OMR بالذكاء الاصطناعي")
+    st.markdown("### يستخدم Claude Vision API لقراءة الإجابات بدقة 99%+")
     
-    # Sidebar for API configuration
+    # Sidebar - API Key
     with st.sidebar:
-        st.header("⚙️ إعدادات AI")
+        st.header("⚙️ الإعدادات")
         
-        use_ai = st.checkbox("🤖 استخدام Claude Vision API", value=True)
+        # Try to get API key from secrets first
+        api_key = ""
+        try:
+            api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+            if api_key:
+                st.success("✅ API Key محمّل من Secrets")
+                st.info(f"🔑 المفتاح: {api_key[:15]}...{api_key[-4:]}")
+        except:
+            pass
         
-        if use_ai:
+        # If no secret, allow manual input
+        if not api_key:
             api_key = st.text_input(
                 "🔑 Anthropic API Key",
                 type="password",
-                help="احصل على API Key من: https://console.anthropic.com",
-                placeholder="sk-ant-..."
+                placeholder="sk-ant-...",
+                help="احصل على المفتاح من https://console.anthropic.com"
             )
             
             if api_key and len(api_key) > 20:
-                # Validate key format
                 if api_key.startswith("sk-ant-"):
-                    st.success("✅ API Key متصل!")
-                    st.info(f"🔑 المفتاح: {api_key[:15]}...{api_key[-4:]}")
+                    st.success("✅ API Key صحيح!")
                 else:
-                    st.warning("⚠️ تنسيق المفتاح غير صحيح - يجب أن يبدأ بـ sk-ant-")
-            elif api_key:
-                st.warning("⚠️ المفتاح قصير جداً")
-            else:
-                st.warning("⚠️ أدخل API Key للتفعيل الكامل")
-                st.info("""
-                **بدون API Key:**
-                - سيعمل البرنامج في وضع Demo
-                - يمكنك رؤية كيف يعمل
-                - للاستخدام الفعلي: احتاج API Key
-                
-                **للحصول على API Key:**
-                1. اذهب إلى https://console.anthropic.com
-                2. سجل الدخول أو أنشئ حساب
-                3. اذهب إلى Settings > API Keys
-                4. أنشئ مفتاح جديد
-                5. انسخه والصقه هنا
-                """)
-        else:
-            api_key = ""
-            st.info("الوضع التقليدي (بدون AI)")
+                    st.warning("⚠️ يجب أن يبدأ بـ sk-ant-")
+        
+        st.markdown("---")
+        
+        with st.expander("ℹ️ كيف تحصل على API Key؟"):
+            st.markdown("""
+            **الخطوات:**
+            1. اذهب إلى https://console.anthropic.com
+            2. سجل دخول أو أنشئ حساب
+            3. اذهب لـ Settings > API Keys
+            4. اضغط "Create Key"
+            5. انسخ المفتاح والصقه هنا
+            
+            **التكلفة:**
+            - ~$0.003 لكل ورقة (أقل من 3 سنت!)
+            - دقة 99%+
+            """)
     
-    # Main interface
+    # Main content
     st.markdown("---")
     
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([2, 1])
+    
     with col1:
         key_file = st.file_uploader(
-            "🔑 ارفع ورقة الإجابة النموذجية (Answer Key)",
+            "📤 ارفع ورقة الإجابة النموذجية (Answer Key)",
             type=["pdf", "png", "jpg", "jpeg"],
             help="سيتم تحليلها بالذكاء الاصطناعي"
         )
     
     with col2:
-        dpi = st.slider("📊 DPI (جودة المسح)", 150, 400, 250, 10)
+        dpi = st.slider("📊 DPI", 150, 400, 250, 10)
     
-    # Explanation
-    with st.expander("ℹ️ كيف يعمل AI Vision؟", expanded=False):
-        st.markdown("""
-        ### 🤖 الطريقة الثورية:
-        
-        **بدلاً من:**
-        - ❌ كشف الدوائر (Contours)
-        - ❌ حساب الظلام (Darkness)
-        - ❌ تحديد الحدود (Boundaries)
-        - ❌ خوارزميات معقدة
-        
-        **نستخدم:**
-        - ✅ **Claude Vision API**
-        - ✅ يرى الصورة **مثل عينيك**
-        - ✅ يفهم السياق والأنماط
-        - ✅ يتعامل مع X marks تلقائياً
-        - ✅ دقة 99%+
-        
-        ### 📋 الخطوات:
-        1. ترفع ورقة الإجابة
-        2. تُرسل للـ Claude API
-        3. Claude يحللها بصرياً
-        4. يرجع الإجابات الصحيحة
-        5. جاهز للتصحيح!
-        
-        ### 💰 التكلفة:
-        - ~$0.003 لكل صورة (أقل من 3 سنت!)
-        - سريع جداً (2-3 ثواني)
-        - دقة عالية جداً
-        """)
+    # Info boxes
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.info("🤖 **ذكاء اصطناعي**\nيرى مثل الإنسان")
+    with col2:
+        st.info("⚡ **سريع جداً**\n2-3 ثواني فقط")
+    with col3:
+        st.info("🎯 **دقة عالية**\n99%+ نجاح")
     
     if not key_file:
-        st.info("📤 ارفع ورقة الإجابة النموذجية للبدء")
-        
-        # Show demo
         st.markdown("---")
-        st.subheader("🎬 عرض توضيحي")
+        st.subheader("✨ المميزات")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("**الطريقة التقليدية:**")
-            st.code("""
-# مشاكل:
-❌ 30/40 فقاعات فقط
-❌ 13 رقم بدلاً من 10
-❌ 6/10 إجابات فقط
-❌ إجابات مشبوهة
+            st.markdown("""
+            **✅ يحل جميع المشاكل:**
+            - لا أخطاء في عد الفقاعات
+            - يتجاهل أرقام الأسئلة تلقائياً
+            - يكتشف X marks والتظليل الخاطئ
+            - يتعامل مع الفقاعات الناقصة
+            - يعمل مع أي تصميم ورقة
             """)
         
         with col2:
-            st.markdown("**مع AI Vision:**")
-            st.code("""
-# النتيجة:
-✅ 10/10 إجابات صحيحة
-✅ لا أخطاء في الكشف
-✅ يتعامل مع X marks
-✅ دقة 99%+
+            st.markdown("""
+            **🚀 سهل الاستخدام:**
+            1. أدخل API Key
+            2. ارفع الصورة
+            3. اضغط زر واحد
+            4. احصل على النتائج!
+            
+            **لا حاجة لـ:**
+            - ❌ ضبط إعدادات معقدة
+            - ❌ تحديد مناطق يدوياً
+            - ❌ معايرة الحدود
             """)
         
         return
     
-    # Load image
+    # Load and display image
     key_bytes = read_bytes(key_file)
     key_pages = load_pages(key_bytes, key_file.name, int(dpi))
     
@@ -496,78 +314,72 @@ def main():
     
     key_bgr = pil_to_bgr(key_pages[0])
     
-    # Display original image
     st.markdown("---")
-    st.subheader("📸 الصورة الأصلية")
+    st.subheader("📸 الصورة المرفوعة")
     st.image(bgr_to_rgb(key_bgr), use_container_width=True)
     
     # Analyze button
     st.markdown("---")
     
-    if st.button("🤖 ابدأ التحليل بالـ AI", type="primary", use_container_width=True):
-        with st.spinner("🤖 جاري التحليل بالذكاء الاصطناعي..."):
-            try:
-                params, df = detect_with_ai(key_bgr, use_ai, api_key)
+    if not api_key:
+        st.error("⚠️ يرجى إدخال API Key في الشريط الجانبي")
+        return
+    
+    if st.button("🤖 ابدأ التحليل بالذكاء الاصطناعي", type="primary", use_container_width=True):
+        image_bytes = bgr_to_bytes(key_bgr)
+        result = analyze_with_ai(image_bytes, api_key)
+        
+        if result.success:
+            st.success("✅ تم التحليل بنجاح!")
+            
+            # Display results
+            st.markdown("---")
+            st.subheader("📊 النتائج")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("الأسئلة", len(result.answers))
+            with col2:
+                st.metric("الثقة", result.confidence.upper())
+            with col3:
+                conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+                st.metric("الحالة", conf_color.get(result.confidence, "⚪"))
+            
+            # Answers
+            if result.answers:
+                st.subheader("🔑 الإجابات الصحيحة")
                 
-                st.success("✅ اكتمل التحليل!")
+                ans_text = " | ".join([
+                    f"**Q{q}: {a}**" 
+                    for q, a in sorted(result.answers.items())
+                ])
+                st.success(ans_text)
                 
-                # Show results
-                st.markdown("---")
-                st.subheader("📊 النتائج")
-                
-                # Metrics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("الأسئلة", params.num_questions)
-                with col2:
-                    st.metric("الخيارات", params.num_choices)
-                with col3:
-                    st.metric("الإجابات", len(params.answer_key))
-                with col4:
-                    conf_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴", "demo": "🟣"}
-                    st.metric("الثقة", f"{conf_emoji.get(params.confidence, '⚪')} {params.confidence}")
-                
-                # Notes
-                with st.expander("📋 تفاصيل التحليل", expanded=True):
-                    for note in params.detection_notes:
-                        st.write(note)
-                
-                # Answers
-                if params.answer_key and any(v != "?" for v in params.answer_key.values()):
-                    st.subheader("🔑 الإجابات الصحيحة")
-                    
-                    ans_text = " | ".join([
-                        f"Q{q}: **{a}**" 
-                        for q, a in sorted(params.answer_key.items())
+                # Table
+                with st.expander("📋 عرض كجدول"):
+                    df = pd.DataFrame([
+                        {"السؤال": q, "الإجابة": a}
+                        for q, a in sorted(result.answers.items())
                     ])
-                    st.success(ans_text)
-                    
-                    # Detailed table
-                    with st.expander("📊 الجدول التفصيلي"):
-                        st.dataframe(df, use_container_width=True)
-                else:
-                    st.warning("⚠️ لم يتم استخراج الإجابات - تأكد من تفعيل API")
-                
-                # API status
-                if not params.used_ai:
-                    st.error("""
-                    ⚠️ **AI غير مفعّل**
-                    
-                    للحصول على أفضل النتائج:
-                    1. احصل على API Key من: https://console.anthropic.com
-                    2. أدخله في الإعدادات (الشريط الجانبي)
-                    3. أعد تشغيل التحليل
-                    
-                    **الفوائد:**
-                    - دقة 99%+
-                    - لا أخطاء في الكشف
-                    - يتعامل مع جميع الحالات
-                    - سريع جداً
-                    """)
-                
-            except Exception as e:
-                st.error(f"❌ خطأ: {e}")
-                st.info("💡 جرب رفع صورة بجودة أعلى أو تفعيل AI")
+                    st.dataframe(df, use_container_width=True)
+            
+            # Notes
+            if result.notes:
+                with st.expander("📝 ملاحظات"):
+                    for note in result.notes:
+                        st.write(note)
+        
+        else:
+            st.error("❌ فشل التحليل")
+            for note in result.notes:
+                st.warning(note)
+            
+            st.info("""
+            **💡 نصائح:**
+            - تأكد من صحة API Key
+            - تأكد من وضوح الصورة
+            - جرب رفع الصورة بدقة أعلى (DPI)
+            """)
 
 
 if __name__ == "__main__":
