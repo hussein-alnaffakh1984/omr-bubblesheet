@@ -312,9 +312,10 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
                                  max_area: int = 9000,
                                  min_circ: float = 0.55,
                                  blank_thresh: float = 170,
-                                 diff_thresh: float = 12) -> AutoDetectedParams:
+                                 diff_thresh: float = 12) -> Tuple[AutoDetectedParams, pd.DataFrame]:
     """
     Automatically detect ALL parameters from answer key image
+    Returns: (params, debug_dataframe)
     """
     h, w = key_bgr.shape[:2]
     gray = cv2.cvtColor(key_bgr, cv2.COLOR_BGR2GRAY)
@@ -350,21 +351,65 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
     if q_grid is None:
         raise ValueError("فشل بناء شبكة الأسئلة. جرب تعديل معايير الكشف.")
     
-    # Extract answer key by reading filled bubbles
+    # Extract answer key by reading filled bubbles with DETAILED DEBUG
     answer_key = {}
     choices = list("ABCDEFGHIJ"[:q_cols_est])
+    debug_rows = []
     
     for r in range(q_rows_est):
         means = []
         for c in range(q_cols_est):
             cx, cy = q_grid.centers[r, c]
-            means.append(mean_darkness(gray, int(cx), int(cy), win=18))
+            darkness = mean_darkness(gray, int(cx), int(cy), win=18)
+            means.append(darkness)
         
-        ans, status = pick_by_darkness(means, choices, blank_thresh, diff_thresh)
-        if status == "OK":
+        # Find darkest (filled) bubble
+        min_idx = int(np.argmin(means))
+        darkest_val = means[min_idx]
+        
+        # Get second darkest for comparison
+        means_sorted = sorted(means)
+        second_darkest = means_sorted[1] if len(means_sorted) > 1 else 255
+        
+        # Decision logic with more lenient thresholds
+        if darkest_val > blank_thresh:
+            # Too light - probably blank
+            ans = "?"
+            status = "BLANK"
+        elif (second_darkest - darkest_val) < diff_thresh:
+            # Two bubbles too close - double mark
+            ans = "!"
+            status = "DOUBLE"
+        else:
+            # Clear winner
+            ans = choices[min_idx]
+            status = "OK"
             answer_key[r + 1] = ans
+        
+        # Build debug row with ALL darkness values
+        debug_row = {
+            "Q": r + 1,
+            "Picked": ans,
+            "Status": status,
+            "Darkest": round(darkest_val, 1),
+            "2nd_Dark": round(second_darkest, 1),
+            "Diff": round(second_darkest - darkest_val, 1)
+        }
+        # Add individual choice darkness values
+        for i, choice in enumerate(choices):
+            debug_row[choice] = round(means[i], 1)
+        
+        debug_rows.append(debug_row)
+    
+    debug_df = pd.DataFrame(debug_rows)
     
     notes.append(f"✓ تم استخراج {len(answer_key)} إجابة صحيحة من {q_rows_est} سؤال")
+    
+    if len(answer_key) == 0:
+        notes.append("⚠️ لم يتم اكتشاف أي إجابات مظللة! تحقق من:")
+        notes.append("  - هل الأنسر مظلل بشكل واضح؟")
+        notes.append("  - جرب تقليل blank_threshold")
+        notes.append("  - جرب تقليل diff_threshold")
     
     # Determine confidence
     avg_conf = (id_conf + q_conf) / 2
@@ -375,7 +420,7 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
     else:
         confidence = "low"
     
-    return AutoDetectedParams(
+    params = AutoDetectedParams(
         num_questions=q_rows_est,
         num_choices=q_cols_est,
         id_digits=id_cols_est,
@@ -384,6 +429,8 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
         confidence=confidence,
         detection_notes=notes
     )
+    
+    return params, debug_df
 
 
 # ==============================
@@ -598,9 +645,11 @@ def main():
     with st.expander("✅ إعدادات قراءة التظليل"):
         r1, r2 = st.columns(2)
         with r1:
-            blank_mean_thresh = st.slider("Blank threshold", 120, 240, 170, 1)
+            blank_mean_thresh = st.slider("Blank threshold (كلما قل = يقرأ تظليل أخف)", 120, 240, 185, 1,
+                                         help="الفقاعة تعتبر فارغة إذا كان متوسط الظلام أكبر من هذه القيمة")
         with r2:
-            diff_thresh = st.slider("Diff threshold", 3, 60, 12, 1)
+            diff_thresh = st.slider("Diff threshold (كلما قل = يقبل فروق أقل)", 3, 60, 8, 1,
+                                   help="الفرق المطلوب بين أغمق فقاعة والثانية لاعتبارها مظللة بوضوح")
 
     debug = st.checkbox("🔍 عرض تفاصيل Debug", value=True)
 
@@ -636,7 +685,7 @@ def main():
         
         try:
             with st.spinner("⏳ يتم تحليل ورقة الإجابة النموذجية..."):
-                auto_params = auto_detect_from_answer_key(
+                auto_params, debug_df = auto_detect_from_answer_key(
                     key_bgr,
                     min_area=int(min_area),
                     max_area=int(max_area),
@@ -665,9 +714,37 @@ def main():
                 for note in auto_params.detection_notes:
                     st.write(note)
             
+            # Show answer key with better formatting
             st.subheader("🔑 الإجابات الصحيحة المكتشفة:")
+            if len(auto_params.answer_key) > 0:
+                # Display as a nice formatted dict
+                key_display = " | ".join([f"Q{q}: {ans}" for q, ans in sorted(auto_params.answer_key.items())])
+                st.success(key_display)
+                
+                # Show detailed detection table
+                with st.expander("📊 جدول تفصيلي لقراءة كل سؤال (الأقل = المظلل)", expanded=True):
+                    st.dataframe(debug_df, use_container_width=True, height=400)
+                    st.info("💡 **نصيحة:** العمود 'Darkest' يجب أن يكون أقل من 'Blank threshold' للإجابات الصحيحة")
+                
+                # Visual representation of answer key
+                if debug:
+                    with st.expander("🖼️ تصور مرئي للأنسر المكتشف"):
+                        st.image(bgr_to_rgb(key_bgr), caption="Answer Key الأصلي", use_container_width=True)
+                        
+            else:
+                st.error("❌ لم يتم اكتشاف أي إجابات مظللة!")
+                st.warning("🔧 **حلول مقترحة:**")
+                st.write("1. قلل قيمة **Blank threshold** (حالياً:", blank_mean_thresh, ")")
+                st.write("2. قلل قيمة **Diff threshold** (حالياً:", diff_thresh, ")")
+                st.write("3. تأكد أن الأنسر مظلل بقلم رصاص أسود غامق")
+                st.write("4. تأكد أن جودة الصورة عالية (DPI حالياً:", dpi, ")")
+                
+                # Show the detection table anyway
+                st.subheader("📊 جدول القراءة (للتشخيص):")
+                st.dataframe(debug_df, use_container_width=True, height=400)
+                st.info("💡 ابحث عن السطور التي 'Darkest' فيها أقل رقم - هذه المفروض تكون المظللة")
+            
             choices = list("ABCDEFGHIJ"[:auto_params.num_choices])
-            st.write(auto_params.answer_key)
             
             # Use detected parameters
             id_rows = auto_params.id_rows
@@ -675,6 +752,11 @@ def main():
             num_q = auto_params.num_questions
             num_choices = auto_params.num_choices
             answer_key = auto_params.answer_key
+            
+            # Show warning if no answers detected
+            if len(answer_key) == 0:
+                st.error("⚠️ لا يمكن المتابعة بدون إجابات صحيحة. عدّل الإعدادات أو استخدم الوضع اليدوي.")
+                return
             
             # Show warning if confidence is low
             if auto_params.confidence == "low":
