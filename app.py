@@ -1,9 +1,9 @@
 # app.py
 # ============================================================
-# ✅ Smart OMR (Auto-learn from Answer Key)
-# ✅ KEY: Apply X-cancel then pick filled (fix Q5)
-# ✅ STUDENT: Apply X-cancel then pick filled
-# ✅ Policy: "لو شطب خيار واحد + ظلّل خيار آخر → اختر المظلّل فقط"
+# ✅ AUTO OMR (No sliders) - Train on ANY Answer Key you upload
+# ✅ Auto-detect: ID grid + Question grid + Number of questions
+# ✅ Shows: Detected #Questions + Extracted Answer Key BEFORE grading
+# ✅ Policy: X-cancel (if one choice X'ed and another filled -> choose filled)
 # ============================================================
 
 import io
@@ -19,7 +19,7 @@ from PIL import Image
 
 
 # ==============================
-# Helpers
+# File + image helpers
 # ==============================
 def read_bytes(uploaded_file) -> bytes:
     if uploaded_file is None:
@@ -50,11 +50,13 @@ def bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
 
 
 # ==============================
-# Data models
+# Models
 # ==============================
 @dataclass
 class BubbleGrid:
-    centers: np.ndarray  # (rows, cols, 2) float32
+    row_y: np.ndarray  # (R,)
+    col_x: np.ndarray  # (C,)
+    centers: np.ndarray  # (R, C, 2) float32
     rows: int
     cols: int
 
@@ -73,36 +75,63 @@ class LearnedTemplate:
 
 
 # ==============================
-# Bubble detection
+# Preprocess for bubble detection
 # ==============================
-def preprocess_binary_for_detection(bgr: np.ndarray) -> np.ndarray:
+def preprocess_binary(bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     bin_img = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31, 7
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 7
     )
     bin_img = cv2.medianBlur(bin_img, 3)
     return bin_img
 
 
-def find_bubble_centers(bin_img: np.ndarray,
-                        min_area: int,
-                        max_area: int,
-                        min_circularity: float) -> np.ndarray:
+def find_bubble_centers(bin_img: np.ndarray) -> np.ndarray:
+    """
+    Auto-select circles-like contours:
+    - We learn area range from the most frequent contour sizes.
+    """
     cnts, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    centers = []
+    if not cnts:
+        return np.zeros((0, 2), dtype=np.int32)
+
+    feats = []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < min_area or area > max_area:
+        if area < 10:
             continue
         peri = cv2.arcLength(c, True)
-        if peri <= 1e-6:
+        if peri < 1:
             continue
         circ = 4.0 * np.pi * area / (peri * peri)
-        if circ < min_circularity:
+        x, y, w, h = cv2.boundingRect(c)
+        ar = w / (h + 1e-9)
+        feats.append((area, circ, ar, c))
+
+    if not feats:
+        return np.zeros((0, 2), dtype=np.int32)
+
+    areas = np.array([f[0] for f in feats], dtype=np.float32)
+
+    # Build histogram to find the most common contour area band (likely bubbles)
+    # Use log scale for stability
+    loga = np.log(np.clip(areas, 1, None))
+    hist, edges = np.histogram(loga, bins=30)
+    peak_bin = int(np.argmax(hist))
+    lo = edges[peak_bin]
+    hi = edges[min(peak_bin + 1, len(edges) - 1)]
+    area_lo = float(np.exp(lo)) * 0.7
+    area_hi = float(np.exp(hi)) * 1.7
+
+    centers = []
+    for area, circ, ar, c in feats:
+        if not (area_lo <= area <= area_hi):
+            continue
+        if circ < 0.35:  # permissive
+            continue
+        if not (0.6 <= ar <= 1.6):
             continue
         M = cv2.moments(c)
         if abs(M["m00"]) < 1e-6:
@@ -117,72 +146,98 @@ def find_bubble_centers(bin_img: np.ndarray,
 
 
 # ==============================
-# Grid building
+# Auto grouping (no kmeans/sklearn)
 # ==============================
-def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
-    idx = np.argsort(values)
-    labels = np.zeros(len(values), dtype=np.int32)
-    n = len(values)
-    for j in range(k):
-        s = int(j * n / k)
-        e = int((j + 1) * n / k)
-        labels[idx[s:e]] = j
-    return labels
+def robust_gap_tolerance(sorted_vals: np.ndarray) -> float:
+    if len(sorted_vals) < 6:
+        return 10.0
+    diffs = np.diff(sorted_vals)
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return 10.0
+    # take "typical" small gaps (between same-row bubbles / near)
+    p10 = np.percentile(diffs, 10)
+    p40 = np.percentile(diffs, 40)
+    small = diffs[(diffs >= p10) & (diffs <= p40)]
+    base = float(np.median(small)) if len(small) else float(np.median(diffs))
+    return max(6.0, base * 0.65)
 
 
-def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid]:
-    if centers.shape[0] < int(rows * cols * 0.7):
-        return None
+def group_1d_positions(values: np.ndarray) -> np.ndarray:
+    """
+    Groups 1D positions into clusters by gap tolerance (auto).
+    Returns sorted cluster centers.
+    """
+    v = np.sort(values.astype(np.float32))
+    tol = robust_gap_tolerance(v)
+    groups = []
+    cur = [v[0]]
+    for x in v[1:]:
+        if (x - cur[-1]) <= tol:
+            cur.append(x)
+        else:
+            groups.append(cur)
+            cur = [x]
+    groups.append(cur)
+    centers = np.array([float(np.mean(g)) for g in groups], dtype=np.float32)
+    centers = np.sort(centers)
+    return centers
 
-    xs = centers[:, 0].astype(np.float32)
-    ys = centers[:, 1].astype(np.float32)
 
-    rlab = cluster_1d_equal_bins(ys, rows)
-    clab = cluster_1d_equal_bins(xs, cols)
+def snap_to_grid(centers_xy: np.ndarray, row_y: np.ndarray, col_x: np.ndarray) -> np.ndarray:
+    """
+    Map detected centers into grid by nearest row_y and col_x.
+    Returns (R,C,2) float32 filled with mean of assigned points.
+    """
+    R = len(row_y)
+    C = len(col_x)
+    grid = np.zeros((R, C, 2), dtype=np.float32)
+    cnt = np.zeros((R, C), dtype=np.int32)
 
-    grid = np.zeros((rows, cols, 2), dtype=np.float32)
-    cnt = np.zeros((rows, cols), dtype=np.int32)
+    for x, y in centers_xy:
+        ri = int(np.argmin(np.abs(row_y - y)))
+        ci = int(np.argmin(np.abs(col_x - x)))
+        grid[ri, ci, 0] += x
+        grid[ri, ci, 1] += y
+        cnt[ri, ci] += 1
 
-    for (x, y), r, c in zip(centers, rlab, clab):
-        grid[r, c, 0] += x
-        grid[r, c, 1] += y
-        cnt[r, c] += 1
-
-    for r in range(rows):
-        for c in range(cols):
+    # fill missing by ideal intersections
+    for r in range(R):
+        for c in range(C):
             if cnt[r, c] > 0:
                 grid[r, c] /= cnt[r, c]
             else:
-                grid[r, c] = (np.median(xs), np.median(ys))
+                grid[r, c] = (col_x[c], row_y[r])
 
-    # Sort rows/cols robustly
-    row_meds = np.median(grid[:, :, 1], axis=1)
-    col_meds = np.median(grid[:, :, 0], axis=0)
-    grid = grid[np.argsort(row_meds)][:, np.argsort(col_meds)]
-
-    return BubbleGrid(centers=grid, rows=rows, cols=cols)
-
-
-def split_id_questions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
-    xs = centers[:, 0]
-    ys = centers[:, 1]
-
-    id_mask = (xs > 0.55 * w) & (ys < 0.55 * h)
-    q_mask = (xs < 0.55 * w) & (ys > 0.40 * h)
-
-    id_centers = centers[id_mask]
-    q_centers = centers[q_mask]
-
-    if id_centers.shape[0] < 25:
-        id_centers = centers[(xs > np.median(xs)) & (ys < np.median(ys))]
-    if q_centers.shape[0] < 25:
-        q_centers = centers[(xs < np.median(xs)) & (ys > np.median(ys))]
-
-    return id_centers, q_centers
+    return grid
 
 
 # ==============================
-# Alignment (student -> key)
+# Split ID region vs Question region (heuristic)
+# ==============================
+def split_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
+    xs = centers[:, 0]
+    ys = centers[:, 1]
+
+    # ID: top-right (common on many sheets)
+    id_mask = (xs > 0.55 * w) & (ys < 0.55 * h)
+    # Q: lower/left
+    q_mask = (xs < 0.70 * w) & (ys > 0.25 * h)
+
+    id_c = centers[id_mask]
+    q_c = centers[q_mask]
+
+    # fallback if split too strict
+    if id_c.shape[0] < 25:
+        id_c = centers[(xs > np.median(xs)) & (ys < np.median(ys))]
+    if q_c.shape[0] < 60:
+        q_c = centers[(ys > np.median(ys))]
+
+    return id_c, q_c
+
+
+# ==============================
+# Alignment
 # ==============================
 def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray, bool, int]:
     h, w = ref_bgr.shape[:2]
@@ -193,13 +248,11 @@ def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray,
 
     k1, d1 = orb.detectAndCompute(g1, None)
     k2, d2 = orb.detectAndCompute(g2, None)
-
     if d1 is None or d2 is None or len(k1) < 25 or len(k2) < 25:
         return cv2.resize(student_bgr, (w, h)), False, 0
 
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     matches = bf.knnMatch(d1, d2, k=2)
-
     good = []
     for m, n in matches:
         if m.distance < 0.75 * n.distance:
@@ -220,7 +273,7 @@ def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray,
 
 
 # ==============================
-# Bubble ROI + X detector + fill score
+# Bubble scoring (Fill + X)
 # ==============================
 def bubble_roi(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> np.ndarray:
     h, w = gray.shape[:2]
@@ -235,6 +288,14 @@ def bubble_roi(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> np.ndarray:
     mw = int(rw * 0.18)
     inner = roi[mh:rh-mh, mw:rw-mw]
     return inner if inner.size > 0 else roi
+
+
+def fill_score(roi_gray: np.ndarray) -> float:
+    if roi_gray.size < 10:
+        return 0.0
+    g = cv2.GaussianBlur(roi_gray, (3, 3), 0)
+    _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return float(np.mean(th > 0))  # 0..1 (higher = more filled)
 
 
 def x_mark_score(roi_gray: np.ndarray) -> float:
@@ -254,42 +315,39 @@ def x_mark_score(roi_gray: np.ndarray) -> float:
     return total / norm
 
 
-def fill_score(roi_gray: np.ndarray) -> float:
-    """
-    Higher = more filled.
-    Uses Otsu threshold on ROI then percent of black pixels.
-    """
-    if roi_gray.size < 10:
-        return 0.0
-    g = cv2.GaussianBlur(roi_gray, (3, 3), 0)
-    _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    return float(np.mean(th > 0))  # 0..1
-
-
 def bubble_stats(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> dict:
     roi = bubble_roi(gray, cx, cy, win=win)
-    mean = float(np.mean(roi))
-    std = float(np.std(roi))
-    xscore = float(x_mark_score(roi))
-    fscore = float(fill_score(roi))
-    return {"mean": mean, "std": std, "xscore": xscore, "fill": fscore}
+    return {
+        "fill": float(fill_score(roi)),
+        "std": float(np.std(roi)),
+        "xscore": float(x_mark_score(roi)),
+    }
 
 
-# ==============================
-# Picker (used for KEY and STUDENT)
-# ==============================
+def auto_threshold_from_key(all_fills: np.ndarray) -> Tuple[float, float]:
+    """
+    Auto blank/fill separation using Otsu on fill scores.
+    Returns:
+      blank_fill_thresh, double_gap_thresh
+    """
+    fills = np.clip(all_fills, 0.0, 1.0)
+    # scale to 0..255 for Otsu
+    x = (fills * 255.0).astype(np.uint8).reshape(-1, 1)
+    _, thr = cv2.threshold(x, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    blank_fill_thresh = float(thr) / 255.0
+
+    # double gap: adaptive
+    # if filled cluster exists, use a conservative gap
+    double_gap = 0.08
+    return max(0.05, min(0.25, blank_fill_thresh * 0.6)), double_gap
+
+
 def pick_choice_x_cancel(stats_list: List[dict],
                          labels: List[str],
                          blank_fill_thresh: float,
                          double_fill_gap: float,
                          x_std_thresh: float,
-                         x_score_thresh: float) -> Tuple[str, str, List[bool]]:
-    """
-    - cancelled if looks like X (std high + xscore high)
-    - choose highest fill among not-cancelled
-    - blank if best_fill < blank_fill_thresh
-    - double if (best - second) < double_fill_gap (among not-cancelled)
-    """
+                         x_score_thresh: float) -> Tuple[str, str, List[bool], List[float]]:
     cancelled = []
     fills = []
     for s in stats_list:
@@ -298,7 +356,7 @@ def pick_choice_x_cancel(stats_list: List[dict],
 
     cand = [i for i in range(len(labels)) if not cancelled[i]]
     if not cand:
-        return "?", "CANCELLED_ALL", cancelled
+        return "?", "CANCELLED_ALL", cancelled, fills
 
     cand_sorted = sorted(cand, key=lambda i: fills[i], reverse=True)
     best = cand_sorted[0]
@@ -306,12 +364,11 @@ def pick_choice_x_cancel(stats_list: List[dict],
     second_f = fills[cand_sorted[1]] if len(cand_sorted) > 1 else 0.0
 
     if best_f < blank_fill_thresh:
-        return "?", "BLANK", cancelled
-
+        return "?", "BLANK", cancelled, fills
     if (best_f - second_f) < double_fill_gap:
-        return "!", "DOUBLE", cancelled
+        return "!", "DOUBLE", cancelled, fills
 
-    return labels[best], "OK", cancelled
+    return labels[best], "OK", cancelled, fills
 
 
 # ==============================
@@ -338,25 +395,71 @@ def load_roster(file, id_digits: int) -> Dict[str, str]:
 
 
 # ==============================
-# Learn template
+# Learn template from answer key (AUTO rows/cols)
 # ==============================
-def learn_template(key_bgr: np.ndarray,
-                   id_rows: int, id_digits: int,
-                   num_q: int, num_choices: int,
-                   min_area: int, max_area: int, min_circ: float) -> Tuple[LearnedTemplate, Dict]:
-
+def learn_template_from_key(key_bgr: np.ndarray) -> Tuple[LearnedTemplate, dict]:
     h, w = key_bgr.shape[:2]
-    bin_key = preprocess_binary_for_detection(key_bgr)
-    centers = find_bubble_centers(bin_key, min_area=min_area, max_area=max_area, min_circularity=min_circ)
+    bin_img = preprocess_binary(key_bgr)
+    centers = find_bubble_centers(bin_img)
+    if centers.shape[0] < 60:
+        raise ValueError("عدد الفقاعات المكتشفة قليل جداً. ارفع DPI أو تأكد وضوح الصورة.")
 
-    id_centers, q_centers = split_id_questions(centers, w, h)
-    id_grid = build_grid(id_centers, rows=id_rows, cols=id_digits)
-    q_grid = build_grid(q_centers, rows=num_q, cols=num_choices)
+    id_centers, q_centers = split_regions(centers, w, h)
 
-    if id_grid is None:
-        raise ValueError("فشل تعلم شبكة الكود (ID). عدّل min_area/max_area/min_circularity أو ارفع DPI.")
-    if q_grid is None:
-        raise ValueError("فشل تعلم شبكة الأسئلة. عدّل min_area/max_area/min_circularity أو ارفع DPI.")
+    # ---- ID grid auto-detect
+    # Expect 10 rows for digits 0..9 (common). We'll infer row count by grouping y.
+    id_row_y = group_1d_positions(id_centers[:, 1]) if id_centers.shape[0] else np.array([], dtype=np.float32)
+    # If it doesn't look like 10, we still accept detected count.
+    id_col_x = group_1d_positions(id_centers[:, 0]) if id_centers.shape[0] else np.array([], dtype=np.float32)
+
+    if len(id_row_y) < 8 or len(id_col_x) < 2:
+        raise ValueError("فشل اكتشاف شبكة كود الطالب تلقائياً (ID). جرّب رفع DPI أو صورة أوضح.")
+
+    # Force rows=10 if close
+    if 9 <= len(id_row_y) <= 11:
+        # normalize to 10 by trimming/merging if needed
+        # simplest: re-group using median spacing around 10
+        # if 11 -> drop closest pair mid
+        while len(id_row_y) > 10:
+            dif = np.diff(id_row_y)
+            j = int(np.argmin(dif))
+            merged = (id_row_y[j] + id_row_y[j+1]) / 2.0
+            id_row_y = np.delete(id_row_y, [j, j+1])
+            id_row_y = np.sort(np.append(id_row_y, merged))
+        while len(id_row_y) < 10:
+            # add missing by extrapolation
+            step = float(np.median(np.diff(id_row_y)))
+            id_row_y = np.sort(np.append(id_row_y, id_row_y[-1] + step))
+        id_rows = 10
+    else:
+        id_rows = int(len(id_row_y))
+
+    id_digits = int(len(id_col_x))
+
+    id_grid_centers = snap_to_grid(id_centers, id_row_y, id_col_x)
+    id_grid = BubbleGrid(row_y=id_row_y, col_x=id_col_x, centers=id_grid_centers, rows=len(id_row_y), cols=len(id_col_x))
+
+    # ---- Question grid auto-detect
+    q_row_y = group_1d_positions(q_centers[:, 1])
+    q_col_x = group_1d_positions(q_centers[:, 0])
+
+    # Choices should be small number (4-6). If detected more, keep the densest band.
+    if len(q_col_x) > 8:
+        # keep middle 4-6 columns by density (approx): take the most clustered region
+        # fallback: take 4 nearest-spaced centers around median
+        med = np.median(q_col_x)
+        idx = np.argsort(np.abs(q_col_x - med))
+        q_col_x = np.sort(q_col_x[idx[:4]])
+
+    # Ensure at least 4 choices
+    if len(q_col_x) < 4:
+        raise ValueError("فشل اكتشاف أعمدة خيارات الأسئلة. الصورة قد تكون مقصوصة أو غير واضحة.")
+
+    num_choices = int(len(q_col_x))
+    num_q = int(len(q_row_y))
+
+    q_grid_centers = snap_to_grid(q_centers, q_row_y, q_col_x)
+    q_grid = BubbleGrid(row_y=q_row_y, col_x=q_col_x, centers=q_grid_centers, rows=num_q, cols=num_choices)
 
     template = LearnedTemplate(
         ref_bgr=key_bgr, ref_w=w, ref_h=h,
@@ -364,67 +467,93 @@ def learn_template(key_bgr: np.ndarray,
         num_q=num_q, num_choices=num_choices,
         id_rows=id_rows, id_digits=id_digits
     )
-    dbg = {"bin_key": bin_key, "centers": centers, "id_centers": id_centers, "q_centers": q_centers}
+
+    dbg = {
+        "bin_key": bin_img,
+        "centers_all": centers,
+        "id_centers": id_centers,
+        "q_centers": q_centers,
+        "id_row_y": id_row_y,
+        "id_col_x": id_col_x,
+        "q_row_y": q_row_y,
+        "q_col_x": q_col_x,
+    }
     return template, dbg
 
 
 # ==============================
-# Extract KEY (WITH X-cancel ✅)
+# Extract Answer Key (AUTO thresholds from key)
 # ==============================
-def extract_answer_key(template: LearnedTemplate,
-                       choices: List[str],
-                       blank_fill_thresh: float,
-                       double_fill_gap: float,
-                       x_std_thresh_key: float,
-                       x_score_thresh_key: float) -> Tuple[Dict[int, str], pd.DataFrame]:
+def extract_answer_key(template: LearnedTemplate) -> Tuple[Dict[int, str], pd.DataFrame, dict]:
     gray = cv2.cvtColor(template.ref_bgr, cv2.COLOR_BGR2GRAY)
-    key = {}
-    rows_dbg = []
+    choices = list("ABCDEFGH"[:template.num_choices])
 
+    # collect all fill scores to auto-threshold
+    all_fills = []
+    all_stats_rows = []
     for r in range(template.q_grid.rows):
-        stats = []
+        row_stats = []
         for c in range(template.q_grid.cols):
             cx, cy = template.q_grid.centers[r, c]
-            stats.append(bubble_stats(gray, int(cx), int(cy), win=18))
+            stt = bubble_stats(gray, int(cx), int(cy), win=18)
+            row_stats.append(stt)
+            all_fills.append(stt["fill"])
+        all_stats_rows.append(row_stats)
 
-        ans, status, cancelled = pick_choice_x_cancel(
+    all_fills = np.array(all_fills, dtype=np.float32)
+    blank_fill_thresh, double_gap = auto_threshold_from_key(all_fills)
+
+    # X thresholds (auto-ish, stable defaults)
+    x_std_key = 18.0
+    x_score_key = 0.90
+
+    key = {}
+    dbg_rows = []
+    for r in range(template.q_grid.rows):
+        stats = all_stats_rows[r]
+        ans, status, cancelled, fills = pick_choice_x_cancel(
             stats, choices,
             blank_fill_thresh=blank_fill_thresh,
-            double_fill_gap=double_fill_gap,
-            x_std_thresh=x_std_thresh_key,
-            x_score_thresh=x_score_thresh_key
+            double_fill_gap=double_gap,
+            x_std_thresh=x_std_key,
+            x_score_thresh=x_score_key,
         )
-
-        # حتى لو DOUBLE نخليه ظاهر بالديبغ، لكن لا ندخله بالمفتاح إلا OK
         if status == "OK":
             key[r + 1] = ans
 
-        rows_dbg.append(
+        dbg_rows.append(
             [r + 1, ans, status, cancelled] +
-            [round(s["fill"], 3) for s in stats] +
+            [round(f, 3) for f in fills] +
             [round(s["std"], 1) for s in stats] +
             [round(s["xscore"], 2) for s in stats]
         )
 
     df_dbg = pd.DataFrame(
-        rows_dbg,
+        dbg_rows,
         columns=(["Q", "Picked", "Status", "CancelledFlags"] +
                  [f"fill_{c}" for c in choices] +
                  [f"std_{c}" for c in choices] +
                  [f"x_{c}" for c in choices])
     )
-    return key, df_dbg
+
+    params = {
+        "blank_fill_thresh": float(blank_fill_thresh),
+        "double_gap": float(double_gap),
+        "x_std_key": float(x_std_key),
+        "x_score_key": float(x_score_key),
+        "choices": choices,
+    }
+    return key, df_dbg, params
 
 
 # ==============================
-# Read student ID (fill only)
+# Read student ID + answers
 # ==============================
-def read_student_id(template: LearnedTemplate,
-                    gray: np.ndarray,
-                    blank_fill_thresh: float,
-                    double_fill_gap: float) -> Tuple[str, pd.DataFrame]:
+def read_student_id(template: LearnedTemplate, gray: np.ndarray, blank_fill_thresh: float, double_gap: float) -> Tuple[str, pd.DataFrame]:
     digits = []
     dbg_rows = []
+    # rows correspond to digits 0..(rows-1)
+    labels = [str(i) for i in range(template.id_grid.rows)]
 
     for c in range(template.id_grid.cols):
         fills = []
@@ -433,8 +562,7 @@ def read_student_id(template: LearnedTemplate,
             roi = bubble_roi(gray, int(cx), int(cy), win=16)
             fills.append(fill_score(roi))
 
-        labels = [str(i) for i in range(template.id_grid.rows)]
-        idx = np.argsort(fills)[::-1]  # highest fill first
+        idx = np.argsort(fills)[::-1]
         best = int(idx[0])
         second = int(idx[1]) if len(idx) > 1 else best
         best_f = fills[best]
@@ -442,7 +570,7 @@ def read_student_id(template: LearnedTemplate,
 
         if best_f < blank_fill_thresh:
             digit, status = "X", "BLANK"
-        elif (best_f - second_f) < double_fill_gap:
+        elif (best_f - second_f) < double_gap:
             digit, status = "X", "DOUBLE"
         else:
             digit, status = labels[best], "OK"
@@ -450,20 +578,17 @@ def read_student_id(template: LearnedTemplate,
         digits.append(digit)
         dbg_rows.append([c + 1, digit, status] + [round(f, 3) for f in fills])
 
-    df_dbg = pd.DataFrame(dbg_rows, columns=["DigitCol", "Picked", "Status"] + [str(i) for i in range(template.id_rows)])
+    df_dbg = pd.DataFrame(dbg_rows, columns=["DigitCol", "Picked", "Status"] + labels)
     return "".join(digits), df_dbg
 
 
-# ==============================
-# Read student answers (WITH X-cancel ✅)
-# ==============================
 def read_student_answers(template: LearnedTemplate,
                          gray: np.ndarray,
                          choices: List[str],
                          blank_fill_thresh: float,
-                         double_fill_gap: float,
-                         x_std_thresh: float,
-                         x_score_thresh: float) -> pd.DataFrame:
+                         double_gap: float,
+                         x_std_student: float = 22.0,
+                         x_score_student: float = 1.2) -> pd.DataFrame:
     out = []
     for r in range(template.q_grid.rows):
         stats = []
@@ -471,17 +596,17 @@ def read_student_answers(template: LearnedTemplate,
             cx, cy = template.q_grid.centers[r, c]
             stats.append(bubble_stats(gray, int(cx), int(cy), win=18))
 
-        ans, status, cancelled = pick_choice_x_cancel(
+        ans, status, cancelled, fills = pick_choice_x_cancel(
             stats, choices,
             blank_fill_thresh=blank_fill_thresh,
-            double_fill_gap=double_fill_gap,
-            x_std_thresh=x_std_thresh,
-            x_score_thresh=x_score_thresh
+            double_fill_gap=double_gap,
+            x_std_thresh=x_std_student,
+            x_score_thresh=x_score_student,
         )
 
         out.append(
             [r + 1, ans, status, cancelled] +
-            [round(s["fill"], 3) for s in stats] +
+            [round(f, 3) for f in fills] +
             [round(s["std"], 1) for s in stats] +
             [round(s["xscore"], 2) for s in stats]
         )
@@ -496,11 +621,23 @@ def read_student_answers(template: LearnedTemplate,
 
 
 # ==============================
-# Streamlit UI
+# Streamlit app
 # ==============================
 def main():
-    st.set_page_config(page_title="Smart OMR (Fix Q5/Q6)", layout="wide")
-    st.title("✅ Smart OMR (Fix Q5/Q6): الأنسر يفهم X + الطالب يفهم X")
+    st.set_page_config(page_title="AUTO OMR (Train on any Answer Key)", layout="wide")
+    st.title("✅ AUTO OMR: يتدرّب على أي Answer Key + يكتشف عدد الأسئلة ويعرض الأنسر قبل التصحيح")
+
+    # ---- Freeze training
+    if "trained" not in st.session_state:
+        st.session_state.trained = False
+    if "template" not in st.session_state:
+        st.session_state.template = None
+    if "answer_key" not in st.session_state:
+        st.session_state.answer_key = None
+    if "key_dbg" not in st.session_state:
+        st.session_state.key_dbg = None
+    if "train_params" not in st.session_state:
+        st.session_state.train_params = None
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -510,104 +647,93 @@ def main():
     with col3:
         sheets_file = st.file_uploader("📚 أوراق الطلاب (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
 
+    dpi = st.selectbox("DPI للـ PDF (كلما أعلى أدق)", [200, 250, 300, 350], index=1)
+    debug = st.checkbox("Debug (عرض تفاصيل)", value=True)
+
+    if not key_file:
+        st.info("ارفع Answer Key أولاً ليبدأ التدريب التلقائي.")
+        return
+
+    # Train step (only when not trained OR key changed)
+    if (not st.session_state.trained) or st.button("🔄 إعادة التدريب من الأنسر", type="secondary"):
+        try:
+            key_pages = load_pages(read_bytes(key_file), key_file.name, dpi=int(dpi))
+            if not key_pages:
+                st.error("فشل قراءة الأنسر")
+                return
+            key_bgr = pil_to_bgr(key_pages[0])
+
+            template, dbg = learn_template_from_key(key_bgr)
+            answer_key, df_key_dbg, params = extract_answer_key(template)
+
+            st.session_state.template = template
+            st.session_state.answer_key = answer_key
+            st.session_state.key_dbg = df_key_dbg
+            st.session_state.train_params = params
+            st.session_state.trained = True
+
+            st.success("✅ تم التدريب تلقائياً من الأنسر.")
+        except Exception as e:
+            st.error(f"❌ فشل التدريب التلقائي: {e}")
+            return
+
+    # Show training result BEFORE grading
+    template = st.session_state.template
+    answer_key = st.session_state.answer_key
+    df_key_dbg = st.session_state.key_dbg
+    params = st.session_state.train_params
+
     st.markdown("---")
-    st.subheader("إعدادات الورقة")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        dpi = st.slider("DPI", 150, 450, 250, 10)
-    with c2:
-        id_rows = st.number_input("صفوف الكود (0-9)", 10, 15, 10, 1)
-    with c3:
-        id_digits = st.number_input("خانات الكود", 1, 12, 4, 1)
-    with c4:
-        num_q = st.number_input("عدد الأسئلة (مهم جداً)", 1, 300, 10, 1)
-    with c5:
-        num_choices = st.selectbox("عدد الخيارات", [4, 5, 6], index=0)
+    st.subheader("📌 نتيجة التدريب (قبل التصحيح)")
 
-    choices = list("ABCDEF"[:int(num_choices)])
+    cA, cB, cC, cD = st.columns(4)
+    with cA:
+        st.metric("عدد الأسئلة المكتشف", template.num_q)
+    with cB:
+        st.metric("عدد الخيارات المكتشف", template.num_choices)
+    with cC:
+        st.metric("خانات كود الطالب المكتشفة", template.id_digits)
+    with cD:
+        st.metric("صفوف كود الطالب المكتشفة", template.id_grid.rows)
 
-    st.subheader("تعلم مراكز الفقاعات (Bubble Detection)")
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        min_area = st.number_input("min_area", 20, 2500, 120, 10)
-    with d2:
-        max_area = st.number_input("max_area", 500, 40000, 9000, 500)
-    with d3:
-        min_circ = st.slider("min_circularity", 0.25, 0.95, 0.55, 0.01)
+    st.markdown("### 🔑 Answer Key المستخرج")
+    st.json(answer_key)
 
-    st.subheader("Thresholds (Fill + X)")
-    r1, r2, r3, r4, r5, r6 = st.columns(6)
-    with r1:
-        blank_fill_thresh = st.slider("Blank fill threshold", 0.01, 0.60, 0.12, 0.01)
-    with r2:
-        double_fill_gap = st.slider("Double gap threshold", 0.01, 0.60, 0.10, 0.01)
-    with r3:
-        x_std_student = st.slider("X std (student)", 5.0, 80.0, 22.0, 1.0)
-    with r4:
-        x_score_student = st.slider("X score (student)", 0.0, 10.0, 1.2, 0.1)
-    with r5:
-        x_std_key = st.slider("X std (key)", 5.0, 120.0, 18.0, 1.0)
-    with r6:
-        x_score_key = st.slider("X score (key)", 0.0, 10.0, 0.9, 0.1)
+    st.info(f"Auto thresholds: blank_fill={params['blank_fill_thresh']:.3f}, double_gap={params['double_gap']:.3f}")
 
-    debug = st.checkbox("Debug", value=True)
+    if debug:
+        st.markdown("### Debug Table (مهم: تأكد من Q5/Q6 هنا)")
+        st.dataframe(df_key_dbg, width="stretch", height=420)
 
-    if not (roster_file and key_file and sheets_file):
-        st.info("ارفع الملفات الثلاثة ثم ابدأ.")
+        vis = template.ref_bgr.copy()
+        # draw question grid
+        for r in range(template.q_grid.rows):
+            for c in range(template.q_grid.cols):
+                x, y = template.q_grid.centers[r, c]
+                cv2.circle(vis, (int(x), int(y)), 6, (0, 255, 0), 2)
+        # draw id grid
+        for r in range(template.id_grid.rows):
+            for c in range(template.id_grid.cols):
+                x, y = template.id_grid.centers[r, c]
+                cv2.circle(vis, (int(x), int(y)), 6, (0, 0, 255), 2)
+        st.image(bgr_to_rgb(vis), caption="Green=Questions bubbles, Red=ID bubbles", width="stretch")
+
+    st.markdown("---")
+    st.subheader("✅ التصحيح")
+
+    if not roster_file or not sheets_file:
+        st.warning("ارفع ملف الطلاب + أوراق الطلاب للبدء.")
         return
 
     # Load roster
     try:
-        roster = load_roster(roster_file, id_digits=int(id_digits))
+        roster = load_roster(roster_file, id_digits=int(template.id_digits))
         st.success(f"✅ تم تحميل قائمة الطلاب: {len(roster)}")
     except Exception as e:
         st.error(f"خطأ ملف الطلاب: {e}")
         return
 
-    # Load key page
-    try:
-        key_pages = load_pages(read_bytes(key_file), key_file.name, dpi=int(dpi))
-        if not key_pages:
-            st.error("فشل قراءة الأنسر")
-            return
-        key_bgr = pil_to_bgr(key_pages[0])
-    except Exception as e:
-        st.error(f"فشل فتح الأنسر: {e}")
-        return
-
-    # Learn template
-    try:
-        template, dbg = learn_template(
-            key_bgr,
-            id_rows=int(id_rows), id_digits=int(id_digits),
-            num_q=int(num_q), num_choices=int(num_choices),
-            min_area=int(min_area), max_area=int(max_area), min_circ=float(min_circ)
-        )
-        st.success("✅ تم تعلم القالب من الأنسر.")
-    except Exception as e:
-        st.error(f"❌ فشل تعلم القالب: {e}")
-        return
-
-    # Extract answer key (WITH X-cancel)
-    answer_key, df_key_dbg = extract_answer_key(
-        template,
-        choices=choices,
-        blank_fill_thresh=float(blank_fill_thresh),
-        double_fill_gap=float(double_fill_gap),
-        x_std_thresh_key=float(x_std_key),
-        x_score_thresh_key=float(x_score_key),
-    )
-
-    st.markdown("### 🔑 Answer Key المستخرج")
-    st.write(answer_key)
-
-    if debug:
-        st.markdown("---")
-        st.subheader("Debug: Key extraction table (شوف Q5 و Q6 هنا)")
-        st.dataframe(df_key_dbg, width="stretch", height=420)
-
-    st.markdown("---")
-    if st.button("🚀 ابدأ التصحيح", type="primary", width="stretch"):
+    if st.button("🚀 ابدأ التصحيح الآن", type="primary"):
         pages = load_pages(read_bytes(sheets_file), sheets_file.name, dpi=int(dpi))
         if not pages:
             st.error("فشل قراءة أوراق الطلاب")
@@ -616,27 +742,21 @@ def main():
         results = []
         prog = st.progress(0)
 
+        # use the same thresholds learned from key
+        blank_fill = float(params["blank_fill_thresh"])
+        double_gap = float(params["double_gap"])
+        choices = params["choices"]
+
         for i, pil_page in enumerate(pages, start=1):
             page_bgr = pil_to_bgr(pil_page)
             aligned, ok, good_matches = orb_align(page_bgr, template.ref_bgr)
             gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
 
-            student_code, _ = read_student_id(
-                template, gray,
-                blank_fill_thresh=float(blank_fill_thresh),
-                double_fill_gap=float(double_fill_gap),
-            )
-            student_code = str(student_code).zfill(int(id_digits))
+            student_code, _ = read_student_id(template, gray, blank_fill, double_gap)
+            student_code = str(student_code).zfill(int(template.id_digits))
             student_name = roster.get(student_code, "غير موجود")
 
-            df_ans = read_student_answers(
-                template, gray,
-                choices=choices,
-                blank_fill_thresh=float(blank_fill_thresh),
-                double_fill_gap=float(double_fill_gap),
-                x_std_thresh=float(x_std_student),
-                x_score_thresh=float(x_score_student),
-            )
+            df_ans = read_student_answers(template, gray, choices, blank_fill, double_gap)
 
             correct = 0
             total = len(answer_key)
