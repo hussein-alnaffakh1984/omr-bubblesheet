@@ -139,9 +139,9 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
     y_mid = np.median(ys)
     
     # Count bubbles in each quadrant
-    q1 = np.sum((xs > x_mid) & (ys < y_mid))  # top-right
+    q1 = np.sum((xs > x_mid) & (ys < y_mid))  # top-right (usually ID)
     q2 = np.sum((xs < x_mid) & (ys < y_mid))  # top-left
-    q3 = np.sum((xs < x_mid) & (ys > y_mid))  # bottom-left
+    q3 = np.sum((xs < x_mid) & (ys > y_mid))  # bottom-left (usually Questions)
     q4 = np.sum((xs > x_mid) & (ys > y_mid))  # bottom-right
     
     debug = {
@@ -150,22 +150,29 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
         "y_median": y_mid
     }
     
-    # Typical layout: ID is top-right, Questions are bottom-left
-    # But we'll be flexible
-    id_mask = (xs > 0.55 * w) & (ys < 0.55 * h)
-    q_mask = (xs < 0.55 * w) & (ys > 0.40 * h)
+    # More precise splitting using better boundaries
+    # ID section: typically top-right, tighter boundaries
+    id_mask = (xs > 0.6 * w) & (ys < 0.5 * h)
+    
+    # Questions section: typically bottom-left, tighter boundaries  
+    q_mask = (xs < 0.5 * w) & (ys > 0.45 * h)
     
     id_centers = centers[id_mask]
     q_centers = centers[q_mask]
     
-    # Fallback if regions are empty
-    if id_centers.shape[0] < 10:
+    # Fallback if regions produce odd counts
+    if id_centers.shape[0] < 20 or id_centers.shape[0] > 100:
+        # Try quadrant-based
         id_centers = centers[(xs > x_mid) & (ys < y_mid)]
-    if q_centers.shape[0] < 10:
+    
+    if q_centers.shape[0] < 20 or q_centers.shape[0] > 100:
+        # Try quadrant-based
         q_centers = centers[(xs < x_mid) & (ys > y_mid)]
     
     debug["id_count"] = id_centers.shape[0]
     debug["q_count"] = q_centers.shape[0]
+    debug["id_expected_multiples"] = [30, 40, 50, 60, 70, 80]  # 10×3, 10×4, etc.
+    debug["q_expected_multiples"] = [40, 50, 60]  # 10×4, 10×5, 10×6
     
     return id_centers, q_centers, debug
 
@@ -173,7 +180,7 @@ def detect_bubble_regions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarr
 # ==============================
 # 🆕 Auto-detect grid dimensions
 # ==============================
-def estimate_grid_dimensions(centers: np.ndarray) -> Tuple[int, int, float]:
+def estimate_grid_dimensions(centers: np.ndarray, is_questions: bool = True) -> Tuple[int, int, float]:
     """
     Estimate rows and columns by analyzing spacing patterns
     Returns: (estimated_rows, estimated_cols, confidence)
@@ -192,26 +199,64 @@ def estimate_grid_dimensions(centers: np.ndarray) -> Tuple[int, int, float]:
     x_diffs = np.diff(xs_sorted)
     y_diffs = np.diff(ys_sorted)
     
-    # Find modal spacing (most common distance)
-    x_spacing = np.median(x_diffs[x_diffs > 5])
-    y_spacing = np.median(y_diffs[y_diffs > 5])
+    # Find modal spacing (most common distance) - ignore very small diffs
+    x_diffs_clean = x_diffs[x_diffs > 5]
+    y_diffs_clean = y_diffs[y_diffs > 5]
+    
+    if len(x_diffs_clean) == 0 or len(y_diffs_clean) == 0:
+        return 1, 1, 0.0
+    
+    x_spacing = np.median(x_diffs_clean)
+    y_spacing = np.median(y_diffs_clean)
     
     # Estimate dimensions
     x_range = xs.max() - xs.min()
     y_range = ys.max() - ys.min()
     
-    cols = int(round(x_range / x_spacing)) + 1 if x_spacing > 0 else 1
-    rows = int(round(y_range / y_spacing)) + 1 if y_spacing > 0 else 1
+    cols_raw = int(round(x_range / x_spacing)) + 1 if x_spacing > 0 else 1
+    rows_raw = int(round(y_range / y_spacing)) + 1 if y_spacing > 0 else 1
+    
+    # Snap to expected values based on typical OMR sheets
+    if is_questions:
+        # Questions typically: 10 rows × (4, 5, or 6 choices)
+        # Find closest valid configuration
+        expected_configs = [
+            (10, 4), (10, 5), (10, 6),
+            (20, 4), (20, 5), (20, 6),
+            (15, 4), (15, 5), (15, 6),
+            (25, 4), (25, 5), (25, 6),
+            (30, 4), (30, 5), (30, 6),
+        ]
+    else:
+        # ID typically: 10 rows (0-9) × (3-8 digit columns)
+        expected_configs = [
+            (10, 3), (10, 4), (10, 5), (10, 6), (10, 7), (10, 8),
+            (11, 3), (11, 4), (11, 5), (11, 6),
+        ]
+    
+    # Find best match
+    total_bubbles = centers.shape[0]
+    best_config = (rows_raw, cols_raw)
+    best_diff = float('inf')
+    
+    for exp_rows, exp_cols in expected_configs:
+        expected_total = exp_rows * exp_cols
+        diff = abs(expected_total - total_bubbles)
+        if diff < best_diff:
+            best_diff = diff
+            best_config = (exp_rows, exp_cols)
+    
+    rows, cols = best_config
     
     # Sanity bounds
     cols = max(1, min(cols, 20))
     rows = max(1, min(rows, 100))
     
-    # Confidence based on consistency
+    # Confidence based on how close we are to expected
     expected_bubbles = rows * cols
     actual_bubbles = centers.shape[0]
-    confidence = 1.0 - abs(expected_bubbles - actual_bubbles) / expected_bubbles
-    confidence = max(0.0, min(1.0, confidence))
+    diff_ratio = abs(expected_bubbles - actual_bubbles) / expected_bubbles if expected_bubbles > 0 else 1.0
+    confidence = 1.0 - min(1.0, diff_ratio)
     
     return rows, cols, confidence
 
@@ -335,12 +380,14 @@ def auto_detect_from_answer_key(key_bgr: np.ndarray,
     notes.append(f"✓ منطقة الأسئلة: {q_centers.shape[0]} فقاعة")
     
     # Estimate ID grid dimensions
-    id_rows_est, id_cols_est, id_conf = estimate_grid_dimensions(id_centers)
+    id_rows_est, id_cols_est, id_conf = estimate_grid_dimensions(id_centers, is_questions=False)
     notes.append(f"✓ تقدير شبكة الكود: {id_rows_est} صفوف × {id_cols_est} أعمدة (ثقة: {id_conf:.1%})")
+    notes.append(f"  → إجمالي فقاعات الكود المتوقعة: {id_rows_est * id_cols_est} (فعلياً: {id_centers.shape[0]})")
     
     # Estimate Question grid dimensions
-    q_rows_est, q_cols_est, q_conf = estimate_grid_dimensions(q_centers)
+    q_rows_est, q_cols_est, q_conf = estimate_grid_dimensions(q_centers, is_questions=True)
     notes.append(f"✓ تقدير شبكة الأسئلة: {q_rows_est} أسئلة × {q_cols_est} خيارات (ثقة: {q_conf:.1%})")
+    notes.append(f"  → إجمالي فقاعات الأسئلة المتوقعة: {q_rows_est * q_cols_est} (فعلياً: {q_centers.shape[0]})")
     
     # Build grids with estimated dimensions
     id_grid = build_grid(id_centers, rows=id_rows_est, cols=id_cols_est)
@@ -728,8 +775,36 @@ def main():
                 
                 # Visual representation of answer key
                 if debug:
-                    with st.expander("🖼️ تصور مرئي للأنسر المكتشف"):
-                        st.image(bgr_to_rgb(key_bgr), caption="Answer Key الأصلي", use_container_width=True)
+                    with st.expander("🖼️ تصور مرئي للكشف", expanded=True):
+                        # Show original with detected regions
+                        vis = key_bgr.copy()
+                        
+                        # Draw all detected centers
+                        bin_key = preprocess_binary_for_detection(key_bgr)
+                        all_centers = find_bubble_centers(bin_key, int(min_area), int(max_area), float(min_circ))
+                        id_ctrs, q_ctrs, reg_debug = detect_bubble_regions(all_centers, key_bgr.shape[1], key_bgr.shape[0])
+                        
+                        # Draw ID bubbles in RED
+                        for (x, y) in id_ctrs:
+                            cv2.circle(vis, (int(x), int(y)), 8, (0, 0, 255), 2)
+                        
+                        # Draw Question bubbles in GREEN
+                        for (x, y) in q_ctrs:
+                            cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 0), 2)
+                        
+                        # Add text labels
+                        cv2.putText(vis, f"ID: {id_ctrs.shape[0]} bubbles", (10, 30), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                        cv2.putText(vis, f"Q: {q_ctrs.shape[0]} bubbles", (10, 70), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.image(bgr_to_rgb(key_bgr), caption="Answer Key الأصلي", use_container_width=True)
+                        with col2:
+                            st.image(bgr_to_rgb(vis), caption="المناطق المكتشفة: 🔴 ID | 🟢 أسئلة", use_container_width=True)
+                        
+                        st.info(f"📊 توزيع الفقاعات: ID={id_ctrs.shape[0]} | Questions={q_ctrs.shape[0]} | Total={all_centers.shape[0]}")
                         
             else:
                 st.error("❌ لم يتم اكتشاف أي إجابات مظللة!")
