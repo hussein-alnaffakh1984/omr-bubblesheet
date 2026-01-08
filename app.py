@@ -521,6 +521,8 @@ def main():
             status = st.empty()
             
             results = []
+            unmatched_codes = []  # Track codes that weren't found
+            
             for idx, f in enumerate(sheets):
                 status.text(f"📝 {idx+1}/{len(sheets)}")
                 progress.progress((idx+1)/len(sheets))
@@ -556,14 +558,52 @@ def main():
                                 percentage=pct,
                                 details=details
                             ))
+                            status.text(f"✅ {st_code}: {student.name}")
                         else:
-                            st.warning(f"⚠️ {st_code} غير موجود")
+                            unmatched_codes.append(st_code)
+                            st.warning(f"⚠️ الكود {st_code} غير موجود في القائمة")
+                    else:
+                        st.error(f"❌ فشل قراءة {f.name}")
                 
                 except Exception as e:
                     st.error(f"❌ {f.name}: {e}")
             
             st.session_state.results = results
-            status.text(f"✅ تم تصحيح {len(results)} ورقة")
+            
+            # Summary
+            st.markdown("---")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("✅ تم التصحيح", len(results))
+            with col2:
+                st.metric("⚠️ غير موجود", len(unmatched_codes))
+            with col3:
+                st.metric("📝 الإجمالي", len(sheets))
+            
+            if unmatched_codes:
+                st.error("### ⚠️ أكواد غير موجودة في قائمة الطلاب:")
+                
+                # Show unmatched codes
+                codes_text = ", ".join(unmatched_codes)
+                st.code(codes_text)
+                
+                # Show available codes for comparison
+                with st.expander("🔍 الأكواد المتاحة في قائمة الطلاب (أول 20)"):
+                    available = [s.code for s in st.session_state.students[:20]]
+                    st.code(", ".join(available))
+                    if len(st.session_state.students) > 20:
+                        st.info(f"عرض 20 من {len(st.session_state.students)} طالب")
+                
+                st.info("""
+                **💡 حلول:**
+                1. تأكد من أن الأكواد في ملف Excel صحيحة
+                2. تأكد من عدم وجود مسافات زيادة
+                3. تأكد من أن الطلاب ظللوا الأكواد بشكل صحيح
+                4. حمّل ملف Excel محدّث يحتوي على هذه الأكواد
+                """)
+            
+            if results:
+                st.success(f"✅ تم تصحيح {len(results)} ورقة بنجاح!")
     
     # ============================================================
     # TAB 4: Results
