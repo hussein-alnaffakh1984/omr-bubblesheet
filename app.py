@@ -1,8 +1,9 @@
 # app.py
 # ============================================================
 # ✅ Smart OMR (Auto-learn from Answer Key)
-# ✅ Student sheets: Ignore X-marked choice + pick filled choice
-# ✅ Answer key: NO X detection (key is read by fill only)
+# ✅ Answer Key: read by fill ONLY (NO X detection)
+# ✅ Student Sheets: detect X and ignore it (cancelled), pick filled
+# ✅ Policy: "لو شطب خيار واحد + ظلّل خيار آخر → اختر المظلّل فقط"
 # ============================================================
 
 import io
@@ -18,7 +19,7 @@ from PIL import Image
 
 
 # ==============================
-# File helpers
+# Helpers: file read
 # ==============================
 def read_bytes(uploaded_file) -> bytes:
     if uploaded_file is None:
@@ -53,7 +54,7 @@ def bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
 # ==============================
 @dataclass
 class BubbleGrid:
-    centers: np.ndarray  # (rows, cols, 2)
+    centers: np.ndarray  # (rows, cols, 2) float32
     rows: int
     cols: int
 
@@ -63,8 +64,8 @@ class LearnedTemplate:
     ref_bgr: np.ndarray
     ref_w: int
     ref_h: int
-    id_grid: BubbleGrid  # 10 x digits
-    q_grid: BubbleGrid   # num_q x choices
+    id_grid: BubbleGrid  # (id_rows, id_digits)
+    q_grid: BubbleGrid   # (num_q, num_choices)
     num_q: int
     num_choices: int
     id_rows: int
@@ -72,7 +73,7 @@ class LearnedTemplate:
 
 
 # ==============================
-# Detection preprocess
+# Bubble-center detection
 # ==============================
 def preprocess_binary_for_detection(bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -103,6 +104,7 @@ def find_bubble_centers(bin_img: np.ndarray,
         circ = 4.0 * np.pi * area / (peri * peri)
         if circ < min_circularity:
             continue
+
         M = cv2.moments(c)
         if abs(M["m00"]) < 1e-6:
             continue
@@ -116,9 +118,10 @@ def find_bubble_centers(bin_img: np.ndarray,
 
 
 # ==============================
-# Grid building
+# Grid building helpers
 # ==============================
 def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
+    """Cheap 1D clustering by sorting and splitting into k equal bins."""
     idx = np.argsort(values)
     labels = np.zeros(len(values), dtype=np.int32)
     n = len(values)
@@ -130,6 +133,7 @@ def cluster_1d_equal_bins(values: np.ndarray, k: int) -> np.ndarray:
 
 
 def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid]:
+    """Assign detected centers into a (rows x cols) grid using equal-bin clustering."""
     if centers.shape[0] < int(rows * cols * 0.7):
         return None
 
@@ -147,6 +151,7 @@ def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid
         grid[r, c, 1] += y
         cnt[r, c] += 1
 
+    # Fill / average
     for r in range(rows):
         for c in range(cols):
             if cnt[r, c] > 0:
@@ -154,6 +159,7 @@ def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid
             else:
                 grid[r, c] = (np.median(xs), np.median(ys))
 
+    # Ensure ordering
     row_meds = np.median(grid[:, :, 1], axis=1)
     col_meds = np.median(grid[:, :, 0], axis=0)
     grid = grid[np.argsort(row_meds)][:, np.argsort(col_meds)]
@@ -162,6 +168,11 @@ def build_grid(centers: np.ndarray, rows: int, cols: int) -> Optional[BubbleGrid
 
 
 def split_id_questions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Heuristic split:
+    - ID is usually top-right
+    - Questions usually lower-left/center
+    """
     xs = centers[:, 0]
     ys = centers[:, 1]
 
@@ -171,6 +182,7 @@ def split_id_questions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray,
     id_centers = centers[id_mask]
     q_centers = centers[q_mask]
 
+    # fallback if too strict
     if id_centers.shape[0] < 25:
         id_centers = centers[(xs > np.median(xs)) & (ys < np.median(ys))]
     if q_centers.shape[0] < 25:
@@ -180,9 +192,10 @@ def split_id_questions(centers: np.ndarray, w: int, h: int) -> Tuple[np.ndarray,
 
 
 # ==============================
-# ORB alignment
+# Alignment (student -> key)
 # ==============================
 def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray, bool, int]:
+    """Align student image to reference (answer key) by ORB homography."""
     h, w = ref_bgr.shape[:2]
     orb = cv2.ORB_create(5000)
 
@@ -218,7 +231,7 @@ def orb_align(student_bgr: np.ndarray, ref_bgr: np.ndarray) -> Tuple[np.ndarray,
 
 
 # ==============================
-# Bubble analysis
+# Bubble stats
 # ==============================
 def bubble_roi(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> np.ndarray:
     h, w = gray.shape[:2]
@@ -229,12 +242,14 @@ def bubble_roi(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> np.ndarray:
         return np.zeros((1, 1), dtype=np.uint8)
 
     rh, rw = roi.shape
-    mh = int(rh * 0.20); mw = int(rw * 0.20)
+    mh = int(rh * 0.20)
+    mw = int(rw * 0.20)
     inner = roi[mh:rh-mh, mw:rw-mw]
     return inner if inner.size > 0 else roi
 
 
 def x_mark_score(roi_gray: np.ndarray) -> float:
+    """Simple X detector: counts diagonal-ish line lengths in ROI (Hough)."""
     g = cv2.GaussianBlur(roi_gray, (3, 3), 0)
     edges = cv2.Canny(g, 50, 150)
 
@@ -256,20 +271,20 @@ def x_mark_score(roi_gray: np.ndarray) -> float:
 
 def bubble_stats(gray: np.ndarray, cx: int, cy: int, win: int = 18) -> dict:
     roi = bubble_roi(gray, cx, cy, win=win)
-    mean = float(np.mean(roi))
+    mean = float(np.mean(roi))     # lower = darker
     std = float(np.std(roi))
     score = float(x_mark_score(roi))
     return {"mean": mean, "std": std, "xscore": score}
 
 
 # ==============================
-# Choice pickers
+# Pickers
 # ==============================
 def pick_choice_key_only(stats_list: List[dict],
                          labels: List[str],
                          blank_mean_thresh: float,
                          diff_thresh: float) -> Tuple[str, str]:
-    """Answer key: ignore X detection, pick by fill only."""
+    """Answer key: ignore X detection."""
     means = [s["mean"] for s in stats_list]
     idx = np.argsort(means)  # darker first
     best = int(idx[0])
@@ -294,9 +309,10 @@ def pick_choice_student_smart(stats_list: List[dict],
                              filled_mean_thresh: float) -> Tuple[str, str, List[bool]]:
     """
     Student sheet policy:
-    - cancelled bubbles (X) are excluded.
-    - if any X exists AND best remaining looks filled -> choose it OK.
-    - double evaluated only among remaining (not-cancelled).
+    - Mark as cancelled if looks like X (std high + xscore high).
+    - Remove cancelled from candidates.
+    - If any cancelled exists AND there is a clear filled among remaining -> choose it OK.
+    - DOUBLE only among remaining.
     """
     cancelled = []
     means = []
@@ -308,7 +324,7 @@ def pick_choice_student_smart(stats_list: List[dict],
     if len(cand) == 0:
         return "?", "CANCELLED_ALL", cancelled
 
-    cand_sorted = sorted(cand, key=lambda i: means[i])  # darker first
+    cand_sorted = sorted(cand, key=lambda i: means[i])
     best = cand_sorted[0]
     best_m = means[best]
     second_m = means[cand_sorted[1]] if len(cand_sorted) > 1 else 999.0
@@ -316,7 +332,7 @@ def pick_choice_student_smart(stats_list: List[dict],
     if best_m > blank_mean_thresh:
         return "?", "BLANK", cancelled
 
-    # ✅ policy you asked for
+    # ✅ Policy requested: X + filled => choose filled only
     if any(cancelled) and best_m <= filled_mean_thresh:
         return labels[best], "OK", cancelled
 
@@ -350,13 +366,12 @@ def load_roster(file, id_digits: int) -> Dict[str, str]:
 
 
 # ==============================
-# Template learning
+# Learn template from key
 # ==============================
 def learn_template(key_bgr: np.ndarray,
                    id_rows: int, id_digits: int,
                    num_q: int, num_choices: int,
                    min_area: int, max_area: int, min_circ: float) -> Tuple[LearnedTemplate, Dict]:
-
     h, w = key_bgr.shape[:2]
     bin_key = preprocess_binary_for_detection(key_bgr)
     centers = find_bubble_centers(bin_key, min_area=min_area, max_area=max_area, min_circularity=min_circ)
@@ -377,17 +392,12 @@ def learn_template(key_bgr: np.ndarray,
         id_rows=id_rows, id_digits=id_digits
     )
 
-    dbg = {
-        "bin_key": bin_key,
-        "centers": centers,
-        "id_centers": id_centers,
-        "q_centers": q_centers
-    }
+    dbg = {"bin_key": bin_key, "centers": centers, "id_centers": id_centers, "q_centers": q_centers}
     return template, dbg
 
 
 # ==============================
-# Key extraction (NO X)
+# Extract key (NO X)
 # ==============================
 def extract_answer_key(template: LearnedTemplate,
                        choices: List[str],
@@ -408,13 +418,12 @@ def extract_answer_key(template: LearnedTemplate,
             blank_mean_thresh=blank_mean_thresh,
             diff_thresh=diff_thresh
         )
-        cancelled = [False] * len(choices)
 
         if status == "OK":
             key[r + 1] = ans
 
         rows_dbg.append(
-            [r + 1, ans, status, cancelled] +
+            [r + 1, ans, status] +
             [round(s["mean"], 1) for s in stats] +
             [round(s["std"], 1) for s in stats] +
             [round(s["xscore"], 2) for s in stats]
@@ -422,7 +431,7 @@ def extract_answer_key(template: LearnedTemplate,
 
     df_dbg = pd.DataFrame(
         rows_dbg,
-        columns=(["Q", "Picked", "Status", "CancelledFlags"] +
+        columns=(["Q", "Picked", "Status"] +
                  [f"mean_{c}" for c in choices] +
                  [f"std_{c}" for c in choices] +
                  [f"x_{c}" for c in choices])
@@ -431,7 +440,7 @@ def extract_answer_key(template: LearnedTemplate,
 
 
 # ==============================
-# Student ID reading
+# Read student ID
 # ==============================
 def read_student_id(template: LearnedTemplate,
                     gray: np.ndarray,
@@ -439,7 +448,6 @@ def read_student_id(template: LearnedTemplate,
                     diff_thresh: float) -> Tuple[str, pd.DataFrame]:
     digits = []
     dbg_rows = []
-
     for c in range(template.id_grid.cols):
         means = []
         for r in range(template.id_grid.rows):
@@ -449,8 +457,10 @@ def read_student_id(template: LearnedTemplate,
 
         labels = [str(i) for i in range(template.id_grid.rows)]
         idx = np.argsort(means)
-        best = int(idx[0]); second = int(idx[1]) if len(idx) > 1 else best
-        best_m = means[best]; second_m = means[second]
+        best = int(idx[0])
+        second = int(idx[1]) if len(idx) > 1 else best
+        best_m = means[best]
+        second_m = means[second]
 
         if best_m > blank_mean_thresh:
             digit, status = "X", "BLANK"
@@ -467,7 +477,7 @@ def read_student_id(template: LearnedTemplate,
 
 
 # ==============================
-# Student answers reading (WITH X)
+# Read student answers (WITH X)
 # ==============================
 def read_student_answers(template: LearnedTemplate,
                          gray: np.ndarray,
@@ -478,7 +488,7 @@ def read_student_answers(template: LearnedTemplate,
                          x_score_thresh: float,
                          filled_mean_thresh: float) -> pd.DataFrame:
     out = []
-    for r in rangetemplate.q_grid.rows):
+    for r in range(template.q_grid.rows):
         stats = []
         for c in range(template.q_grid.cols):
             cx, cy = template.q_grid.centers[r, c]
@@ -510,7 +520,7 @@ def read_student_answers(template: LearnedTemplate,
 
 
 # ==============================
-# UI
+# UI / Main
 # ==============================
 def main():
     st.set_page_config(page_title="Smart OMR (Key no-X, Student X)", layout="wide")
@@ -525,16 +535,16 @@ def main():
         sheets_file = st.file_uploader("📚 أوراق الطلاب (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
 
     st.markdown("---")
-    st.subheader("إعدادات النموذج (حسب ورقتكم)")
+    st.subheader("إعدادات الورقة")
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        dpi = st.slider("DPI", 150, 400, 250, 10)
+        dpi = st.slider("DPI", 150, 450, 250, 10)
     with c2:
         id_rows = st.number_input("صفوف الكود (0-9)", 10, 15, 10, 1)
     with c3:
         id_digits = st.number_input("خانات الكود", 1, 12, 4, 1)
     with c4:
-        num_q = st.number_input("عدد الأسئلة", 1, 200, 10, 1)
+        num_q = st.number_input("عدد الأسئلة", 1, 300, 10, 1)
     with c5:
         num_choices = st.selectbox("عدد الخيارات", [4, 5, 6], index=0)
 
@@ -543,11 +553,11 @@ def main():
     st.subheader("تعلم مراكز الفقاعات (Bubble Detection)")
     d1, d2, d3 = st.columns(3)
     with d1:
-        min_area = st.number_input("min_area", 20, 2000, 120, 10)
+        min_area = st.number_input("min_area", 20, 2500, 120, 10)
     with d2:
-        max_area = st.number_input("max_area", 1000, 30000, 9000, 500)
+        max_area = st.number_input("max_area", 500, 40000, 9000, 500)
     with d3:
-        min_circ = st.slider("min_circularity", 0.30, 0.95, 0.55, 0.01)
+        min_circ = st.slider("min_circularity", 0.25, 0.95, 0.55, 0.01)
 
     st.subheader("Thresholds (Key + Student)")
     r1, r2, r3, r4, r5 = st.columns(5)
@@ -607,7 +617,8 @@ def main():
         blank_mean_thresh=float(blank_mean_thresh),
         diff_thresh=float(diff_thresh),
     )
-    st.write("🔑 Answer Key المستخرج:")
+
+    st.markdown("### 🔑 Answer Key المستخرج")
     st.write(answer_key)
 
     if debug:
@@ -623,9 +634,9 @@ def main():
             cv2.circle(vis, (int(x), int(y)), 7, (0, 255, 0), 2)
         st.image(bgr_to_rgb(vis), caption="Red=ID centers, Green=Q centers", width="stretch")
 
+        st.subheader("Debug: Key extraction table")
         st.dataframe(df_key_dbg, width="stretch", height=360)
 
-    # Grade
     st.markdown("---")
     if st.button("🚀 ابدأ التصحيح", type="primary", width="stretch"):
         pages = load_pages(read_bytes(sheets_file), sheets_file.name, dpi=int(dpi))
