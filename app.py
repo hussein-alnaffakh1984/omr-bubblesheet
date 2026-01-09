@@ -394,6 +394,7 @@ def main():
         2. ارفع ملف واحد في كل مرة
         3. عالج 10-20 ورقة في كل دفعة
         4. النتائج تتجمع تلقائياً
+        5. استخدم AI لقراءة الأكواد والإجابات بدقة
         
         ⚠️ **لتجنب Memory Error:**
         - لا ترفع ملفات أكبر من 50 صفحة
@@ -402,10 +403,10 @@ def main():
         
         **مثال:** 500 طالب
         - قسّم لـ 10 ملفات (50 ورقة لكل ملف)
-        - كل ملف: 5 دفعات × 10 أوراق = 3 دقائق
-        - الإجمالي: 30 دقيقة ✅
+        - كل ملف: 5 دفعات × 10 أوراق = 3-4 دقائق
+        - الإجمالي: 30-40 دقيقة ✅
         
-        **الوقت المتوقع:** 10 ملفات × 3 دقائق = 30 دقيقة
+        **الوقت المتوقع:** 10 ملفات × 3-4 دقائق = 30-40 دقيقة
         **التكلفة:** 500 × $0.003 = $1.50
         """)
         
@@ -423,21 +424,6 @@ def main():
             batch_size = st.slider("📦 Batch size", 5, 20, 10, help="للذاكرة المحدودة: استخدم 10 أو أقل")
         with col2:
             auto_continue = st.checkbox("🔄 Auto-continue", value=False, help="⚠️ أطفئه لو في مشاكل ذاكرة")
-        
-        st.markdown("---")
-        
-        # Code extraction method
-        code_method = st.radio(
-            "🔢 طريقة قراءة الأكواد:",
-            options=[
-                "🤖 AI (Claude Vision) - أبطأ وأغلى",
-                "📸 OCR (Tesseract) - أسرع ومجاني ✅"
-            ] if HAS_TESSERACT else ["🤖 AI (Claude Vision)"],
-            index=1 if HAS_TESSERACT else 0,
-            help="OCR أدق للأرقام ومجاني!"
-        )
-        
-        use_ocr = "OCR" in code_method
         
         st.markdown("---")
         st.subheader("🔍 إدارة التكرارات")
@@ -503,42 +489,16 @@ def main():
                         # Convert and compress immediately
                         bgr = pil_to_bgr(page)
                         
-                        # Extract code (OCR or AI)
-                        img = None  # Initialize
-                        res = None
+                        # Extract code with AI (simple and reliable)
+                        img = bgr_to_bytes(bgr)
+                        res = analyze_with_ai(img, api_key, False)
                         
-                        if use_ocr:
-                            code, ocr_score = extract_code_with_ocr(bgr)
-                            if not code or ocr_score < 80:
-                                st.warning(f"⚠️ Page {i+1}: OCR failed (score: {ocr_score}), trying AI...")
-                                # Fallback to AI
-                                img = bgr_to_bytes(bgr)
-                                res = analyze_with_ai(img, api_key, False)
-                                if res.success and res.student_code:
-                                    code = res.student_code.strip()
-                                else:
-                                    st.warning(f"⚠️ Page {i+1}: Both OCR and AI failed")
-                                    del page, bgr
-                                    continue
-                            else:
-                                # OCR success - use AI only for answers
-                                img = bgr_to_bytes(bgr)
-                                res = analyze_with_ai(img, api_key, False)
-                                if not res.success:
-                                    st.warning(f"⚠️ Page {i+1}: AI failed to read answers")
-                                    del page, bgr
-                                    continue
-                                # Use OCR code + AI answers
-                                res.student_code = code
-                        else:
-                            # Full AI approach
-                            img = bgr_to_bytes(bgr)
-                            res = analyze_with_ai(img, api_key, False)
-                            if not res.success or not res.student_code:
-                                st.warning(f"⚠️ Page {i+1}: AI failed")
-                                del page, bgr
-                                continue
-                            code = res.student_code.strip()
+                        if not res.success or not res.student_code:
+                            st.warning(f"⚠️ Page {i+1}: Failed to read")
+                            del page, bgr, img
+                            continue
+                        
+                        code = res.student_code.strip()
                         
                         # Free memory immediately
                         del page
