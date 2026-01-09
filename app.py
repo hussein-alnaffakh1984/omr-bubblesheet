@@ -147,82 +147,84 @@ def analyze_with_ai(image_bytes, api_key, is_answer_key=True):
         if is_answer_key:
             prompt = "اقرأ Answer Key. JSON فقط: {\"answers\": {\"1\": \"C\", ...}}"
         else:
-            prompt = """أنت نظام OMR خبير. اقرأ ورقة الطالب بدقة عالية.
+            prompt = """You are an expert OMR (Optical Mark Recognition) system. Read this student answer sheet with EXTREME precision.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 قراءة الكود (صف بصف - مثل الإجابات!)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 STUDENT CODE GRID (TOP OF PAGE) - READ WITH EXTREME CARE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**شبكة الكود في أعلى الورقة = 4 صفوف عمودية:**
+The code grid has FOUR VERTICAL COLUMNS (reading LEFT to RIGHT):
 
-📍 **الصف الأول** (الخانة الأولى):
-[0] [1] [2] [3] [4] [5] [6] [7] [8] [9]
-→ اقرأ الفقاعة المظللة → الرقم الأول
+COLUMN 1 (First digit):    ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨
+COLUMN 2 (Second digit):   ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨
+COLUMN 3 (Third digit):    ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨
+COLUMN 4 (Fourth digit):   ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨
 
-📍 **الصف الثاني** (الخانة الثانية):
-[0] [1] [2] [3] [4] [5] [6] [7] [8] [9]
-→ اقرأ الفقاعة المظللة → الرقم الثاني
+CRITICAL INSTRUCTIONS:
+1. Look at EACH COLUMN separately - treat each like an independent question
+2. Find the FILLED/DARKEST bubble in each column
+3. The code MUST start with "1" (first column = 1)
+4. Valid range: 1000-1057
+5. Output EXACTLY 4 digits - no more, no less
 
-📍 **الصف الثالث** (الخانة الثالثة):
-[0] [1] [2] [3] [4] [5] [6] [7] [8] [9]
-→ اقرأ الفقاعة المظللة → الرقم الثالث
+COMMON MISTAKES TO AVOID:
+❌ Confusing 0 ↔ 8 (zero vs eight)
+❌ Confusing 1 ↔ 7 (one vs seven)  
+❌ Confusing 3 ↔ 8 (three vs eight)
+❌ Confusing 5 ↔ 6 (five vs six)
+❌ Confusing 7 ↔ 9 (seven vs nine)
+❌ Reading wrong column order
 
-📍 **الصف الرابع** (الخانة الرابعة):
-[0] [1] [2] [3] [4] [5] [6] [7] [8] [9]
-→ اقرأ الفقاعة المظللة → الرقم الرابع
+STEP-BY-STEP PROCESS:
+Step 1: Locate the code grid (top-left area of page)
+Step 2: Read Column 1 → Find filled bubble → Usually "1"
+Step 3: Read Column 2 → Find filled bubble → 0-9
+Step 4: Read Column 3 → Find filled bubble → 0-9
+Step 5: Read Column 4 → Find filled bubble → 0-9
+Step 6: Combine: [digit1][digit2][digit3][digit4]
 
-**مثال:**
-الصف 1: الفقاعة [1] مظللة → "1"
-الصف 2: الفقاعة [0] مظللة → "0"
-الصف 3: الفقاعة [1] مظللة → "1"
-الصف 4: الفقاعة [3] مظللة → "3"
-الكود النهائي = "1013" ✅
+EXAMPLE:
+Column 1: Bubble ① is filled → "1"
+Column 2: Bubble ⓪ is filled → "0"
+Column 3: Bubble ① is filled → "1"
+Column 4: Bubble ⑦ is filled → "7"
+Final code = "1017" ✅
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ قواعد مهمة للكود:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 ANSWERS (10 Questions: A, B, C, D)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. **اقرأ كل صف منفصل** (مثل قراءة سؤال!)
-2. **الفقاعة المظللة** = الأكثر قتامة
-3. **لو أكثر من فقاعة مظللة** → اختر الأقتم
-4. **4 أرقام فقط** - لا أكثر ولا أقل
-5. **الكود يبدأ بـ "1"** عادة (النطاق: 1000-1057)
-6. **لا تخلط بين الأرقام** - كل صف منفصل تماماً!
+RULE 1 - X mark CANCELS a bubble (HIGHEST PRIORITY):
+Q1: [●X] A  [●] B  [ ] C  [ ] D
+    ^^^^    ^^^
+  CANCEL   ANSWER
+→ Ignore A (has X mark)
+→ Answer: B ✅
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 قراءة الإجابات (10 أسئلة)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 2 - Single filled bubble:
+Q2: [ ] A  [●] B  [ ] C  [ ] D
+→ Answer: B ✅
 
-**القاعدة 1 - X يلغي الفقاعة (أولوية قصوى!):**
-Q1: [●X] A [●] B [ ] C [ ] D
-     ملغ    ✓
-→ احذف A (عليها X)
-→ الإجابة: B ✅
+RULE 3 - Multiple filled bubbles (NO X marks):
+Q3: [●●] A  [●] B  [ ] C  [ ] D
+    ^^^^    ^^^
+   DARKER  LIGHTER
+→ Answer: A (darkest) ✅
 
-**القاعدة 2 - فقاعة واحدة:**
-Q2: [ ] A [●] B [ ] C [ ] D
-→ الإجابة: B ✅
+ALGORITHM:
+1. Remove any bubble with X mark
+2. From remaining: choose DARKEST
+3. If none: "?"
 
-**القاعدة 3 - أكثر من فقاعة:**
-Q3: [●●] A [●] B [ ] C [ ] D
-     أكثر   أقل
-     قتامة  قتامة
-→ الإجابة: A (الأكثر قتامة) ✅
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**خوارزمية:**
-1. احذف أي فقاعة عليها X
-2. من المتبقي: اختر الأكثر قتامة
-3. إذا لا شيء: "?"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-JSON فقط (لا نص إضافي):
+RESPOND WITH JSON ONLY (no extra text):
 {
-  "row1": "1",
-  "row2": "0",
-  "row3": "1",
-  "row4": "3",
-  "student_code": "1013",
+  "col1": "1",
+  "col2": "0",
+  "col3": "1",
+  "col4": "7",
+  "student_code": "1017",
   "answers": {
     "1": "C",
     "2": "B",
@@ -566,42 +568,44 @@ def main():
                             st.warning(f"🔍 Page {i+1}: Code {code} suspicious ({recheck_reason}) - double-checking...")
                             
                             # Ultra-detailed prompt focusing ONLY on code
-                            detailed_prompt = """⚠️ CRITICAL: قراءة دقيقة جداً للكود فقط!
+                            detailed_prompt = """⚠️ CRITICAL RE-CHECK: Student Code Grid Reading
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 شبكة الكود (4 صفوف × 10 فقاعات)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 FOCUS: CODE GRID ONLY (top-left area of page)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**انظر بدقة شديدة للشبكة في أعلى الورقة!**
+Look VERY CAREFULLY at the bubble grid. It has 4 VERTICAL COLUMNS:
 
-**الصف 1 (الرقم الأول):**
-[ ] 0  [ ] 1  [ ] 2  [ ] 3  [ ] 4  [ ] 5  [ ] 6  [ ] 7  [ ] 8  [ ] 9
-→ ما هي الفقاعة المظللة؟ (عادة: 1)
+COLUMN 1 (1st digit):  ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨  → Which bubble is FILLED?
+COLUMN 2 (2nd digit):  ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨  → Which bubble is FILLED?
+COLUMN 3 (3rd digit):  ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨  → Which bubble is FILLED?
+COLUMN 4 (4th digit):  ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨  → Which bubble is FILLED?
 
-**الصف 2 (الرقم الثاني):**
-[ ] 0  [ ] 1  [ ] 2  [ ] 3  [ ] 4  [ ] 5  [ ] 6  [ ] 7  [ ] 8  [ ] 9
-→ ما هي الفقاعة المظللة؟
+⚠️ CRITICAL WARNINGS:
+• First column MUST be "1" (not 0, not 7)
+• Valid codes: 1000-1057 ONLY
+• Watch for similar-looking numbers:
+  - 0 vs 8 (zero vs eight)
+  - 1 vs 7 (one vs seven)
+  - 3 vs 8 (three vs eight)
+  - 5 vs 6 (five vs six)
+  - 7 vs 9 (seven vs nine)
 
-**الصف 3 (الرقم الثالث):**
-[ ] 0  [ ] 1  [ ] 2  [ ] 3  [ ] 4  [ ] 5  [ ] 6  [ ] 7  [ ] 8  [ ] 9
-→ ما هي الفقاعة المظللة؟
+VERIFICATION STEPS:
+1. Find the grid (top-left area)
+2. Read Column 1 carefully → Usually "1"
+3. Read Column 2 carefully → 0-9
+4. Read Column 3 carefully → 0-9
+5. Read Column 4 carefully → 0-9
+6. Double-check: Does it look reasonable?
+7. Verify: Is it between 1000-1057?
 
-**الصف 4 (الرقم الرابع):**
-[ ] 0  [ ] 1  [ ] 2  [ ] 3  [ ] 4  [ ] 5  [ ] 6  [ ] 7  [ ] 8  [ ] 9
-→ ما هي الفقاعة المظللة؟
-
-⚠️ **تحذيرات حرجة:**
-- الأرقام المتشابهة: 0↔8, 1↔7, 3↔8, 5↔6, 7↔9
-- افحص كل فقاعة بدقة شديدة!
-- الكود يجب أن يبدأ بـ "1" (ليس 0 ولا 7)
-- النطاق الصحيح: 1000-1057
-
-JSON فقط:
+JSON ONLY:
 {
-  "row1": "1",
-  "row2": "0", 
-  "row3": "1",
-  "row4": "7",
+  "col1": "1",
+  "col2": "0",
+  "col3": "1",
+  "col4": "7",
   "student_code": "1017",
   "confidence": "high"
 }"""
