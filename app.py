@@ -540,6 +540,58 @@ def main():
                         
                         code = res.student_code.strip()
                         
+                        # Smart code correction
+                        original_code = code
+                        
+                        # Fix common OCR errors
+                        if len(code) == 4 and code.isdigit():
+                            digits = list(code)
+                            
+                            # Rule 1: First digit should be 1 (not 0, 7, etc)
+                            if digits[0] in ['0', '7', 'I', 'l']:
+                                digits[0] = '1'
+                                st.info(f"📝 Page {i+1}: Auto-corrected first digit {code[0]} → 1")
+                            
+                            # Rule 2: Common digit confusions
+                            for idx in range(len(digits)):
+                                if digits[idx] == 'O':
+                                    digits[idx] = '0'
+                                elif digits[idx] == 'l' or digits[idx] == 'I':
+                                    digits[idx] = '1'
+                            
+                            code = ''.join(digits)
+                            
+                            # Rule 3: If code out of range, try smart fixes
+                            code_int = int(code)
+                            if code_int > 1057 and code_int < 1100:
+                                # Try fixing last digit (9→7, 8→5, etc)
+                                if digits[3] == '9':
+                                    test_code = code[:3] + '7'
+                                    if find_student_by_code(st.session_state.students, test_code):
+                                        st.info(f"📝 Page {i+1}: Auto-corrected {code} → {test_code}")
+                                        code = test_code
+                                elif digits[3] == '8':
+                                    test_code = code[:3] + '5'
+                                    if find_student_by_code(st.session_state.students, test_code):
+                                        st.info(f"📝 Page {i+1}: Auto-corrected {code} → {test_code}")
+                                        code = test_code
+                                elif digits[3] == '0':
+                                    # Try 0→8 or 0→3
+                                    for try_digit in ['8', '3', '5']:
+                                        test_code = code[:3] + try_digit
+                                        if find_student_by_code(st.session_state.students, test_code):
+                                            st.info(f"📝 Page {i+1}: Auto-corrected {code} → {test_code}")
+                                            code = test_code
+                                            break
+                            
+                            # Rule 4: Try common second digit fixes (0→1, 9→0)
+                            if not find_student_by_code(st.session_state.students, code):
+                                if digits[1] == '9':
+                                    test_code = digits[0] + '0' + digits[2] + digits[3]
+                                    if find_student_by_code(st.session_state.students, test_code):
+                                        st.info(f"📝 Page {i+1}: Auto-corrected {code} → {test_code}")
+                                        code = test_code
+                        
                         # Free memory immediately after AI processing
                         del page, bgr, img
                         
