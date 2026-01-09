@@ -1,115 +1,70 @@
 """
 🤖 AI OMR - Scalable Version for Large Classes (500-700 students)
 معالجة قابلة للتوسع للأعداد الكبيرة
+
+✅ NEW (FIX):
+- اقرأ كود الطالب بالـ AI لكن من ROI شبكة الكود فقط (Bubble grid) لمنع خلطه مع الأسئلة
+- تحقق صارم للكود + إعادة محاولة + مرشحين واختيار مطابق لقائمة الطلاب
 """
-import io, base64, time, gc, re
+
+import io, base64, time, gc, re, json
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import cv2, numpy as np, pandas as pd
 import streamlit as st
 from pdf2image import convert_from_bytes
 from PIL import Image
 from datetime import datetime
 
-# OCR for code extraction
-try:
-    import pytesseract
-    HAS_TESSERACT = True
-except:
-    HAS_TESSERACT = False
 
-# Same helper functions...
+# ----------------------------
+# Helpers
+# ----------------------------
 def read_bytes(f):
-    if not f: return b""
-    try: return f.getbuffer().tobytes()
-    except: 
-        try: return f.read()
-        except: return b""
+    if not f:
+        return b""
+    try:
+        return f.getbuffer().tobytes()
+    except:
+        try:
+            return f.read()
+        except:
+            return b""
 
-def load_pages(file_bytes, filename, dpi=150):  # Lower DPI: 150 instead of 200
-    """Load pages with aggressive memory management"""
+
+def load_pages(file_bytes, filename, dpi=170):
+    """
+    ✅ DPI متوسط لتوازن الدقة والذاكرة.
+    - لا ترفع كثير حتى لا تتعب الذاكرة
+    - ولا تنزل جدًا حتى لا تتدهور قراءة الفقاعات
+    """
     if filename.lower().endswith(".pdf"):
-        # Process in smaller chunks
-        pages = convert_from_bytes(file_bytes, dpi=dpi, fmt='jpeg', jpegopt={'quality': 85, 'optimize': True})
+        pages = convert_from_bytes(
+            file_bytes,
+            dpi=dpi,
+            fmt="jpeg",
+            jpegopt={"quality": 85, "optimize": True},
+        )
         return [p.convert("RGB") for p in pages]
     return [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
+
 
 def pil_to_bgr(pil_img):
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
+
 def bgr_to_bytes(bgr):
-    _, buffer = cv2.imencode('.png', bgr, [cv2.IMWRITE_PNG_COMPRESSION, 6])  # Higher compression
-    return buffer.tobytes()
+    ok, buffer = cv2.imencode(".png", bgr, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+    return buffer.tobytes() if ok else b""
 
-# OCR-based code extraction
-def extract_code_with_ocr(bgr_image):
-    """Extract 4-digit code using OCR (more accurate for numbers)"""
-    if not HAS_TESSERACT:
-        return None, 0
-    
-    try:
-        h, w = bgr_image.shape[:2]
-        
-        # ROI for code area (top-left section)
-        y1, y2 = int(0.145 * h), int(0.285 * h)
-        x1, x2 = int(0.080 * w), int(0.440 * w)
-        roi = bgr_image[y1:y2, x1:x2].copy()
-        
-        # Preprocess
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        gray = clahe.apply(gray)
-        gray = cv2.GaussianBlur(gray, (3,3), 0)
-        
-        # Try multiple thresholds
-        variants = []
-        
-        # Otsu inverse
-        _, th1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        variants.append(th1)
-        
-        # Adaptive mean
-        th2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                    cv2.THRESH_BINARY_INV, 31, 7)
-        variants.append(th2)
-        
-        # Adaptive gaussian
-        th3 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY_INV, 31, 7)
-        variants.append(th3)
-        
-        best_code = None
-        best_score = -999
-        
-        for variant in variants:
-            # Upscale for better OCR
-            big = cv2.resize(variant, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
-            
-            # OCR with digit whitelist
-            config = "--psm 7 -c tessedit_char_whitelist=0123456789"
-            text = pytesseract.image_to_string(big, config=config).strip()
-            
-            # Extract 4-digit codes
-            codes = re.findall(r'\b(1[0-9]{3})\b', text)
-            
-            if codes:
-                code = codes[0]
-                code_int = int(code)
-                
-                # Score based on validity
-                score = 50  # base score
-                if 1000 <= code_int <= 1999:
-                    score += 50
-                
-                if score > best_score:
-                    best_code = code
-                    best_score = score
-        
-        return best_code, best_score
-    
-    except Exception as e:
-        return None, 0
 
+def normalize_code(x: str) -> str:
+    return str(x).strip().replace(" ", "").replace("-", "")
+
+
+# ----------------------------
+# Data classes
+# ----------------------------
 @dataclass
 class AIResult:
     answers: Dict
@@ -118,11 +73,13 @@ class AIResult:
     success: bool
     student_code: Optional[str] = None
 
+
 @dataclass
 class StudentRecord:
     student_id: str
     name: str
     code: str
+
 
 @dataclass
 class GradingResult:
@@ -133,688 +90,739 @@ class GradingResult:
     total: int
     page_number: int = 0
 
-def analyze_with_ai(image_bytes, api_key, is_answer_key=True):
-    """AI Analysis - optimized"""
-    if not api_key or len(api_key) < 20:
-        return AIResult({}, "no_api", ["API Key required"], False)
-    
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        
-        image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        if is_answer_key:
-            prompt = "اقرأ Answer Key. JSON فقط: {\"answers\": {\"1\": \"C\", ...}}"
-        else:
-            prompt = """أنت نظام OMR خبير. اقرأ ورقة الطالب بدقة عالية.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 قراءة الكود (صف بصف - مثل الإجابات!)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-**شبكة الكود في أعلى الورقة = 4 صفوف عمودية:**
-
-📍 **الصف الأول** (الخانة الأولى):
-[0] [1] [2] [3] [4] [5] [6] [7] [8] [9]
-→ اقرأ الفقاعة المظللة → الرقم الأول
-
-📍 **الصف الثاني** (الخانة الثانية):
-[0] [1] [2] [3] [4] [5] [6] [7] [8] [9]
-→ اقرأ الفقاعة المظللة → الرقم الثاني
-
-📍 **الصف الثالث** (الخانة الثالثة):
-[0] [1] [2] [3] [4] [5] [6] [7] [8] [9]
-→ اقرأ الفقاعة المظللة → الرقم الثالث
-
-📍 **الصف الرابع** (الخانة الرابعة):
-[0] [1] [2] [3] [4] [5] [6] [7] [8] [9]
-→ اقرأ الفقاعة المظللة → الرقم الرابع
-
-**مثال:**
-الصف 1: الفقاعة [1] مظللة → "1"
-الصف 2: الفقاعة [0] مظللة → "0"
-الصف 3: الفقاعة [1] مظللة → "1"
-الصف 4: الفقاعة [3] مظللة → "3"
-الكود النهائي = "1013" ✅
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ قواعد مهمة للكود:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. **اقرأ كل صف منفصل** (مثل قراءة سؤال!)
-2. **الفقاعة المظللة** = الأكثر قتامة
-3. **لو أكثر من فقاعة مظللة** → اختر الأقتم
-4. **4 أرقام فقط** - لا أكثر ولا أقل
-5. **الكود يبدأ بـ "1"** عادة (النطاق: 1000-1057)
-6. **لا تخلط بين الأرقام** - كل صف منفصل تماماً!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 قراءة الإجابات (10 أسئلة)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-**القاعدة 1 - X يلغي الفقاعة (أولوية قصوى!):**
-Q1: [●X] A [●] B [ ] C [ ] D
-     ملغ    ✓
-→ احذف A (عليها X)
-→ الإجابة: B ✅
-
-**القاعدة 2 - فقاعة واحدة:**
-Q2: [ ] A [●] B [ ] C [ ] D
-→ الإجابة: B ✅
-
-**القاعدة 3 - أكثر من فقاعة:**
-Q3: [●●] A [●] B [ ] C [ ] D
-     أكثر   أقل
-     قتامة  قتامة
-→ الإجابة: A (الأكثر قتامة) ✅
-
-**خوارزمية:**
-1. احذف أي فقاعة عليها X
-2. من المتبقي: اختر الأكثر قتامة
-3. إذا لا شيء: "?"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-JSON فقط (لا نص إضافي):
-{
-  "row1": "1",
-  "row2": "0",
-  "row3": "1",
-  "row4": "3",
-  "student_code": "1013",
-  "answers": {
-    "1": "C",
-    "2": "B",
-    "3": "A",
-    "4": "D",
-    "5": "A",
-    "6": "C",
-    "7": "B",
-    "8": "D",
-    "9": "A",
-    "10": "B"
-  }
-}"""
-        
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1500,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-        )
-        
-        response_text = message.content[0].text
-        
-        import json, re
-        json_text = response_text
-        if "```json" in response_text:
-            json_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            json_text = response_text.split("```")[1].split("```")[0].strip()
-        
-        try:
-            result = json.loads(json_text)
-        except:
-            match = re.search(r'\{[\s\S]*\}', response_text)
-            if match: result = json.loads(match.group())
-            else: raise ValueError("No JSON")
-        
-        answers = {int(k): v for k, v in result.get("answers", {}).items()}
-        student_code = result.get("student_code") if not is_answer_key else None
-        
-        return AIResult(answers, result.get("confidence", "medium"), result.get("notes", []), True, student_code)
-    
-    except Exception as e:
-        return AIResult({}, "error", [str(e)], False)
-
+# ----------------------------
+# Student loading / matching
+# ----------------------------
 def load_students_from_excel(file_bytes):
     """Load students from Excel"""
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
         id_col = name_col = code_col = None
+
         for col in df.columns:
             cl = str(col).lower().strip()
-            if 'id' in cl or 'رقم' in cl: id_col = col
-            elif 'name' in cl or 'اسم' in cl: name_col = col
-            elif 'code' in cl or 'كود' in cl or 'رمز' in cl: code_col = col
-        
+            if ("id" in cl) or ("رقم" in cl):
+                id_col = col
+            elif ("name" in cl) or ("اسم" in cl):
+                name_col = col
+            elif ("code" in cl) or ("كود" in cl) or ("رمز" in cl):
+                code_col = col
+
         if not all([id_col, name_col, code_col]):
             return []
-        
+
         students = []
         for _, row in df.iterrows():
-            students.append(StudentRecord(str(row[id_col]), str(row[name_col]), str(row[code_col])))
+            students.append(
+                StudentRecord(
+                    str(row[id_col]),
+                    str(row[name_col]),
+                    str(row[code_col]),
+                )
+            )
         return students
+
     except Exception as e:
         st.error(f"Excel error: {e}")
         return []
 
+
 def find_student_by_code(students, code):
     """Find student with flexible matching"""
-    code_norm = str(code).strip().replace(" ", "").replace("-", "")
+    code_norm = normalize_code(code)
+
     for s in students:
-        s_code = str(s.code).strip().replace(" ", "").replace("-", "")
-        if s_code == code_norm: return s
-    
-    # Try prefix match (if code is longer)
+        s_code = normalize_code(s.code)
+        if s_code == code_norm:
+            return s
+
+    # Prefix match (لو AI رجّع أكثر من 4)
     if len(code_norm) > 4:
         for length in [4, 5, 6]:
             if len(code_norm) >= length:
                 prefix = code_norm[:length]
                 for s in students:
-                    s_code = str(s.code).strip().replace(" ", "").replace("-", "")
-                    if s_code == prefix: return s
+                    s_code = normalize_code(s.code)
+                    if s_code == prefix:
+                        return s
     return None
 
+
+# ----------------------------
+# Grading / Export
+# ----------------------------
 def grade_student(student_answers, answer_key):
-    """Grade student"""
     score = sum(1 for q in answer_key.keys() if student_answers.get(q) == answer_key[q])
     return score, len(answer_key)
 
+
 def export_results(results):
-    """Export to Excel - minimal format"""
-    data = [{
-        "Page": r.page_number,
-        "ID": r.student_id, 
-        "Name": r.name, 
-        "Code": r.detected_code, 
-        "Score": r.score
-    } for r in results]
-    
+    data = [
+        {
+            "Page": r.page_number,
+            "ID": r.student_id,
+            "Name": r.name,
+            "Code": r.detected_code,
+            "Score": r.score,
+        }
+        for r in results
+    ]
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame(data).to_excel(writer, sheet_name='Results', index=False)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(data).to_excel(writer, sheet_name="Results", index=False)
     return output.getvalue()
 
-# ==== MAIN APP ====
+
+# ----------------------------
+# ✅ NEW: Code ROI + AI for code only
+# ----------------------------
+def crop_code_grid_roi(bgr_image):
+    """
+    ✅ قص شبكة الكود (Bubble grid) فقط.
+    IMPORTANT: عدّل هذه النسب مرة واحدة فقط حتى تقع على شبكة الكود بشكل مثالي.
+    """
+    h, w = bgr_image.shape[:2]
+
+    # قيم بداية جيدة لقالبك (قد تحتاج تعديل بسيط)
+    y1, y2 = int(0.12 * h), int(0.33 * h)
+    x1, x2 = int(0.05 * w), int(0.50 * w)
+
+    roi = bgr_image[y1:y2, x1:x2].copy()
+    return roi
+
+
+def ai_call(client, model, image_png_bytes, prompt, max_tokens=500):
+    image_b64 = base64.b64encode(image_png_bytes).decode("utf-8")
+    msg = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    )
+    return msg.content[0].text
+
+
+def parse_json_robust(txt: str) -> dict:
+    # Extract JSON even if wrapped
+    if "```" in txt:
+        m = re.search(r"\{[\s\S]*\}", txt)
+        if m:
+            txt = m.group()
+    else:
+        m = re.search(r"\{[\s\S]*\}", txt)
+        if m:
+            txt = m.group()
+    return json.loads(txt)
+
+
+def is_valid_code(code: str, students: List[StudentRecord], min_code=1000, max_code=1999) -> bool:
+    code = normalize_code(code)
+    if not (code.isdigit() and len(code) == 4):
+        return False
+    v = int(code)
+    if not (min_code <= v <= max_code):
+        return False
+    return find_student_by_code(students, code) is not None
+
+
+def read_code_with_ai_strict(
+    bgr_page: np.ndarray,
+    api_key: str,
+    students: List[StudentRecord],
+    model: str = "claude-sonnet-4-20250514",
+    min_code: int = 1000,
+    max_code: int = 1057,   # ✅ نطاقك الحقيقي حسب كلامك
+    debug_show: bool = False
+) -> Tuple[Optional[str], dict]:
+    """
+    ✅ AI يقرأ كود الطالب من ROI شبكة الكود فقط + تحقق صارم + إعادة محاولة.
+    Returns: (code or None, meta)
+    """
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+
+    roi = crop_code_grid_roi(bgr_page)
+
+    # تكبير ROI لتحسين قراءة الفقاعات
+    roi_big = cv2.resize(roi, None, fx=2.2, fy=2.2, interpolation=cv2.INTER_CUBIC)
+    roi_png = bgr_to_bytes(roi_big)
+
+    prompt1 = """
+أنت نظام OMR لقراءة كود الطالب من الفقاعات فقط.
+الصورة تحتوي شبكة كود: 4 صفوف (row1..row4) وكل صف فيه الأرقام 0..9.
+اقرأ كل صف وحده واختر الفقاعة الأغمق.
+أعد JSON فقط (بدون شرح):
+
+{
+  "row1":"digit",
+  "row2":"digit",
+  "row3":"digit",
+  "row4":"digit",
+  "student_code":"dddd",
+  "confidence":"high|medium|low"
+}
+"""
+
+    try:
+        txt1 = ai_call(client, model, roi_png, prompt1, max_tokens=350)
+        data1 = parse_json_robust(txt1)
+        code1 = normalize_code(data1.get("student_code", ""))
+
+        if is_valid_code(code1, students, min_code=min_code, max_code=max_code):
+            return code1, {"ok": True, "try": 1, "data": data1}
+
+        # ✅ محاولة ثانية: تكبير أكثر + توجيه أقوى
+        roi_big2 = cv2.resize(roi, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        roi_png2 = bgr_to_bytes(roi_big2)
+
+        prompt2 = """
+اقرأ شبكة كود الطالب (Bubble grid) بدقة عالية جداً.
+- 4 صفوف فقط، كل صف اختيار واحد من 0..9
+- تجاهل أي علامات خارج الفقاعات
+- إذا كان هناك أكثر من فقاعة مظللة في الصف، اختر الأغمق
+أعد JSON فقط:
+
+{"student_code":"dddd","confidence":"high|medium|low"}
+"""
+        txt2 = ai_call(client, model, roi_png2, prompt2, max_tokens=250)
+        data2 = parse_json_robust(txt2)
+        code2 = normalize_code(data2.get("student_code", ""))
+
+        if is_valid_code(code2, students, min_code=min_code, max_code=max_code):
+            return code2, {"ok": True, "try": 2, "data": data2}
+
+        # ✅ محاولة ثالثة: اطلب 3 مرشحين واختر المطابق لقائمة الطلاب
+        prompt3 = """
+اقرأ شبكة الكود (4 صفوف × 10 أرقام 0..9).
+إذا غير متأكد أعط أفضل 3 احتمالات.
+JSON فقط:
+
+{"candidates":["dddd","dddd","dddd"],"confidence":"high|medium|low"}
+"""
+        txt3 = ai_call(client, model, roi_png2, prompt3, max_tokens=300)
+        data3 = parse_json_robust(txt3)
+        candidates = [normalize_code(x) for x in data3.get("candidates", [])]
+
+        picked = None
+        for c in candidates:
+            if is_valid_code(c, students, min_code=min_code, max_code=max_code):
+                picked = c
+                break
+
+        if picked:
+            return picked, {"ok": True, "try": 3, "picked": picked, "data": data3}
+
+        meta = {
+            "ok": False,
+            "try": 3,
+            "first": {"code": code1, "data": data1},
+            "second": {"code": code2, "data": data2},
+            "candidates": candidates,
+        }
+
+        # اختياري: عرض ROI لتشخيص سريع
+        if debug_show:
+            meta["roi"] = roi
+        return None, meta
+
+    except Exception as e:
+        return None, {"ok": False, "error": str(e)}
+
+
+# ----------------------------
+# AI analysis for Answer key / Answers (unchanged idea)
+# ----------------------------
+def analyze_answers_with_ai(image_bytes, api_key, is_answer_key=True):
+    """
+    ✅ هذه الدالة الآن مخصصة للإجابات فقط.
+    - Answer Key: يرجع answers فقط
+    - Student page: يرجع answers فقط (لا نطلب student_code هنا)
+    """
+    if not api_key or len(api_key) < 20:
+        return AIResult({}, "no_api", ["API Key required"], False)
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        if is_answer_key:
+            prompt = "اقرأ Answer Key فقط. JSON فقط: {\"answers\": {\"1\": \"C\", ...}}"
+            max_tokens = 800
+        else:
+            prompt = """
+أنت نظام OMR خبير. اقرأ إجابات الطالب فقط (10 أسئلة).
+قاعدة X:
+- إذا على الفقاعة علامة X فهي ملغاة مهما كانت مظللة.
+- من الباقي اختر الأكثر قتامة.
+- إذا لا شيء: "?"
+
+JSON فقط:
+{
+  "answers": {
+    "1":"A|B|C|D|?",
+    "2":"A|B|C|D|?",
+    ...
+    "10":"A|B|C|D|?"
+  }
+}
+"""
+            max_tokens = 1200
+
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=max_tokens,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+        )
+
+        response_text = message.content[0].text
+
+        # robust JSON parse
+        try:
+            result = parse_json_robust(response_text)
+        except:
+            # fallback
+            match = re.search(r"\{[\s\S]*\}", response_text)
+            if match:
+                result = json.loads(match.group())
+            else:
+                raise ValueError("No JSON")
+
+        answers = {int(k): v for k, v in result.get("answers", {}).items()}
+        return AIResult(answers, result.get("confidence", "medium"), result.get("notes", []), True, None)
+
+    except Exception as e:
+        return AIResult({}, "error", [str(e)], False)
+
+
+# ----------------------------
+# MAIN APP
+# ----------------------------
 def main():
     st.set_page_config(page_title="🤖 AI OMR - Scalable", layout="wide")
     st.title("🤖 نظام OMR للأعداد الكبيرة")
     st.markdown("### 📊 500-700 طالب بدون مشاكل!")
-    
+
     # Session state
-    if 'answer_key' not in st.session_state: st.session_state.answer_key = {}
-    if 'students' not in st.session_state: st.session_state.students = []
-    if 'results' not in st.session_state: st.session_state.results = []
-    if 'processed_pages' not in st.session_state: st.session_state.processed_pages = set()
-    if 'duplicate_warnings' not in st.session_state: st.session_state.duplicate_warnings = []
-    if 'allow_duplicates' not in st.session_state: st.session_state.allow_duplicates = False
-    
+    if "answer_key" not in st.session_state:
+        st.session_state.answer_key = {}
+    if "students" not in st.session_state:
+        st.session_state.students = []
+    if "results" not in st.session_state:
+        st.session_state.results = []
+    if "processed_pages" not in st.session_state:
+        st.session_state.processed_pages = set()
+    if "duplicate_warnings" not in st.session_state:
+        st.session_state.duplicate_warnings = []
+    if "allow_duplicates" not in st.session_state:
+        st.session_state.allow_duplicates = False
+
     # Sidebar
     with st.sidebar:
         st.header("⚙️ الإعدادات")
+
         api_key = ""
         try:
             api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-            if api_key: st.success("✅ API Key")
-        except: pass
+            if api_key:
+                st.success("✅ API Key")
+        except:
+            pass
+
         if not api_key:
             api_key = st.text_input("🔑 API Key", type="password")
-        
+
         st.markdown("---")
         st.metric("Answer Key", f"{len(st.session_state.answer_key)} Q")
         st.metric("Students", len(st.session_state.students))
         st.metric("Graded", len(st.session_state.results))
-        
+
         if st.session_state.results:
-            avg = np.mean([r.score/r.total*100 for r in st.session_state.results])
+            avg = np.mean([r.score / r.total * 100 for r in st.session_state.results])
             st.metric("Average", f"{avg:.1f}%")
-        
+
         if st.button("🔄 Reset All", type="secondary"):
             st.session_state.answer_key = {}
             st.session_state.results = []
             st.session_state.processed_pages = set()
+            st.session_state.duplicate_warnings = []
+            # لا نمسح الطلاب إلا إذا تريد
             st.rerun()
-    
+
     # Tabs
     tab1, tab2, tab3, tab4 = st.tabs(["1️⃣ Answer Key", "2️⃣ Students", "3️⃣ Grade", "4️⃣ Results"])
-    
+
     # TAB 1: Answer Key
     with tab1:
         st.subheader("📝 Answer Key")
-        key_file = st.file_uploader("Upload Answer Key", type=["pdf","png","jpg"], key="key")
+        key_file = st.file_uploader("Upload Answer Key", type=["pdf", "png", "jpg"], key="key")
+
         if key_file:
-            if st.button("🤖 Analyze", type="primary"):
-                if not api_key: 
+            if st.button("🤖 Analyze Key", type="primary"):
+                if not api_key:
                     st.error("❌ Need API Key")
                 else:
-                    with st.spinner("Analyzing..."):
+                    with st.spinner("Analyzing Answer Key..."):
                         b = read_bytes(key_file)
-                        pages = load_pages(b, key_file.name, 200)
+                        pages = load_pages(b, key_file.name, dpi=200)
                         if pages:
                             img = bgr_to_bytes(pil_to_bgr(pages[0]))
-                            res = analyze_with_ai(img, api_key, True)
+                            res = analyze_answers_with_ai(img, api_key, True)
                             if res.success:
                                 st.session_state.answer_key = res.answers
                                 st.success(f"✅ {len(res.answers)} questions")
-                            else: st.error("Failed")
-        
+                            else:
+                                st.error("Failed")
+
         if st.session_state.answer_key:
             st.info(" | ".join([f"Q{q}: {a}" for q, a in sorted(st.session_state.answer_key.items())]))
-    
+
     # TAB 2: Students
     with tab2:
         st.subheader("👥 Students")
-        excel = st.file_uploader("Upload Excel (ID, Name, Code)", type=["xlsx","xls"], key="excel")
+        excel = st.file_uploader("Upload Excel (ID, Name, Code)", type=["xlsx", "xls"], key="excel")
+
         if excel and st.button("📊 Load"):
             students = load_students_from_excel(read_bytes(excel))
             if students:
                 st.session_state.students = students
                 st.success(f"✅ {len(students)} students")
-        
+
         if st.session_state.students:
             st.info(f"Loaded: {len(st.session_state.students)} students")
             with st.expander("View Students"):
-                df = pd.DataFrame([{"ID": s.student_id, "Name": s.name, "Code": s.code} 
-                                   for s in st.session_state.students[:50]])
+                df = pd.DataFrame(
+                    [{"ID": s.student_id, "Name": s.name, "Code": s.code} for s in st.session_state.students[:50]]
+                )
                 st.dataframe(df)
-    
+
     # TAB 3: Grading
     with tab3:
         st.subheader("✅ Grading - Optimized for Large Scale")
-        
+
         if not st.session_state.answer_key:
             st.warning("⚠️ Load Answer Key first")
             return
         if not st.session_state.students:
             st.warning("⚠️ Load Students first")
             return
-        
-        st.info("""
-        💡 **للأعداد الكبيرة (500-700 طالب):**
-        
-        **الطريقة الموصى بها:**
-        1. قسّم PDF الكبير لملفات أصغر (**30-50 ورقة لكل ملف** - مهم!)
-        2. ارفع ملف واحد في كل مرة
-        3. عالج 10-20 ورقة في كل دفعة
-        4. النتائج تتجمع تلقائياً
-        5. استخدم AI لقراءة الأكواد والإجابات بدقة
-        
-        ⚠️ **لتجنب Memory Error:**
-        - لا ترفع ملفات أكبر من 50 صفحة
-        - استخدم batch size صغير (10-20)
-        - لو ظهر خطأ memory: اضغط "Reboot" وأعد المحاولة بملفات أصغر
-        
-        **مثال:** 500 طالب
-        - قسّم لـ 10 ملفات (50 ورقة لكل ملف)
-        - كل ملف: 5 دفعات × 10 أوراق = 3-4 دقائق
-        - الإجمالي: 30-40 دقيقة ✅
-        
-        **الوقت المتوقع:** 10 ملفات × 3-4 دقائق = 30-40 دقيقة
-        **التكلفة:** 500 × $0.003 = $1.50
-        """)
-        
+
+        st.info(
+            """
+💡 **للأعداد الكبيرة (500-700 طالب):**
+- قسّم PDF إلى ملفات أصغر (30-50 ورقة لكل ملف)
+- batch صغير 10-20
+- الكود الآن يُقرأ من ROI شبكة الكود فقط (Fix)
+"""
+        )
+
         sheets = st.file_uploader(
             "ارفع ملف PDF (⚠️ **أقصى حد: 50 صفحة**)",
             type=["pdf"],
             accept_multiple_files=False,
-            key="sheets"
+            key="sheets",
         )
-        
-        st.warning("⚠️ **حد الذاكرة:** لا ترفع ملفات أكبر من 50 صفحة! قسّم الملفات الكبيرة أولاً.")
-        
-        col1, col2 = st.columns(2)
+
+        col1, col2, col3 = st.columns(3)
         with col1:
-            batch_size = st.slider("📦 Batch size", 5, 20, 10, help="للذاكرة المحدودة: استخدم 10 أو أقل")
+            batch_size = st.slider("📦 Batch size", 5, 20, 10)
         with col2:
-            auto_continue = st.checkbox("🔄 Auto-continue", value=False, help="⚠️ أطفئه لو في مشاكل ذاكرة")
-        
+            auto_continue = st.checkbox("🔄 Auto-continue", value=False)
+        with col3:
+            debug_roi = st.checkbox("🧪 Debug ROI (للتشخيص)", value=False)
+
         st.markdown("---")
         st.subheader("🔍 إدارة التكرارات")
-        
+
         dup_mode = st.radio(
             "كيف تتعامل مع الأكواد المكررة؟",
             options=[
                 "⚠️ تحذير فقط (صحح الجميع)",
                 "🚫 تجاهل التكرارات (صحح الأول فقط)",
-                "✅ لا تفحص التكرارات (صحح كل شيء)"
+                "✅ لا تفحص التكرارات (صحح كل شيء)",
             ],
-            help="""
-            **تحذير فقط:** يصحح كل الأوراق ويعطيك قائمة بالأكواد المكررة
-            **تجاهل:** يصحح أول ورقة فقط ويتجاهل الباقي
-            **لا تفحص:** يصحح كل الأوراق (قد يكون عندك طلاب بنفس الكود)
-            """
         )
-        
+
         if st.session_state.duplicate_warnings:
             st.warning(f"⚠️ تم اكتشاف {len(st.session_state.duplicate_warnings)} كود مكرر!")
             with st.expander("عرض الأكواد المكررة"):
                 for dup in st.session_state.duplicate_warnings:
                     st.error(f"الكود {dup['code']} - الصفحات: {', '.join(map(str, dup['pages']))}")
-        
-        if sheets and 'current_file_pages' not in st.session_state:
+
+        if sheets and "current_file_pages" not in st.session_state:
             if st.button("🔍 Load File"):
                 with st.spinner("Loading file..."):
                     b = read_bytes(sheets)
-                    pages = load_pages(b, sheets.name, 200)
+                    pages = load_pages(b, sheets.name, dpi=185)
                     st.session_state.current_file_pages = pages
                     st.session_state.current_file_idx = 0
                     st.success(f"✅ Loaded {len(pages)} pages from {sheets.name}")
-        
-        if 'current_file_pages' in st.session_state:
+
+        if "current_file_pages" in st.session_state:
             pages = st.session_state.current_file_pages
             current = st.session_state.current_file_idx
             total = len(pages)
             remaining = total - current
-            
+
             st.metric("File Progress", f"{current}/{total} ({current/total*100:.0f}%)")
-            
+
             if remaining > 0:
                 if st.button(f"🚀 Process next {min(batch_size, remaining)}", type="primary") or auto_continue:
                     end = min(current + batch_size, total)
-                    
+
                     progress = st.progress(0)
                     status = st.empty()
-                    
+
                     processed_count = 0
-                    
+
                     for i in range(current, end):
                         rel = i - current
                         status.text(f"Page {i+1}/{total} ({rel+1}/{end-current})")
-                        progress.progress((rel+1)/(end-current))
-                        
-                        # Skip if already processed
+                        progress.progress((rel + 1) / (end - current))
+
                         if i in st.session_state.processed_pages:
                             status.text(f"⏭️ Page {i+1} already processed")
                             continue
-                        
+
                         page = pages[i]
-                        
-                        # Convert and compress immediately
                         bgr = pil_to_bgr(page)
-                        
-                        # Extract code with AI (simple and reliable)
-                        img = bgr_to_bytes(bgr)
-                        res = analyze_with_ai(img, api_key, False)
-                        
-                        if not res.success or not res.student_code:
-                            st.warning(f"⚠️ Page {i+1}: Failed to read")
-                            del page, bgr, img
+
+                        # ✅ (1) اقرأ الكود من ROI فقط باستخدام AI + validation + retry/candidates
+                        code, meta = read_code_with_ai_strict(
+                            bgr,
+                            api_key,
+                            st.session_state.students,
+                            min_code=1000,
+                            max_code=1057,   # عدّلها حسب قائمتك لو لزم
+                            debug_show=debug_roi
+                        )
+
+                        if not code:
+                            st.warning(f"⚠️ Page {i+1}: Failed to read CODE (AI+ROI).")
+                            if debug_roi and "roi" in meta:
+                                st.image(meta["roi"], caption=f"Code ROI - Page {i+1}")
+                                st.json({k: v for k, v in meta.items() if k != "roi"})
+                            st.session_state.processed_pages.add(i)  # حتى لا يعيد الدوران على نفس الصفحة
+                            del page, bgr
                             continue
-                        
-                        code = res.student_code.strip()
-                        
-                        # Smart code correction
-                        original_code = code
-                        
-                        # Fix common OCR errors
-                        if len(code) == 4 and code.isdigit():
-                            digits = list(code)
-                            
-                            # Rule 1: First digit should be 1 (not 0, 7, etc)
-                            if digits[0] in ['0', '7', 'I', 'l']:
-                                digits[0] = '1'
-                                st.info(f"📝 Page {i+1}: Auto-corrected first digit {code[0]} → 1")
-                            
-                            # Rule 2: Common digit confusions
-                            for idx in range(len(digits)):
-                                if digits[idx] == 'O':
-                                    digits[idx] = '0'
-                                elif digits[idx] == 'l' or digits[idx] == 'I':
-                                    digits[idx] = '1'
-                            
-                            code = ''.join(digits)
-                            
-                            # Rule 3: If code out of range, try smart fixes
-                            code_int = int(code)
-                            if code_int > 1057 and code_int < 1100:
-                                # Try fixing last digit (9→7, 8→5, etc)
-                                if digits[3] == '9':
-                                    test_code = code[:3] + '7'
-                                    if find_student_by_code(st.session_state.students, test_code):
-                                        st.info(f"📝 Page {i+1}: Auto-corrected {code} → {test_code}")
-                                        code = test_code
-                                elif digits[3] == '8':
-                                    test_code = code[:3] + '5'
-                                    if find_student_by_code(st.session_state.students, test_code):
-                                        st.info(f"📝 Page {i+1}: Auto-corrected {code} → {test_code}")
-                                        code = test_code
-                                elif digits[3] == '0':
-                                    # Try 0→8 or 0→3
-                                    for try_digit in ['8', '3', '5']:
-                                        test_code = code[:3] + try_digit
-                                        if find_student_by_code(st.session_state.students, test_code):
-                                            st.info(f"📝 Page {i+1}: Auto-corrected {code} → {test_code}")
-                                            code = test_code
-                                            break
-                            
-                            # Rule 4: Try common second digit fixes (0→1, 9→0)
-                            if not find_student_by_code(st.session_state.students, code):
-                                if digits[1] == '9':
-                                    test_code = digits[0] + '0' + digits[2] + digits[3]
-                                    if find_student_by_code(st.session_state.students, test_code):
-                                        st.info(f"📝 Page {i+1}: Auto-corrected {code} → {test_code}")
-                                        code = test_code
-                        
-                        # Free memory immediately after AI processing
-                        del page, bgr, img
-                        
-                        # Force garbage collection every 10 pages
-                        if (i - current) % 10 == 0:
-                            gc.collect()
-                        
-                        # Strict validation
-                        if not code.isdigit():
-                            st.warning(f"⚠️ Page {i+1}: Bad code '{code}' (contains non-digits)")
-                            continue
-                        
-                        if len(code) != 4:
-                            st.warning(f"⚠️ Page {i+1}: Bad code '{code}' (must be exactly 4 digits, got {len(code)})")
-                            continue
-                        
-                        code_int = int(code)
-                        if code_int < 1000 or code_int > 1999:
-                            st.warning(f"⚠️ Page {i+1}: Code {code} out of range (expected 1000-1999)")
-                            continue
-                        
+
                         student = find_student_by_code(st.session_state.students, code)
                         if not student:
                             st.warning(f"⚠️ Page {i+1}: Code {code} not found in student list")
+                            st.session_state.processed_pages.add(i)
+                            del page, bgr
                             continue
-                        
-                        # Check for duplicates based on mode
+
+                        # ✅ (2) اقرأ الإجابات (AI) من الصفحة كاملة
+                        img_page = bgr_to_bytes(bgr)
+                        res_ans = analyze_answers_with_ai(img_page, api_key, is_answer_key=False)
+
+                        # تحرير ذاكرة مبكر
+                        del page, bgr, img_page
+
+                        if not res_ans.success:
+                            st.warning(f"⚠️ Page {i+1}: Failed to read answers")
+                            st.session_state.processed_pages.add(i)
+                            continue
+
+                        # GC كل 10 صفحات
+                        if (i - current) % 10 == 0:
+                            gc.collect()
+
+                        # Duplicate check
                         already_graded = any(r.detected_code == code for r in st.session_state.results)
-                        
                         if already_graded:
                             if "تجاهل" in dup_mode:
-                                # Mode 2: Skip duplicates
                                 st.info(f"ℹ️ Page {i+1}: Code {code} ({student.name}) already graded - skipping")
                                 st.session_state.processed_pages.add(i)
                                 continue
                             elif "تحذير" in dup_mode:
-                                # Mode 1: Warn but continue grading
                                 st.warning(f"⚠️ Page {i+1}: Code {code} is DUPLICATE - grading anyway")
-                                
-                                # Track duplicate
-                                existing_dup = next((d for d in st.session_state.duplicate_warnings if d['code'] == code), None)
+                                existing_dup = next(
+                                    (d for d in st.session_state.duplicate_warnings if d["code"] == code), None
+                                )
                                 if existing_dup:
-                                    existing_dup['pages'].append(i+1)
+                                    existing_dup["pages"].append(i + 1)
                                 else:
-                                    st.session_state.duplicate_warnings.append({
-                                        'code': code,
-                                        'name': student.name,
-                                        'pages': [i+1]
-                                    })
-                            # Mode 3: No check - continues automatically
-                        
-                        score, total_q = grade_student(res.answers, st.session_state.answer_key)
-                        
-                        st.session_state.results.append(GradingResult(
-                            student.student_id, student.name, code, score, total_q, i+1
-                        ))
-                        
+                                    st.session_state.duplicate_warnings.append(
+                                        {"code": code, "name": student.name, "pages": [i + 1]}
+                                    )
+                            # Mode 3: no check
+
+                        score, total_q = grade_student(res_ans.answers, st.session_state.answer_key)
+
+                        st.session_state.results.append(
+                            GradingResult(student.student_id, student.name, code, score, total_q, i + 1)
+                        )
+
                         st.session_state.processed_pages.add(i)
                         processed_count += 1
-                        
                         status.text(f"✅ Page {i+1}: {code} - {student.name} ({score}/{total_q})")
-                    
+
                     st.session_state.current_file_idx = end
-                    
-                    # Aggressive memory cleanup
+
+                    # Cleanup when file done
                     if end >= total:
-                        # File complete - clear everything
                         del st.session_state.current_file_pages
                         del st.session_state.current_file_idx
                         gc.collect()
-                    
+
                     gc.collect()
-                    
                     st.success(f"✅ Processed {processed_count} pages")
-                    
+
                     if end >= total:
                         st.balloons()
                         st.success("🎉 File complete!")
                     elif auto_continue:
-                        time.sleep(0.5)
+                        time.sleep(0.4)
                         st.rerun()
+
             else:
                 st.success("File complete! Upload next file or go to Results.")
-    
+
     # TAB 4: Results
     with tab4:
         st.subheader("📊 Results")
-        
+
         if not st.session_state.results:
             st.info("No results yet")
             return
-        
+
         # Duplicate warnings section
         if st.session_state.duplicate_warnings:
             st.error(f"⚠️ **تحذير: تم اكتشاف {len(st.session_state.duplicate_warnings)} كود مكرر!**")
-            
+
             with st.expander("🔍 تفاصيل الأكواد المكررة", expanded=True):
-                st.markdown("""
-                **هذه الأكواد ظهرت في أكثر من ورقة:**
-                - قد يكون طالب كتب كود زميله بالخطأ
-                - راجع هذه الأوراق يدوياً
-                - تحقق من الإجابات والخط
-                """)
-                
                 for dup in st.session_state.duplicate_warnings:
-                    st.warning(f"""
-                    **الكود:** {dup['code']} - **الاسم:** {dup['name']}  
-                    **ظهر في الصفحات:** {', '.join(map(str, dup['pages']))}  
-                    **عدد التكرارات:** {len(dup['pages'])} مرة
-                    """)
-                
-                # Show affected results
-                dup_codes = [d['code'] for d in st.session_state.duplicate_warnings]
+                    st.warning(
+                        f"**الكود:** {dup['code']} - **الاسم:** {dup['name']}  \n"
+                        f"**الصفحات:** {', '.join(map(str, dup['pages']))}  \n"
+                        f"**عدد التكرارات:** {len(dup['pages'])} مرة"
+                    )
+
+                dup_codes = [d["code"] for d in st.session_state.duplicate_warnings]
                 dup_results = [r for r in st.session_state.results if r.detected_code in dup_codes]
-                
                 if dup_results:
-                    st.markdown("**الأوراق المتأثرة:**")
-                    dup_df = pd.DataFrame([{
-                        "Page": r.page_number,
-                        "Code": r.detected_code,
-                        "Name": r.name,
-                        "Score": r.score
-                    } for r in dup_results])
-                    st.dataframe(dup_df, width='stretch')
-            
+                    dup_df = pd.DataFrame(
+                        [{"Page": r.page_number, "Code": r.detected_code, "Name": r.name, "Score": r.score}
+                         for r in dup_results]
+                    )
+                    st.dataframe(dup_df, width="stretch")
+
             st.markdown("---")
-        
-        scores = [r.score/r.total*100 for r in st.session_state.results]
+
+        scores = [r.score / r.total * 100 for r in st.session_state.results]
         col1, col2, col3, col4 = st.columns(4)
-        with col1: st.metric("Graded", len(scores))
-        with col2: st.metric("Average", f"{np.mean(scores):.1f}%")
-        with col3: st.metric("Max", f"{np.max(scores):.1f}%")
-        with col4: st.metric("Min", f"{np.min(scores):.1f}%")
-        
-        df = pd.DataFrame([{
-            "Page": r.page_number,
-            "ID": r.student_id, 
-            "Name": r.name, 
-            "Code": r.detected_code,
-            "Score": r.score,
-            "%": f"{r.score/r.total*100:.0f}"
-        } for r in st.session_state.results])
-        
-        st.dataframe(df, width='stretch')
-        
+        with col1:
+            st.metric("Graded", len(scores))
+        with col2:
+            st.metric("Average", f"{np.mean(scores):.1f}%")
+        with col3:
+            st.metric("Max", f"{np.max(scores):.1f}%")
+        with col4:
+            st.metric("Min", f"{np.min(scores):.1f}%")
+
+        df = pd.DataFrame(
+            [
+                {
+                    "Page": r.page_number,
+                    "ID": r.student_id,
+                    "Name": r.name,
+                    "Code": r.detected_code,
+                    "Score": r.score,
+                    "%": f"{r.score / r.total * 100:.0f}",
+                }
+                for r in st.session_state.results
+            ]
+        )
+        st.dataframe(df, width="stretch")
+
         # Duplicate cleaning options
         if st.session_state.duplicate_warnings:
             st.markdown("---")
             st.subheader("🧹 تنظيف التكرارات")
-            
+
             clean_method = st.radio(
                 "كيف تريد التعامل مع التكرارات؟",
                 options=[
                     "احتفظ بالأول فقط",
                     "احتفظ بالأعلى درجة",
                     "احتفظ بالأقل درجة (للمراجعة)",
-                    "احتفظ بالجميع (Excel سيظهر كلهم)"
-                ]
+                    "احتفظ بالجميع (Excel سيظهر كلهم)",
+                ],
             )
-            
+
             if st.button("🧹 إنشاء نتائج نظيفة"):
                 if "الأول" in clean_method:
-                    # Keep first occurrence
                     clean_results = []
                     seen_codes = set()
                     for r in sorted(st.session_state.results, key=lambda x: x.page_number):
                         if r.detected_code not in seen_codes:
                             clean_results.append(r)
                             seen_codes.add(r.detected_code)
-                    st.success(f"✅ تم! {len(clean_results)} نتيجة نظيفة (حذف {len(st.session_state.results) - len(clean_results)} تكرار)")
                     st.session_state.clean_results = clean_results
-                
+                    st.success(
+                        f"✅ تم! {len(clean_results)} نتيجة نظيفة (حذف {len(st.session_state.results) - len(clean_results)} تكرار)"
+                    )
+
                 elif "الأعلى" in clean_method:
-                    # Keep highest score
                     from collections import defaultdict
                     by_code = defaultdict(list)
                     for r in st.session_state.results:
                         by_code[r.detected_code].append(r)
-                    
-                    clean_results = []
-                    for code, results in by_code.items():
-                        best = max(results, key=lambda x: x.score)
-                        clean_results.append(best)
+                    clean_results = [max(v, key=lambda x: x.score) for v in by_code.values()]
+                    st.session_state.clean_results = clean_results
                     st.success(f"✅ تم! {len(clean_results)} نتيجة (أفضل درجة لكل كود)")
-                    st.session_state.clean_results = clean_results
-                
+
                 elif "الأقل" in clean_method:
-                    # Keep lowest score (for review)
                     from collections import defaultdict
                     by_code = defaultdict(list)
                     for r in st.session_state.results:
                         by_code[r.detected_code].append(r)
-                    
-                    clean_results = []
-                    for code, results in by_code.items():
-                        worst = min(results, key=lambda x: x.score)
-                        clean_results.append(worst)
-                    st.success(f"✅ تم! {len(clean_results)} نتيجة (أقل درجة للمراجعة)")
+                    clean_results = [min(v, key=lambda x: x.score) for v in by_code.values()]
                     st.session_state.clean_results = clean_results
-                
+                    st.success(f"✅ تم! {len(clean_results)} نتيجة (أقل درجة للمراجعة)")
+
                 else:
-                    # Keep all
                     st.session_state.clean_results = st.session_state.results
-        
-        # Export buttons
+                    st.success("✅ تم! الاحتفاظ بالجميع")
+
         st.markdown("---")
-        results_to_export = st.session_state.get('clean_results', st.session_state.results)
-        
+        results_to_export = st.session_state.get("clean_results", st.session_state.results)
+
         if st.button("📥 Export Excel", type="primary"):
             excel = export_results(results_to_export)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
+
             status_text = f"({len(results_to_export)} نتيجة"
-            if 'clean_results' in st.session_state and len(results_to_export) < len(st.session_state.results):
+            if "clean_results" in st.session_state and len(results_to_export) < len(st.session_state.results):
                 status_text += f" - تم تنظيف {len(st.session_state.results) - len(results_to_export)} تكرار"
             status_text += ")"
-            
+
             st.download_button(
-                f"⬇️ Download {status_text}", 
-                excel, 
-                f"results_{ts}.xlsx", 
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                f"⬇️ Download {status_text}",
+                excel,
+                f"results_{ts}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
 
 if __name__ == "__main__":
     main()
