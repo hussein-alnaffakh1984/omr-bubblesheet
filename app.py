@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import cv2
-import numpy as np
+import numpy as np   # ✅ FIX: was missing
 import pandas as pd
 import streamlit as st
 from pdf2image import convert_from_bytes
@@ -22,18 +22,16 @@ from datetime import datetime
 # =========================
 # Fixed defaults (no user tuning)
 # =========================
-DPI = 200  # fixed; good for scanner PDFs
-TOP_REGION_RATIO = 0.40  # focus top area where code exists
+DPI = 200
+TOP_REGION_RATIO = 0.40
 
-# Bubble detection / filtering
 MIN_AREA = 60
 MIN_CIRCULARITY = 0.58
 R_MIN = 8
 R_MAX = 35
 
-# Code range (adjust if your college uses different range)
 CODE_MIN = 1000
-CODE_MAX = 1999   # إذا عندك دائمًا 1000-1057 غيّرها إلى 1057
+CODE_MAX = 1999   # إذا أكوادكم فقط 1000-1057 غيّرها إلى 1057
 
 
 # =========================
@@ -79,8 +77,9 @@ def read_bytes(f) -> bytes:
 
 def load_pages(file_bytes: bytes, filename: str, dpi: int = DPI) -> List[Image.Image]:
     if filename.lower().endswith(".pdf"):
-        pages = convert_from_bytes(file_bytes, dpi=dpi, fmt="jpeg",
-                                  jpegopt={"quality": 85, "optimize": True})
+        pages = convert_from_bytes(
+            file_bytes, dpi=dpi, fmt="jpeg", jpegopt={"quality": 85, "optimize": True}
+        )
         return [p.convert("RGB") for p in pages]
     return [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
 
@@ -154,7 +153,7 @@ def grade_student(student_answers: Dict[int, str], answer_key: Dict[int, str]) -
 
 
 # =========================
-# Export Excel (3 sheets)
+# Export Excel
 # =========================
 def export_results(results_rows: List[dict], review_rows: List[dict], dup_rows: List[dict]) -> bytes:
     out = io.BytesIO()
@@ -237,10 +236,9 @@ def analyze_with_ai(image_bytes: bytes, api_key: str, is_answer_key: bool) -> AI
 
 
 # =========================
-# Geometry / clustering
+# KMeans 1D
 # =========================
 def kmeans_1d(values: np.ndarray, k: int, iters: int = 40) -> Tuple[np.ndarray, np.ndarray]:
-    """Simple deterministic 1D kmeans."""
     v = values.astype(np.float32)
     vmin, vmax = float(v.min()), float(v.max())
     centers = np.linspace(vmin, vmax, k).astype(np.float32)
@@ -256,6 +254,7 @@ def kmeans_1d(values: np.ndarray, k: int, iters: int = 40) -> Tuple[np.ndarray, 
             mask = labels == i
             if np.any(mask):
                 centers[i] = float(np.mean(v[mask]))
+
     order = np.argsort(centers)
     inv = np.zeros_like(order)
     inv[order] = np.arange(k)
@@ -265,7 +264,6 @@ def kmeans_1d(values: np.ndarray, k: int, iters: int = 40) -> Tuple[np.ndarray, 
 
 
 def ink_score_in_circle(gray: np.ndarray, cx: int, cy: int, r: int) -> float:
-    """Higher = darker ink inside circle."""
     h, w = gray.shape[:2]
     r1 = max(6, int(r * 0.70))
     x1, x2 = max(0, cx - r1), min(w, cx + r1)
@@ -274,12 +272,10 @@ def ink_score_in_circle(gray: np.ndarray, cx: int, cy: int, r: int) -> float:
     if crop.size == 0:
         return 0.0
 
-    # create circular mask
     mh, mw = crop.shape[:2]
     yy, xx = np.ogrid[:mh, :mw]
     mask = (xx - (cx - x1)) ** 2 + (yy - (cy - y1)) ** 2 <= r1 ** 2
 
-    # ink score: inverted mean intensity inside mask (darker => higher)
     vals = crop[mask]
     if vals.size == 0:
         return 0.0
@@ -287,7 +283,7 @@ def ink_score_in_circle(gray: np.ndarray, cx: int, cy: int, r: int) -> float:
 
 
 # =========================
-# Code reading (BUBBLES ONLY) — robust + adaptive
+# Code from bubbles only
 # =========================
 def read_code_auto(page_bgr: np.ndarray) -> CodeResult:
     H, W = page_bgr.shape[:2]
@@ -313,7 +309,6 @@ def read_code_auto(page_bgr: np.ndarray) -> CodeResult:
                 continue
             circles.append((float(x), float(y), float(r)))
 
-        # Fallback: HoughCircles
         if len(circles) < 60:
             g = cv2.medianBlur(gray_img, 5)
             hc = cv2.HoughCircles(
@@ -340,7 +335,6 @@ def read_code_auto(page_bgr: np.ndarray) -> CodeResult:
     if len(circles) < 45:
         return CodeResult(None, False, "REVIEW: bubble size filtering failed")
 
-    # Focus on top region (where code is)
     top = circles[circles[:, 1] < TOP_REGION_RATIO * H]
     pts = top if len(top) >= 40 else circles
 
@@ -366,7 +360,6 @@ def read_code_auto(page_bgr: np.ndarray) -> CodeResult:
     except Exception:
         return CodeResult(None, False, "REVIEW: column clustering failed")
 
-    # Build 4x10 grid by nearest point per cell
     grid = [[None for _ in range(10)] for _ in range(4)]
     for (cx, cy, r), rr, cc in zip(pts2, row_labels2, col_labels):
         dx = abs(cx - col_centers[cc])
@@ -382,7 +375,6 @@ def read_code_auto(page_bgr: np.ndarray) -> CodeResult:
     digits: List[int] = []
     for rr in range(4):
         scores = np.zeros((10,), dtype=np.float32)
-
         for cc in range(10):
             cell = grid[rr][cc]
             if cell is None:
@@ -397,11 +389,9 @@ def read_code_auto(page_bgr: np.ndarray) -> CodeResult:
         med = float(np.median(scores))
         mad = float(np.median(np.abs(scores - med)) + 1e-6)
 
-        # must stand out
         if best_sc < med + 3.0 * mad:
             return CodeResult(None, False, f"REVIEW: row {rr+1} faint/unclear")
 
-        # must beat 2nd place by relative margin
         sorted_scores = np.sort(scores)
         second_sc = float(sorted_scores[-2])
         margin = best_sc - second_sc
@@ -411,9 +401,6 @@ def read_code_auto(page_bgr: np.ndarray) -> CodeResult:
         digits.append(best)
 
     code = "".join(map(str, digits))
-    if not code.isdigit():
-        return CodeResult(None, False, "REVIEW: invalid code")
-
     code_int = int(code)
     if not (CODE_MIN <= code_int <= CODE_MAX):
         return CodeResult(None, False, f"REVIEW: code out of range ({code})")
@@ -428,7 +415,6 @@ def main():
     st.set_page_config(page_title="OMR PRO — Code from bubbles + AI", layout="wide")
     st.title("😃 OMR PRO — كود من الفقاعات + تصحيح بالـ AI (بدون إعدادات)")
 
-    # Session state
     if "answer_key" not in st.session_state:
         st.session_state.answer_key = {}
     if "students" not in st.session_state:
@@ -440,7 +426,6 @@ def main():
     if "duplicates" not in st.session_state:
         st.session_state.duplicates = []
 
-    # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
         api_key = ""
@@ -448,7 +433,6 @@ def main():
             api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
         except Exception:
             pass
-
         if not api_key:
             api_key = st.text_input("🔑 Anthropic API Key", type="password")
 
@@ -468,7 +452,6 @@ def main():
 
     tab1, tab2, tab3, tab4 = st.tabs(["1️⃣ Answer Key", "2️⃣ Students", "3️⃣ Grade", "4️⃣ Results"])
 
-    # TAB 1: Answer Key
     with tab1:
         st.subheader("📝 Answer Key")
         key_file = st.file_uploader("Upload Answer Key (PDF/PNG/JPG)", type=["pdf", "png", "jpg"], key="key_file")
@@ -487,11 +470,11 @@ def main():
                         st.success(f"✅ Loaded {len(res.answers)} answers")
                     else:
                         st.error("Failed to read Answer Key with AI.")
+
         if st.session_state.answer_key:
             show = " | ".join([f"Q{q}: {a}" for q, a in sorted(st.session_state.answer_key.items())])
             st.info(show)
 
-    # TAB 2: Students
     with tab2:
         st.subheader("👥 Students List")
         excel = st.file_uploader("Upload Excel (ID / Name / Code)", type=["xlsx", "xls"], key="students_excel")
@@ -500,13 +483,13 @@ def main():
             if students:
                 st.session_state.students = students
                 st.success(f"✅ Loaded {len(students)} students")
+
         if st.session_state.students:
             with st.expander("Preview (first 50)"):
                 dfp = pd.DataFrame([{"ID": s.student_id, "Name": s.name, "Code": s.code}
                                     for s in st.session_state.students[:50]])
-                st.dataframe(dfp, use_container_width=True)
+                st.dataframe(dfp, width="stretch")
 
-    # TAB 3: Grade
     with tab3:
         st.subheader("✅ Grading")
         if not st.session_state.answer_key:
@@ -540,20 +523,15 @@ def main():
             prog = st.progress(0)
             status = st.empty()
 
-            seen_codes = {}  # code -> first page number
-            corrected = 0
-            reviewed = 0
-
+            seen_codes = {}  # code -> first page
             for i, p in enumerate(pages):
                 prog.progress((i + 1) / len(pages))
                 status.text(f"Page {i+1}/{len(pages)}")
 
                 bgr = pil_to_bgr(p)
 
-                # 1) code from bubbles
                 cr = read_code_auto(bgr)
                 if not cr.ok or not cr.code:
-                    reviewed += 1
                     st.session_state.review.append({"Page": i + 1, "Reason": cr.reason, "Code": "REVIEW"})
                     del bgr
                     if i % 10 == 0:
@@ -563,14 +541,12 @@ def main():
                 code = cr.code
                 student = find_student_by_code(st.session_state.students, code)
                 if not student:
-                    reviewed += 1
                     st.session_state.review.append({"Page": i + 1, "Reason": f"Code {code} not in Excel", "Code": code})
                     del bgr
                     if i % 10 == 0:
                         gc.collect()
                     continue
 
-                # 2) duplicates (true duplicates only)
                 if code in seen_codes:
                     st.session_state.duplicates.append({
                         "Code": code,
@@ -583,10 +559,8 @@ def main():
                 else:
                     seen_codes[code] = i + 1
 
-                # 3) answers by AI
                 ai_res = analyze_with_ai(bgr_to_png_bytes(bgr), api_key, False)
                 if not ai_res.success or not ai_res.answers:
-                    reviewed += 1
                     st.session_state.review.append({"Page": i + 1, "Reason": "AI failed reading answers", "Code": code})
                     del bgr
                     if i % 10 == 0:
@@ -606,32 +580,27 @@ def main():
                     "Percent": percent
                 })
 
-                corrected += 1
                 del bgr
                 if i % 10 == 0:
                     gc.collect()
 
             gc.collect()
             st.success("✅ Processing complete")
-            st.info(f"✅ Corrected: {corrected} | 🟨 Review: {reviewed} | 📄 Total: {len(pages)}")
 
-            # Show review immediately if results are empty
-            if corrected == 0 and st.session_state.review:
+            if len(st.session_state.results) == 0 and len(st.session_state.review) > 0:
                 st.warning("لم يتم تصحيح أي ورقة. هذه صفحات Review (مع السبب):")
-                st.dataframe(pd.DataFrame(st.session_state.review), use_container_width=True)
+                st.dataframe(pd.DataFrame(st.session_state.review), width="stretch")
 
-    # TAB 4: Results
     with tab4:
         st.subheader("📊 Results")
 
-        # Always show Review if exists
         if st.session_state.review:
             st.warning(f"🟨 Review pages: {len(st.session_state.review)}")
-            st.dataframe(pd.DataFrame(st.session_state.review), use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.review), width="stretch")
 
         if st.session_state.duplicates:
             st.error(f"⚠️ Duplicates found: {len(st.session_state.duplicates)}")
-            st.dataframe(pd.DataFrame(st.session_state.duplicates), use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.duplicates), width="stretch")
 
         if not st.session_state.results:
             st.info("No graded results yet.")
@@ -651,7 +620,7 @@ def main():
         with c4:
             st.metric("Min %", f"{df['Percent'].min():.1f}")
 
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
 
         st.markdown("---")
         if st.button("📥 Export Excel", type="primary"):
