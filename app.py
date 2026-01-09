@@ -145,31 +145,7 @@ def analyze_with_ai(image_bytes, api_key, is_answer_key=True):
         image_b64 = base64.b64encode(image_bytes).decode('utf-8')
         
         if is_answer_key:
-            prompt = """Read the ANSWER KEY sheet carefully.
-
-This is the CORRECT ANSWERS sheet (not a student sheet).
-It shows the right answer for each question.
-
-There are 10 questions, each with 4 choices: A, B, C, D
-One bubble is filled for each question - that's the correct answer.
-
-Read the filled bubble for each question (1-10).
-
-RESPOND WITH JSON ONLY:
-{
-  "answers": {
-    "1": "C",
-    "2": "B",
-    "3": "A",
-    "4": "D",
-    "5": "A",
-    "6": "C",
-    "7": "B",
-    "8": "D",
-    "9": "A",
-    "10": "B"
-  }
-}"""
+            prompt = "اقرأ Answer Key. JSON فقط: {\"answers\": {\"1\": \"C\", ...}}"
         else:
             prompt = """You are an expert OMR (Optical Mark Recognition) system. Read this student answer sheet with EXTREME precision.
 
