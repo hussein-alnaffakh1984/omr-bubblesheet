@@ -2,7 +2,7 @@
 🤖 AI OMR - Scalable Version for Large Classes (500-700 students)
 معالجة قابلة للتوسع للأعداد الكبيرة
 """
-import io, base64, time, gc
+import io, base64, time, gc, re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import cv2, numpy as np, pandas as pd
@@ -10,6 +10,13 @@ import streamlit as st
 from pdf2image import convert_from_bytes
 from PIL import Image
 from datetime import datetime
+
+# OCR for code extraction
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except:
+    HAS_TESSERACT = False
 
 # Same helper functions...
 def read_bytes(f):
@@ -33,6 +40,75 @@ def pil_to_bgr(pil_img):
 def bgr_to_bytes(bgr):
     _, buffer = cv2.imencode('.png', bgr, [cv2.IMWRITE_PNG_COMPRESSION, 6])  # Higher compression
     return buffer.tobytes()
+
+# OCR-based code extraction
+def extract_code_with_ocr(bgr_image):
+    """Extract 4-digit code using OCR (more accurate for numbers)"""
+    if not HAS_TESSERACT:
+        return None, 0
+    
+    try:
+        h, w = bgr_image.shape[:2]
+        
+        # ROI for code area (top-left section)
+        y1, y2 = int(0.145 * h), int(0.285 * h)
+        x1, x2 = int(0.080 * w), int(0.440 * w)
+        roi = bgr_image[y1:y2, x1:x2].copy()
+        
+        # Preprocess
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        gray = clahe.apply(gray)
+        gray = cv2.GaussianBlur(gray, (3,3), 0)
+        
+        # Try multiple thresholds
+        variants = []
+        
+        # Otsu inverse
+        _, th1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        variants.append(th1)
+        
+        # Adaptive mean
+        th2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                    cv2.THRESH_BINARY_INV, 31, 7)
+        variants.append(th2)
+        
+        # Adaptive gaussian
+        th3 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY_INV, 31, 7)
+        variants.append(th3)
+        
+        best_code = None
+        best_score = -999
+        
+        for variant in variants:
+            # Upscale for better OCR
+            big = cv2.resize(variant, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+            
+            # OCR with digit whitelist
+            config = "--psm 7 -c tessedit_char_whitelist=0123456789"
+            text = pytesseract.image_to_string(big, config=config).strip()
+            
+            # Extract 4-digit codes
+            codes = re.findall(r'\b(1[0-9]{3})\b', text)
+            
+            if codes:
+                code = codes[0]
+                code_int = int(code)
+                
+                # Score based on validity
+                score = 50  # base score
+                if 1000 <= code_int <= 1999:
+                    score += 50
+                
+                if score > best_score:
+                    best_code = code
+                    best_score = score
+        
+        return best_code, best_score
+    
+    except Exception as e:
+        return None, 0
 
 @dataclass
 class AIResult:
@@ -349,6 +425,21 @@ def main():
             auto_continue = st.checkbox("🔄 Auto-continue", value=False, help="⚠️ أطفئه لو في مشاكل ذاكرة")
         
         st.markdown("---")
+        
+        # Code extraction method
+        code_method = st.radio(
+            "🔢 طريقة قراءة الأكواد:",
+            options=[
+                "🤖 AI (Claude Vision) - أبطأ وأغلى",
+                "📸 OCR (Tesseract) - أسرع ومجاني ✅"
+            ] if HAS_TESSERACT else ["🤖 AI (Claude Vision)"],
+            index=1 if HAS_TESSERACT else 0,
+            help="OCR أدق للأرقام ومجاني!"
+        )
+        
+        use_ocr = "OCR" in code_method
+        
+        st.markdown("---")
         st.subheader("🔍 إدارة التكرارات")
         
         dup_mode = st.radio(
@@ -411,26 +502,45 @@ def main():
                         
                         # Convert and compress immediately
                         bgr = pil_to_bgr(page)
-                        img = bgr_to_bytes(bgr)
+                        
+                        # Extract code (OCR or AI)
+                        if use_ocr:
+                            code, ocr_score = extract_code_with_ocr(bgr)
+                            if not code or ocr_score < 80:
+                                st.warning(f"⚠️ Page {i+1}: OCR failed, trying AI...")
+                                # Fallback to AI
+                                img = bgr_to_bytes(bgr)
+                                res = analyze_with_ai(img, api_key, False)
+                                if res.success and res.student_code:
+                                    code = res.student_code.strip()
+                                else:
+                                    st.warning(f"⚠️ Page {i+1}: Both OCR and AI failed")
+                                    continue
+                            else:
+                                # OCR success - use AI only for answers
+                                img = bgr_to_bytes(bgr)
+                                res = analyze_with_ai(img, api_key, False)
+                                if not res.success:
+                                    st.warning(f"⚠️ Page {i+1}: AI failed to read answers")
+                                    continue
+                                # Use OCR code + AI answers
+                                res.student_code = code
+                        else:
+                            # Full AI approach
+                            img = bgr_to_bytes(bgr)
+                            res = analyze_with_ai(img, api_key, False)
+                            if not res.success or not res.student_code:
+                                st.warning(f"⚠️ Page {i+1}: AI failed")
+                                continue
+                            code = res.student_code.strip()
                         
                         # Free memory immediately
                         del page
                         del bgr
                         
-                        res = analyze_with_ai(img, api_key, False)
-                        
-                        # Free image bytes
-                        del img
-                        
                         # Force garbage collection every 10 pages
                         if (i - current) % 10 == 0:
                             gc.collect()
-                        
-                        if not res.success or not res.student_code:
-                            st.warning(f"⚠️ Page {i+1}: Failed to read")
-                            continue
-                        
-                        code = res.student_code.strip()
                         
                         # Strict validation
                         if not code.isdigit():
