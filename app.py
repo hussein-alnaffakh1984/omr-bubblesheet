@@ -504,10 +504,13 @@ def main():
                         bgr = pil_to_bgr(page)
                         
                         # Extract code (OCR or AI)
+                        img = None  # Initialize
+                        res = None
+                        
                         if use_ocr:
                             code, ocr_score = extract_code_with_ocr(bgr)
                             if not code or ocr_score < 80:
-                                st.warning(f"⚠️ Page {i+1}: OCR failed, trying AI...")
+                                st.warning(f"⚠️ Page {i+1}: OCR failed (score: {ocr_score}), trying AI...")
                                 # Fallback to AI
                                 img = bgr_to_bytes(bgr)
                                 res = analyze_with_ai(img, api_key, False)
@@ -515,6 +518,7 @@ def main():
                                     code = res.student_code.strip()
                                 else:
                                     st.warning(f"⚠️ Page {i+1}: Both OCR and AI failed")
+                                    del page, bgr
                                     continue
                             else:
                                 # OCR success - use AI only for answers
@@ -522,6 +526,7 @@ def main():
                                 res = analyze_with_ai(img, api_key, False)
                                 if not res.success:
                                     st.warning(f"⚠️ Page {i+1}: AI failed to read answers")
+                                    del page, bgr
                                     continue
                                 # Use OCR code + AI answers
                                 res.student_code = code
@@ -531,6 +536,7 @@ def main():
                             res = analyze_with_ai(img, api_key, False)
                             if not res.success or not res.student_code:
                                 st.warning(f"⚠️ Page {i+1}: AI failed")
+                                del page, bgr
                                 continue
                             code = res.student_code.strip()
                         
@@ -597,8 +603,11 @@ def main():
                         
                         status.text(f"✅ Page {i+1}: {code} - {student.name} ({score}/{total_q})")
                         
-                        # Free memory
-                        del page, bgr, img
+                        # Free memory (img might not exist in OCR-only path)
+                        try:
+                            del img
+                        except:
+                            pass
                     
                     st.session_state.current_file_idx = end
                     
