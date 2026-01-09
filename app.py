@@ -1,384 +1,549 @@
 """
-🤖 AI OMR - Scalable Version for Large Classes (500-700 students)
-معالجة قابلة للتوسع للأعداد الكبيرة
+Template-Free (General) Bubble Sheet Reader
+- Works without hardcoding "60/70/95" or fixed coordinates.
+- Detects bubbles, groups them into rows/columns, separates:
+  1) Student code blocks (vertical stacks of ~10 bubbles: 0..9)
+  2) Answer blocks (rows with ~4/5 bubbles per question)
+- Outputs per page:
+  - student_code (best-effort)
+  - answers list (e.g., ['B','D','', ...])
+  - confidence flags
+
+Tested idea: run on your PDFs (e.g., "التجميل.pdf", "قسم التخدير.pdf", ...).
+You may need to tune only a few thresholds depending on scan quality.
+
+Install (if needed):
+  pip install opencv-python numpy pymupdf pandas
 """
-import io, base64, time, gc
+
+import os
+import math
+import cv2
+import fitz  # PyMuPDF
+import numpy as np
+import pandas as pd
 from dataclasses import dataclass
-from typing import Dict, List, Optional
-import cv2, numpy as np, pandas as pd
-import streamlit as st
-from pdf2image import convert_from_bytes
-from PIL import Image
-from datetime import datetime
+from typing import List, Tuple, Dict, Optional
 
-# Same helper functions...
-def read_bytes(f):
-    if not f: return b""
-    try: return f.getbuffer().tobytes()
-    except: 
-        try: return f.read()
-        except: return b""
 
-def load_pages(file_bytes, filename, dpi=150):
-    """Load pages with aggressive memory management"""
-    if filename.lower().endswith(".pdf"):
-        pages = convert_from_bytes(file_bytes, dpi=dpi, fmt='jpeg', jpegopt={'quality': 85, 'optimize': True})
-        return [p.convert("RGB") for p in pages]
-    return [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
+# -----------------------------
+# PDF -> images
+# -----------------------------
+def pdf_to_images(pdf_path: str, zoom: float = 2.5) -> List[np.ndarray]:
+    """
+    Render each PDF page into a BGR image using PyMuPDF.
+    zoom=2.5 ~ 180-220 dpi-ish depending on original.
+    """
+    doc = fitz.open(pdf_path)
+    imgs = []
+    mat = fitz.Matrix(zoom, zoom)
+    for i in range(len(doc)):
+        pix = doc.load_page(i).get_pixmap(matrix=mat, alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        imgs.append(img[:, :, ::-1].copy())  # RGB->BGR
+    return imgs
 
-def pil_to_bgr(pil_img):
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-def bgr_to_bytes(bgr):
-    _, buffer = cv2.imencode('.png', bgr, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-    return buffer.tobytes()
-
+# -----------------------------
+# Utilities
+# -----------------------------
 @dataclass
-class AIResult:
-    answers: Dict
-    confidence: str
-    notes: List
-    success: bool
-    student_code: Optional[str] = None
+class Bubble:
+    x: float
+    y: float
+    r: float
+    bbox: Tuple[int, int, int, int]  # (x,y,w,h)
 
-@dataclass
-class StudentRecord:
-    student_id: str
-    name: str
-    code: str
 
-@dataclass
-class GradingResult:
-    student_id: str
-    name: str
-    detected_code: str
-    score: int
-    total: int
-    page_number: int = 0
+def _adaptive_bin(gray: np.ndarray) -> np.ndarray:
+    # Strong binarization for scanned sheets
+    # Invert: bubbles become white-ish / easier for contour detection after cleaning
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    th = cv2.adaptiveThreshold(
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 8
+    )
+    return th
 
-def analyze_with_ai(image_bytes, api_key, is_answer_key=True):
-    """AI Analysis - optimized"""
-    if not api_key or len(api_key) < 20:
-        return AIResult({}, "no_api", ["API Key required"], False)
-    
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        
-        image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        if is_answer_key:
-            prompt = "اقرأ Answer Key. JSON فقط: {\"answers\": {\"1\": \"C\", ...}}"
+
+def _find_bubbles(bin_img: np.ndarray) -> List[Bubble]:
+    """
+    Detect circular-ish contours, return bubble candidates.
+    """
+    # Clean tiny noise / connect broken circles slightly
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    cleaned = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, kernel, iterations=1)
+    cleaned = cv2.dilate(cleaned, kernel, iterations=1)
+
+    cnts, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bubbles = []
+
+    areas = [cv2.contourArea(c) for c in cnts]
+    if not areas:
+        return bubbles
+
+    # Robust area band (ignore huge/very small)
+    a = np.array(areas, dtype=np.float32)
+    a_med = float(np.median(a))
+    a_lo = max(20.0, 0.25 * a_med)
+    a_hi = 6.0 * a_med
+
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < a_lo or area > a_hi:
+            continue
+
+        x, y, w, h = cv2.boundingRect(c)
+        if w < 6 or h < 6:
+            continue
+
+        # circularity / aspect
+        ar = w / float(h)
+        if ar < 0.7 or ar > 1.35:
+            continue
+
+        per = cv2.arcLength(c, True)
+        if per <= 0:
+            continue
+        circ = (4.0 * math.pi * area) / (per * per)  # 1.0 ideal circle
+        if circ < 0.45:
+            continue
+
+        r = 0.5 * (w + h) / 2.0
+        bubbles.append(Bubble(x + w / 2.0, y + h / 2.0, r, (x, y, w, h)))
+
+    return bubbles
+
+
+def _cluster_1d(vals: np.ndarray, tol: float) -> List[List[int]]:
+    """
+    Cluster indices by proximity on 1D axis.
+    vals: shape (N,) floats
+    tol: max distance to be in same cluster
+    """
+    if len(vals) == 0:
+        return []
+    order = np.argsort(vals)
+    clusters = []
+    cur = [int(order[0])]
+    for idx in order[1:]:
+        idx = int(idx)
+        if abs(vals[idx] - vals[cur[-1]]) <= tol:
+            cur.append(idx)
         else:
-            prompt = """أنت نظام OMR خبير. اقرأ ورقة الطالب بدقة.
+            clusters.append(cur)
+            cur = [idx]
+    clusters.append(cur)
+    return clusters
 
-━━━━━━━━━━━━━━━━━━━━━━
-📋 الكود (4 أرقام بالضبط)
-━━━━━━━━━━━━━━━━━━━━━━
 
-الكود في أعلى الورقة - شبكة أرقام.
-اقرأ **4 صفوف فقط** - كل صف = رقم واحد.
-النطاق الصحيح: **1000-1057**
+def _estimate_spacing(bubbles: List[Bubble]) -> Dict[str, float]:
+    """
+    Estimate typical bubble radius and typical x/y neighbor spacing.
+    """
+    rs = np.array([b.r for b in bubbles], dtype=np.float32)
+    r_med = float(np.median(rs)) if len(rs) else 10.0
 
-مثال صحيح:
-الصف 1: "1" → 1
-الصف 2: "0" → 0
-الصف 3: "1" → 1
-الصف 4: "3" → 3
-الكود = "1013" ✅
+    xs = np.sort(np.array([b.x for b in bubbles], dtype=np.float32))
+    ys = np.sort(np.array([b.y for b in bubbles], dtype=np.float32))
 
-❌ تجنب:
-- أكثر من 4 أرقام
-- أقل من 4 أرقام
-- أكواد خارج النطاق 1000-1057
+    def median_diff(arr):
+        if len(arr) < 2:
+            return 20.0
+        d = np.diff(arr)
+        d = d[d > 1.0]
+        return float(np.median(d)) if len(d) else 20.0
 
-━━━━━━━━━━━━━━━━━━━━━━
-📋 الإجابات
-━━━━━━━━━━━━━━━━━━━━━━
+    dx = median_diff(xs)
+    dy = median_diff(ys)
 
-**القاعدة 1 - X يلغي الفقاعة (أولوية قصوى!):**
-Q1: [●X] A [●] B [ ] C [ ] D
-     ملغ    ✓
-→ احذف A (عليها X)
-→ الإجابة: B ✅
+    # Clamp to sane
+    dx = max(10.0, min(dx, 200.0))
+    dy = max(10.0, min(dy, 200.0))
 
-**القاعدة 2 - فقاعة واحدة:**
-Q2: [ ] A [●] B [ ] C [ ] D
-→ الإجابة: B ✅
+    return {"r": r_med, "dx": dx, "dy": dy}
 
-**القاعدة 3 - أكثر من فقاعة:**
-Q3: [●●] A [●] B [ ] C [ ] D
-     أكثر   أقل
-     قتامة  قتامة
-→ الإجابة: A (الأكثر قتامة) ✅
 
-**خوارزمية:**
-1. احذف أي فقاعة عليها X
-2. من المتبقي: اختر الأكثر قتامة
-3. إذا لا شيء: "?"
+def _roi_fill_score(gray: np.ndarray, bubble: Bubble) -> float:
+    """
+    Compute fill score inside bubble area.
+    Higher = more filled/darker.
+    Uses a circular mask; compares dark pixels ratio.
+    """
+    x, y, w, h = bubble.bbox
+    pad = int(max(2, bubble.r * 0.25))
+    x0 = max(0, x - pad); y0 = max(0, y - pad)
+    x1 = min(gray.shape[1], x + w + pad); y1 = min(gray.shape[0], y + h + pad)
 
-JSON فقط:
-{"student_code": "1013", "answers": {"1": "C", "2": "B", ...}}"""
-        
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1500,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-        )
-        
-        response_text = message.content[0].text
-        
-        import json, re
-        json_text = response_text
-        if "```json" in response_text:
-            json_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            json_text = response_text.split("```")[1].split("```")[0].strip()
-        
-        try:
-            result = json.loads(json_text)
-        except:
-            match = re.search(r'\{[\s\S]*\}', response_text)
-            if match: result = json.loads(match.group())
-            else: raise ValueError("No JSON")
-        
-        answers = {int(k): v for k, v in result.get("answers", {}).items()}
-        student_code = result.get("student_code") if not is_answer_key else None
-        
-        return AIResult(answers, result.get("confidence", "medium"), result.get("notes", []), True, student_code)
-    
-    except Exception as e:
-        return AIResult({}, "error", [str(e)], False)
+    patch = gray[y0:y1, x0:x1]
+    if patch.size == 0:
+        return 0.0
 
-def load_students_from_excel(file_bytes):
-    """Load students from Excel"""
-    try:
-        df = pd.read_excel(io.BytesIO(file_bytes))
-        id_col = name_col = code_col = None
-        for col in df.columns:
-            cl = str(col).lower().strip()
-            if 'id' in cl or 'رقم' in cl: id_col = col
-            elif 'name' in cl or 'اسم' in cl: name_col = col
-            elif 'code' in cl or 'كود' in cl or 'رمز' in cl: code_col = col
-        
-        if not all([id_col, name_col, code_col]):
-            return []
-        
-        students = []
-        for _, row in df.iterrows():
-            students.append(StudentRecord(str(row[id_col]), str(row[name_col]), str(row[code_col])))
-        return students
-    except Exception as e:
-        st.error(f"Excel error: {e}")
+    # local normalize
+    patch_blur = cv2.GaussianBlur(patch, (3, 3), 0)
+    # Otsu inside patch
+    _, th = cv2.threshold(patch_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # circle mask centered at bubble center within patch
+    cx = int(round(bubble.x - x0))
+    cy = int(round(bubble.y - y0))
+    rr = int(max(4, round(bubble.r * 0.75)))
+
+    mask = np.zeros_like(th, dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), rr, 255, -1)
+
+    # In TH (binary), ink is usually darker => 0. We want dark ratio.
+    inside = th[mask == 255]
+    if inside.size == 0:
+        return 0.0
+    dark_ratio = float(np.mean(inside == 0))
+    return dark_ratio
+
+
+# -----------------------------
+# Structure detection
+# -----------------------------
+@dataclass
+class CodeBlock:
+    cols: List[List[int]]  # list of columns (each is list of bubble indices)
+    bbox: Tuple[int, int, int, int]
+
+
+@dataclass
+class QuestionRow:
+    groups: List[List[int]]  # each group are bubble indices representing options for a question
+    y_mean: float
+
+
+def detect_code_blocks(bubbles: List[Bubble], tol_x: float, tol_y: float) -> List[CodeBlock]:
+    """
+    Find student-code like blocks:
+      - several vertical columns
+      - each column has about 10 bubbles stacked with regular y spacing
+    """
+    if not bubbles:
         return []
 
-def find_student_by_code(students, code):
-    """Find student with flexible matching"""
-    code_norm = str(code).strip().replace(" ", "").replace("-", "")
-    for s in students:
-        s_code = str(s.code).strip().replace(" ", "").replace("-", "")
-        if s_code == code_norm: return s
-    
-    if len(code_norm) > 4:
-        for length in [4, 5, 6]:
-            if len(code_norm) >= length:
-                prefix = code_norm[:length]
-                for s in students:
-                    s_code = str(s.code).strip().replace(" ", "").replace("-", "")
-                    if s_code == prefix: return s
-    return None
+    xs = np.array([b.x for b in bubbles], dtype=np.float32)
+    x_clusters = _cluster_1d(xs, tol=tol_x)
 
-def grade_student(student_answers, answer_key):
-    """Grade student"""
-    score = sum(1 for q in answer_key.keys() if student_answers.get(q) == answer_key[q])
-    return score, len(answer_key)
+    # Candidate columns are x-clusters with ~10 bubbles
+    candidate_cols = []
+    for col in x_clusters:
+        if 7 <= len(col) <= 13:
+            # check if y spread is large enough and roughly monotonic
+            ys = np.array([bubbles[i].y for i in col], dtype=np.float32)
+            ys_sorted = np.sort(ys)
+            if (ys_sorted[-1] - ys_sorted[0]) < 6 * tol_y:
+                continue
+            candidate_cols.append(sorted(col, key=lambda i: bubbles[i].y))
 
-def export_results(results):
-    """Export to Excel - minimal format"""
-    data = [{
-        "Page": r.page_number,
-        "ID": r.student_id, 
-        "Name": r.name, 
-        "Code": r.detected_code, 
-        "Score": r.score
-    } for r in results]
-    
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame(data).to_excel(writer, sheet_name='Results', index=False)
-    return output.getvalue()
+    # Group nearby columns into blocks by x proximity
+    blocks = []
+    if not candidate_cols:
+        return blocks
 
-def main():
-    st.set_page_config(page_title="🤖 AI OMR", layout="wide")
-    st.title("🤖 نظام OMR للأعداد الكبيرة")
-    st.markdown("### 📊 500-700 طالب بدون مشاكل!")
-    
-    if 'answer_key' not in st.session_state: st.session_state.answer_key = {}
-    if 'students' not in st.session_state: st.session_state.students = []
-    if 'results' not in st.session_state: st.session_state.results = []
-    if 'processed_pages' not in st.session_state: st.session_state.processed_pages = set()
-    
-    with st.sidebar:
-        st.header("⚙️ الإعدادات")
-        api_key = ""
-        try:
-            api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-            if api_key: st.success("✅ API Key")
-        except: pass
-        if not api_key:
-            api_key = st.text_input("🔑 API Key", type="password")
-        
-        st.markdown("---")
-        st.metric("Answer Key", f"{len(st.session_state.answer_key)} Q")
-        st.metric("Students", len(st.session_state.students))
-        st.metric("Graded", len(st.session_state.results))
-        
-        if st.session_state.results:
-            avg = np.mean([r.score/r.total*100 for r in st.session_state.results])
-            st.metric("Average", f"{avg:.1f}%")
-        
-        if st.button("🔄 Reset All"):
-            st.session_state.answer_key = {}
-            st.session_state.results = []
-            st.session_state.processed_pages = set()
-            st.rerun()
-    
-    tab1, tab2, tab3, tab4 = st.tabs(["1️⃣ Answer Key", "2️⃣ Students", "3️⃣ Grade", "4️⃣ Results"])
-    
-    with tab1:
-        st.subheader("📝 Answer Key")
-        key_file = st.file_uploader("Upload Answer Key", type=["pdf","png","jpg"], key="key")
-        if key_file:
-            if st.button("🤖 Analyze", type="primary"):
-                if not api_key: 
-                    st.error("❌ Need API Key")
-                else:
-                    with st.spinner("Analyzing..."):
-                        b = read_bytes(key_file)
-                        pages = load_pages(b, key_file.name, 200)
-                        if pages:
-                            img = bgr_to_bytes(pil_to_bgr(pages[0]))
-                            res = analyze_with_ai(img, api_key, True)
-                            if res.success:
-                                st.session_state.answer_key = res.answers
-                                st.success(f"✅ {len(res.answers)} questions")
-                            else: st.error("Failed")
-        
-        if st.session_state.answer_key:
-            st.info(" | ".join([f"Q{q}: {a}" for q, a in sorted(st.session_state.answer_key.items())]))
-    
-    with tab2:
-        st.subheader("👥 Students")
-        excel = st.file_uploader("Upload Excel (ID, Name, Code)", type=["xlsx","xls"], key="excel")
-        if excel and st.button("📊 Load"):
-            students = load_students_from_excel(read_bytes(excel))
-            if students:
-                st.session_state.students = students
-                st.success(f"✅ {len(students)} students")
-        
-        if st.session_state.students:
-            st.info(f"Loaded: {len(st.session_state.students)} students")
-    
-    with tab3:
-        st.subheader("✅ Grading")
-        
-        if not st.session_state.answer_key:
-            st.warning("⚠️ Load Answer Key first")
-            return
-        if not st.session_state.students:
-            st.warning("⚠️ Load Students first")
-            return
-        
-        sheets = st.file_uploader("Upload PDF (⚠️ Max 50 pages)", type=["pdf"], key="sheets")
-        
-        batch_size = st.slider("📦 Batch size", 5, 20, 10)
-        
-        if sheets and 'current_file_pages' not in st.session_state:
-            if st.button("🔍 Load File"):
-                with st.spinner("Loading..."):
-                    b = read_bytes(sheets)
-                    pages = load_pages(b, sheets.name, 200)
-                    st.session_state.current_file_pages = pages
-                    st.session_state.current_file_idx = 0
-                    st.success(f"✅ {len(pages)} pages")
-        
-        if 'current_file_pages' in st.session_state:
-            pages = st.session_state.current_file_pages
-            current = st.session_state.current_file_idx
-            total = len(pages)
-            
-            if current < total:
-                if st.button(f"🚀 Process {min(batch_size, total-current)}", type="primary"):
-                    end = min(current + batch_size, total)
-                    
-                    for i in range(current, end):
-                        if i in st.session_state.processed_pages:
-                            continue
-                        
-                        page = pages[i]
-                        bgr = pil_to_bgr(page)
-                        img = bgr_to_bytes(bgr)
-                        
-                        res = analyze_with_ai(img, api_key, False)
-                        
-                        if not res.success or not res.student_code:
-                            st.warning(f"⚠️ Page {i+1}: Failed")
-                            continue
-                        
-                        code = res.student_code.strip()
-                        
-                        if not code.isdigit() or len(code) != 4:
-                            st.warning(f"⚠️ Page {i+1}: Bad code '{code}'")
-                            continue
-                        
-                        student = find_student_by_code(st.session_state.students, code)
-                        if not student:
-                            st.warning(f"⚠️ Page {i+1}: Code {code} not found")
-                            continue
-                        
-                        score, total_q = grade_student(res.answers, st.session_state.answer_key)
-                        
-                        st.session_state.results.append(GradingResult(
-                            student.student_id, student.name, code, score, total_q, i+1
-                        ))
-                        
-                        st.session_state.processed_pages.add(i)
-                        st.success(f"✅ Page {i+1}: {code} - {student.name} ({score}/{total_q})")
-                    
-                    st.session_state.current_file_idx = end
-                    
-                    if end >= total:
-                        del st.session_state.current_file_pages
-                        del st.session_state.current_file_idx
-                        gc.collect()
-    
-    with tab4:
-        st.subheader("📊 Results")
-        
-        if not st.session_state.results:
-            st.info("No results yet")
-            return
-        
-        df = pd.DataFrame([{
-            "Page": r.page_number,
-            "ID": r.student_id, 
-            "Name": r.name, 
-            "Code": r.detected_code,
-            "Score": r.score
-        } for r in st.session_state.results])
-        
-        st.dataframe(df)
-        
-        if st.button("📥 Export Excel", type="primary"):
-            excel = export_results(st.session_state.results)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button("⬇️ Download", excel, f"results_{ts}.xlsx")
+    col_centers = np.array([np.mean([bubbles[i].x for i in col]) for col in candidate_cols], dtype=np.float32)
+    col_order = np.argsort(col_centers)
 
+    cur_cols = [candidate_cols[int(col_order[0])]]
+    for k in col_order[1:]:
+        k = int(k)
+        if abs(col_centers[k] - np.mean([bubbles[i].x for i in cur_cols[-1]])) <= 2.5 * tol_x:
+            cur_cols.append(candidate_cols[k])
+        else:
+            blocks.append(cur_cols)
+            cur_cols = [candidate_cols[k]]
+    blocks.append(cur_cols)
+
+    code_blocks = []
+    for cols in blocks:
+        # Must have at least 2 columns for a "code" region (common)
+        if len(cols) < 2:
+            continue
+
+        xs_all, ys_all = [], []
+        for col in cols:
+            for i in col:
+                xs_all.append(bubbles[i].x)
+                ys_all.append(bubbles[i].y)
+
+        x0 = int(max(0, min(xs_all) - 3 * tol_x))
+        y0 = int(max(0, min(ys_all) - 3 * tol_y))
+        x1 = int(max(xs_all) + 3 * tol_x)
+        y1 = int(max(ys_all) + 3 * tol_y)
+
+        code_blocks.append(CodeBlock(cols=cols, bbox=(x0, y0, x1 - x0, y1 - y0)))
+
+    # Sort by "upper-right-ish" priority (common in many sheets)
+    code_blocks.sort(key=lambda b: (b.bbox[1], -b.bbox[0]))
+    return code_blocks
+
+
+def detect_question_rows(bubbles: List[Bubble], exclude_bboxes: List[Tuple[int, int, int, int]], tol_y: float, tol_x: float) -> List[QuestionRow]:
+    """
+    Find rows of bubbles (questions) outside code blocks.
+    Then split row bubbles into option-groups (each group ~4-5 bubbles).
+    """
+    if not bubbles:
+        return []
+
+    def in_any_bbox(b: Bubble) -> bool:
+        for (x, y, w, h) in exclude_bboxes:
+            if x <= b.x <= x + w and y <= b.y <= y + h:
+                return True
+        return False
+
+    idxs = [i for i, b in enumerate(bubbles) if not in_any_bbox(b)]
+    if not idxs:
+        return []
+
+    ys = np.array([bubbles[i].y for i in idxs], dtype=np.float32)
+    # Cluster by y to form rows
+    # tol_y should be around 0.6~1.0 of typical y spacing
+    row_clusters_local = _cluster_1d(ys, tol=tol_y)
+
+    rows: List[QuestionRow] = []
+    for cluster in row_clusters_local:
+        row_idxs = [idxs[i] for i in cluster]
+        if len(row_idxs) < 3:
+            continue
+
+        # Sort by x
+        row_idxs = sorted(row_idxs, key=lambda i: bubbles[i].x)
+        y_mean = float(np.mean([bubbles[i].y for i in row_idxs]))
+
+        # Split into groups by x gaps
+        xs_row = np.array([bubbles[i].x for i in row_idxs], dtype=np.float32)
+        gaps = np.diff(xs_row)
+        if len(gaps) == 0:
+            continue
+        # A "big gap" likely separates question groups or columns
+        gap_thr = max(2.2 * tol_x, float(np.median(gaps) * 2.5))
+
+        groups = []
+        cur = [row_idxs[0]]
+        for j in range(1, len(row_idxs)):
+            if (bubbles[row_idxs[j]].x - bubbles[cur[-1]].x) > gap_thr:
+                groups.append(cur)
+                cur = [row_idxs[j]]
+            else:
+                cur.append(row_idxs[j])
+        groups.append(cur)
+
+        # Keep groups that look like options: 3..6 bubbles (common 4 or 5)
+        groups = [g for g in groups if 3 <= len(g) <= 6]
+        if not groups:
+            continue
+
+        rows.append(QuestionRow(groups=groups, y_mean=y_mean))
+
+    # sort rows top to bottom
+    rows.sort(key=lambda r: r.y_mean)
+    return rows
+
+
+# -----------------------------
+# Decode code + answers
+# -----------------------------
+def decode_student_code(gray: np.ndarray, bubbles: List[Bubble], code_block: CodeBlock) -> Tuple[str, Dict]:
+    """
+    For each column, pick the most filled bubble -> digit (0..9)
+    Returns code string and debug info.
+    """
+    digits = []
+    debug = {"cols": []}
+
+    for col in code_block.cols:
+        # Sort by y ascending; assume digits 0..9 in order top->bottom (common)
+        col_sorted = sorted(col, key=lambda i: bubbles[i].y)
+        scores = [(_roi_fill_score(gray, bubbles[i])) for i in col_sorted]
+
+        # Best index
+        best_k = int(np.argmax(scores))
+        best_score = float(scores[best_k])
+
+        # Decide with thresholds:
+        # - require some minimum fill
+        # - require separation from 2nd best
+        s_sorted = sorted(scores, reverse=True)
+        second = float(s_sorted[1]) if len(s_sorted) > 1 else 0.0
+
+        # You can tune these:
+        min_fill = 0.22
+        min_margin = 0.08
+
+        if best_score < min_fill or (best_score - second) < min_margin:
+            digits.append("")  # uncertain/empty
+            debug["cols"].append({"scores": scores, "digit": None, "best": best_score, "second": second})
+        else:
+            # map position -> digit
+            # If column has 10 bubbles => positions 0..9
+            # If not exactly 10, map by rank to nearest digit indices
+            if len(col_sorted) == 10:
+                digit = best_k
+            else:
+                digit = int(round(best_k * 9 / max(1, (len(col_sorted) - 1))))
+            digits.append(str(digit))
+            debug["cols"].append({"scores": scores, "digit": digit, "best": best_score, "second": second})
+
+    code = "".join(digits).strip()
+    if code == "":
+        code = "UNKNOWN"
+    return code, debug
+
+
+def decode_answers(gray: np.ndarray, bubbles: List[Bubble], rows: List[QuestionRow], option_labels: str = "ABCDE") -> Tuple[List[str], Dict]:
+    """
+    For each question-group in each row: pick the most filled bubble -> label
+    If uncertain or multiple: return "" or "MULTI"
+    """
+    answers = []
+    dbg = {"questions": []}
+
+    # Tuning
+    min_fill = 0.22
+    min_margin = 0.08
+    multi_margin = 0.03  # if top two are too close, call ambiguous
+
+    q_index = 0
+    for r in rows:
+        for g in r.groups:
+            g_sorted = sorted(g, key=lambda i: bubbles[i].x)  # options left->right
+            scores = [(_roi_fill_score(gray, bubbles[i])) for i in g_sorted]
+
+            best = int(np.argmax(scores))
+            best_score = float(scores[best])
+            s_sorted = sorted(scores, reverse=True)
+            second = float(s_sorted[1]) if len(s_sorted) > 1 else 0.0
+
+            if best_score < min_fill:
+                ans = ""  # blank
+                flag = "BLANK_OR_WEAK"
+            elif (best_score - second) < multi_margin:
+                ans = "AMB"  # ambiguous
+                flag = "AMBIGUOUS"
+            elif (best_score - second) < min_margin:
+                ans = "AMB"
+                flag = "LOW_MARGIN"
+            else:
+                ans = option_labels[best] if best < len(option_labels) else str(best)
+                flag = "OK"
+
+            answers.append(ans)
+            dbg["questions"].append({
+                "q": q_index + 1,
+                "scores": scores,
+                "best": best_score,
+                "second": second,
+                "flag": flag
+            })
+            q_index += 1
+
+    return answers, dbg
+
+
+# -----------------------------
+# Main pipeline per page
+# -----------------------------
+def process_page(page_bgr: np.ndarray) -> Dict:
+    gray = cv2.cvtColor(page_bgr, cv2.COLOR_BGR2GRAY)
+    bin_img = _adaptive_bin(gray)
+    bubbles = _find_bubbles(bin_img)
+
+    if len(bubbles) < 20:
+        return {
+            "student_code": "UNKNOWN",
+            "num_questions": 0,
+            "answers": [],
+            "flags": ["TOO_FEW_BUBBLES"],
+            "debug": {"bubbles_found": len(bubbles)}
+        }
+
+    spacing = _estimate_spacing(bubbles)
+    r = spacing["r"]
+    tol_x = max(8.0, 0.85 * spacing["dx"])
+    tol_y = max(8.0, 0.85 * spacing["dy"])
+
+    # 1) Detect code blocks
+    code_blocks = detect_code_blocks(bubbles, tol_x=tol_x, tol_y=tol_y)
+    exclude = [cb.bbox for cb in code_blocks[:1]]  # use best block only; you can expand later
+
+    # 2) Detect question rows (excluding code bbox)
+    rows = detect_question_rows(bubbles, exclude_bboxes=exclude, tol_y=tol_y, tol_x=tol_x)
+
+    flags = []
+    if not code_blocks:
+        flags.append("NO_CODE_BLOCK_FOUND")
+    if not rows:
+        flags.append("NO_QUESTION_ROWS_FOUND")
+
+    # 3) Decode
+    if code_blocks:
+        student_code, code_dbg = decode_student_code(gray, bubbles, code_blocks[0])
+    else:
+        student_code, code_dbg = "UNKNOWN", {}
+
+    answers, ans_dbg = decode_answers(gray, bubbles, rows, option_labels="ABCDE")
+
+    # 4) Consistency checks
+    # If too many ambiguous, suggest rescan
+    amb = sum(1 for a in answers if a in ("AMB",))
+    if len(answers) > 0 and amb / max(1, len(answers)) > 0.10:
+        flags.append("MANY_AMBIGUOUS_RESCan_SUGGESTED")
+
+    return {
+        "student_code": student_code,
+        "num_questions": len(answers),
+        "answers": answers,
+        "flags": flags,
+        "debug": {
+            "spacing": spacing,
+            "bubbles_found": len(bubbles),
+            "code_debug": code_dbg,
+            "answers_debug": ans_dbg,
+            "code_bbox": exclude[0] if exclude else None
+        }
+    }
+
+
+def process_pdf(pdf_path: str, out_csv: str = "results.csv") -> pd.DataFrame:
+    pages = pdf_to_images(pdf_path, zoom=2.5)
+
+    rows_out = []
+    for i, img in enumerate(pages):
+        res = process_page(img)
+        rows_out.append({
+            "file": os.path.basename(pdf_path),
+            "page": i + 1,
+            "student_code": res["student_code"],
+            "num_questions": res["num_questions"],
+            "answers": " ".join(res["answers"]),
+            "flags": ",".join(res["flags"])
+        })
+
+    df = pd.DataFrame(rows_out)
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    return df
+
+
+# -----------------------------
+# Run on your file(s)
+# -----------------------------
 if __name__ == "__main__":
-    main()
+    # Change this to your file path:
+    pdf_path = "التجميل.pdf"  # example
+    # Or use an absolute path:
+    # pdf_path = r"/mnt/data/التجميل.pdf"
+
+    if not os.path.exists(pdf_path):
+        # If you're in a notebook / server environment, your uploads may be in /mnt/data
+        alt = os.path.join("/mnt/data", pdf_path)
+        if os.path.exists(alt):
+            pdf_path = alt
+
+    df = process_pdf(pdf_path, out_csv="bubble_results.csv")
+    print(df.head(10))
+    print("\nSaved:", "bubble_results.csv")
