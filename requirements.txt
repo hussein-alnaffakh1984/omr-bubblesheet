@@ -1,8 +1,5 @@
-anthropic
-opencv-python-headless
-pillow
-pdf2image
+streamlit
+opencv-python
 numpy
 pandas
-openpyxl
-pytesseract
+pymupdf
