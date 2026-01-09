@@ -500,9 +500,8 @@ def main():
                         
                         code = res.student_code.strip()
                         
-                        # Free memory immediately
-                        del page
-                        del bgr
+                        # Free memory immediately after AI processing
+                        del page, bgr, img
                         
                         # Force garbage collection every 10 pages
                         if (i - current) % 10 == 0:
@@ -562,12 +561,6 @@ def main():
                         processed_count += 1
                         
                         status.text(f"✅ Page {i+1}: {code} - {student.name} ({score}/{total_q})")
-                        
-                        # Free memory (img might not exist in OCR-only path)
-                        try:
-                            del img
-                        except:
-                            pass
                     
                     st.session_state.current_file_idx = end
                     
