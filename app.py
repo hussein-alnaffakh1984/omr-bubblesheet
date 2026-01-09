@@ -262,10 +262,17 @@ RESPOND WITH JSON ONLY (no extra text):
         
         try:
             result = json.loads(json_text)
-        except:
+        except Exception as parse_error:
+            # Try to find JSON in response
             match = re.search(r'\{[\s\S]*\}', response_text)
-            if match: result = json.loads(match.group())
-            else: raise ValueError("No JSON")
+            if match:
+                try:
+                    result = json.loads(match.group())
+                except:
+                    # Return detailed error for debugging
+                    return AIResult({}, "error", [f"JSON parse failed: {str(parse_error)}", f"Response: {response_text[:200]}"], False)
+            else:
+                return AIResult({}, "error", [f"No JSON found in response: {response_text[:200]}"], False)
         
         answers = {int(k): v for k, v in result.get("answers", {}).items()}
         student_code = result.get("student_code") if not is_answer_key else None
@@ -395,7 +402,12 @@ def main():
                             if res.success:
                                 st.session_state.answer_key = res.answers
                                 st.success(f"✅ {len(res.answers)} questions")
-                            else: st.error("Failed")
+                            else:
+                                st.error(f"❌ Failed to read Answer Key")
+                                if res.notes:
+                                    with st.expander("🔍 Error Details"):
+                                        for note in res.notes:
+                                            st.code(note)
         
         if st.session_state.answer_key:
             st.info(" | ".join([f"Q{q}: {a}" for q, a in sorted(st.session_state.answer_key.items())]))
