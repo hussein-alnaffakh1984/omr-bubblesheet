@@ -1,4 +1,3 @@
-# app.py
 import io
 import math
 import numpy as np
@@ -13,14 +12,10 @@ except Exception:
     fitz = None
 
 
-# =========================
-# 0) Load PDF / Images
-# =========================
+# -------------------------
+# PDF/Image loader
+# -------------------------
 def load_pages(file_bytes: bytes, filename: str, zoom: float = 4.0):
-    """
-    Returns list of BGR images for each page.
-    zoom=4.0 IMPORTANT for thin outlines in PDF.
-    """
     name = (filename or "").lower()
     if name.endswith(".pdf"):
         if fitz is None:
@@ -44,9 +39,9 @@ def load_pages(file_bytes: bytes, filename: str, zoom: float = 4.0):
         return [img]
 
 
-# =========================
-# 1) Preprocess & Warp Page
-# =========================
+# -------------------------
+# Preprocess
+# -------------------------
 def preprocess_page(bgr: np.ndarray):
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -54,10 +49,10 @@ def preprocess_page(bgr: np.ndarray):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray2 = clahe.apply(gray)
 
+    # try warp by page contour (optional)
     thr = cv2.adaptiveThreshold(
         gray2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7
     )
-
     cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return bgr, gray2
@@ -70,7 +65,6 @@ def preprocess_page(bgr: np.ndarray):
         if len(approx) == 4:
             page = approx
             break
-
     if page is None:
         return bgr, gray2
 
@@ -103,19 +97,18 @@ def preprocess_page(bgr: np.ndarray):
     return warped, wgray
 
 
-# =========================
-# 2) Bubble Detection (Dual + Radius-band filter)
-# =========================
+# -------------------------
+# Bubble detection (dual + radius band)
+# -------------------------
 def detect_bubbles(gray: np.ndarray):
     H, W = gray.shape[:2]
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-    # ---- A) contours for filled marks
+    # A) contours
     thr = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7
     )
     thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-
     cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     bubblesA = []
@@ -138,18 +131,17 @@ def detect_bubbles(gray: np.ndarray):
         r = (w + h) / 4.0
         bubblesA.append((cx, cy, r))
 
-    # ---- B) Hough for thin outlines (reduce false circles)
+    # B) Hough
     circles = cv2.HoughCircles(
         gray,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
         minDist=20,
         param1=140,
-        param2=26,     # أعلى = دوائر أقل (أكثر دقة)
+        param2=26,
         minRadius=8,
         maxRadius=55,
     )
-
     bubblesB = []
     if circles is not None:
         circles = np.round(circles[0, :]).astype("int")
@@ -159,36 +151,27 @@ def detect_bubbles(gray: np.ndarray):
 
     bubbles = bubblesA + bubblesB
     if len(bubbles) == 0:
-        return np.zeros((0, 3), dtype=np.float32), thr, {"mode": "none", "r_med": 0.0}
+        return np.zeros((0, 3), dtype=np.float32), {"mode": "none", "r_med": 0.0}
 
     bubbles = np.array(bubbles, dtype=np.float32)
-
-    # ✅ Radius-band filtering (يقتل 90% من false positives)
     r = bubbles[:, 2]
     r_med = float(np.median(r))
     lo = 0.70 * r_med
     hi = 1.35 * r_med
     keep = (r >= lo) & (r <= hi)
     bubbles = bubbles[keep]
-
-    dbg = cv2.Canny(gray, 60, 160)
-    dbg = cv2.dilate(dbg, kernel, iterations=1)
-
-    meta = {"mode": "dual+radius_band", "r_med": r_med, "keep_lo": lo, "keep_hi": hi}
-    return bubbles, dbg, meta
+    return bubbles, {"mode": "dual+radius_band", "r_med": r_med, "lo": lo, "hi": hi}
 
 
-# =========================
-# 3) Clustering (eps based on r_med)
-# =========================
+# -------------------------
+# Clustering
+# -------------------------
 def cluster_points(bubbles: np.ndarray, r_med: float):
     if len(bubbles) < 30:
         return []
     eps = max(18.0, min(55.0, r_med * 2.4))
-    min_samples = 10
-    db = DBSCAN(eps=eps, min_samples=min_samples).fit(bubbles[:, :2])
+    db = DBSCAN(eps=eps, min_samples=10).fit(bubbles[:, :2])
     labels = db.labels_
-
     clusters = []
     for lb in sorted(set(labels)):
         if lb == -1:
@@ -215,9 +198,6 @@ def estimate_rows_cols(xy: np.ndarray, r_med: float):
     return rows, cols
 
 
-# =========================
-# 4) Identify code grid (10x4) and answer grids
-# =========================
 def find_code_cluster(clusters_idx, bubbles, r_med: float):
     best = None
     best_score = 1e9
@@ -228,10 +208,8 @@ def find_code_cluster(clusters_idx, bubbles, r_med: float):
         if score < best_score:
             best_score = score
             best = i
-
     if best is None:
         return None
-
     xy = bubbles[clusters_idx[best]][:, :2]
     rows, cols = estimate_rows_cols(xy, r_med)
     if abs(rows - 10) <= 2 and abs(cols - 4) <= 2:
@@ -251,9 +229,9 @@ def find_answer_clusters(clusters_idx, bubbles, r_med: float, code_cluster_i=Non
     return cands
 
 
-# =========================
-# 5) Fill score
-# =========================
+# -------------------------
+# Fill score
+# -------------------------
 def bubble_fill_score(gray: np.ndarray, cx: float, cy: float, r: float):
     H, W = gray.shape[:2]
     pad = int(max(10, r * 1.4))
@@ -264,31 +242,27 @@ def bubble_fill_score(gray: np.ndarray, cx: float, cy: float, r: float):
     roi = gray[y0:y1, x0:x1]
     if roi.size == 0:
         return 0.0
-
     thr = cv2.adaptiveThreshold(
         roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 7
     )
-
     mh, mw = thr.shape[:2]
     mask = np.zeros((mh, mw), dtype=np.uint8)
     ccx = int(cx) - x0
     ccy = int(cy) - y0
     rr = int(max(4, r * 0.62))
     cv2.circle(mask, (ccx, ccy), rr, 255, -1)
-
     inside = thr[mask == 255]
     if inside.size == 0:
         return 0.0
     return float(np.mean(inside) / 255.0)
 
 
-# =========================
-# 6) Read student code (4 digits)
-# =========================
+# -------------------------
+# Read student code (4 digits)
+# -------------------------
 def read_student_code(gray, code_bubbles, code_cols=4):
     pts = code_bubbles.copy()
-    pts = pts[np.argsort(pts[:, 0])]  # by x
-
+    pts = pts[np.argsort(pts[:, 0])]
     col_bins = []
     col_center = []
     for i in range(len(pts)):
@@ -306,34 +280,15 @@ def read_student_code(gray, code_bubbles, code_cols=4):
     digits = []
     for b in col_bins:
         col = pts[b]
-        col = col[np.argsort(col[:, 1])]  # y: 0..9
+        col = col[np.argsort(col[:, 1])]
         scores = [bubble_fill_score(gray, cx, cy, r) for cx, cy, r in col]
-        k = int(np.argmax(scores))
-        digits.append(str(k))
+        digits.append(str(int(np.argmax(scores))))
     return "".join(digits)
 
 
-# =========================
-# 7) Answers reading helpers
-# =========================
-def split_blocks_by_x(points_xy, gap_factor=2.6):
-    xs = np.sort(points_xy[:, 0])
-    if len(xs) < 30:
-        return [np.arange(len(points_xy))]
-    diffs = np.diff(xs)
-    med = float(np.median(diffs)) if np.median(diffs) > 0 else 1.0
-    cut = med * gap_factor
-    cuts = np.where(diffs > cut)[0]
-    if len(cuts) == 0:
-        return [np.arange(len(points_xy))]
-    sort_idx = np.argsort(points_xy[:, 0])
-    boundaries = [0] + (cuts + 1).tolist() + [len(xs)]
-    blocks = []
-    for a, b in zip(boundaries[:-1], boundaries[1:]):
-        blocks.append(sort_idx[a:b])
-    return blocks
-
-
+# -------------------------
+# Read answers
+# -------------------------
 def group_rows(points, y_tol):
     points = points[np.argsort(points[:, 1])]
     rows = []
@@ -349,120 +304,88 @@ def group_rows(points, y_tol):
 
 
 def pick_best_4_in_row(row):
-    """
-    If row has too many points due to noise, pick 4 representative points.
-    """
     row = row[np.argsort(row[:, 0])]
     if len(row) <= 6:
         return row
-    # pick 4 distributed indices
     idxs = [0, len(row)//3, (2*len(row))//3, len(row)-1]
     return row[idxs]
 
 
 def read_answers(gray, ans_bubbles, r_med: float, option_letters="ABCDE"):
     pts = ans_bubbles.copy()
-    blocks = split_blocks_by_x(pts[:, :2], gap_factor=2.7)
-    blocks = sorted(blocks, key=lambda idxs: float(np.mean(pts[idxs, 0])))
+    y_tol = max(16.0, r_med * 1.9)
+    rows = group_rows(pts, y_tol=y_tol)
 
     all_ans, all_conf = [], []
-    y_tol = max(16.0, r_med * 1.9)
+    for row in rows:
+        row = pick_best_4_in_row(row)
+        row = row[np.argsort(row[:, 0])]
+        if len(row) < 3:
+            continue
 
-    for bidx in blocks:
-        blk = pts[bidx]
-        rows = group_rows(blk, y_tol=y_tol)
+        scores = [bubble_fill_score(gray, cx, cy, r) for cx, cy, r in row]
+        scores_sorted = sorted(scores, reverse=True)
+        best = int(np.argmax(scores))
+        second = scores_sorted[1] if len(scores_sorted) > 1 else 0.0
+        conf = float(scores_sorted[0] - second)
 
-        for row in rows:
-            row = pick_best_4_in_row(row)
-            row = row[np.argsort(row[:, 0])]
-            if len(row) < 3:
-                continue
-
-            scores = [bubble_fill_score(gray, cx, cy, r) for cx, cy, r in row]
-            scores_sorted = sorted(scores, reverse=True)
-            best = int(np.argmax(scores))
-            second = scores_sorted[1] if len(scores_sorted) > 1 else 0.0
-            conf = float(scores_sorted[0] - second)
-
-            if scores_sorted[0] < 0.22:
-                all_ans.append("BLANK")
-                all_conf.append(0.0)
-                continue
-            if conf < 0.06:
-                all_ans.append("MULTI")
-                all_conf.append(conf)
-                continue
-
+        if scores_sorted[0] < 0.22:
+            all_ans.append("BLANK")
+            all_conf.append(0.0)
+        elif conf < 0.06:
+            all_ans.append("MULTI")
+            all_conf.append(conf)
+        else:
             all_ans.append(option_letters[best] if best < len(option_letters) else str(best))
             all_conf.append(conf)
 
     return all_ans, all_conf
 
 
-# =========================
-# 8) Parse one page
-# =========================
+# -------------------------
+# Parse one page
+# -------------------------
 def parse_page(bgr):
     warped, gray = preprocess_page(bgr)
-    bubbles, dbg_img, meta = detect_bubbles(gray)
+    bubbles, meta = detect_bubbles(gray)
+    if len(bubbles) < 60:
+        return None, {"error": "bubbles_too_few", "bubbles": int(len(bubbles)), "meta": meta}
 
-    if bubbles is None or len(bubbles) < 60:
-        return None, {
-            "error": "bubbles_too_few",
-            "bubbles": int(0 if bubbles is None else len(bubbles)),
-            "meta": meta
-        }
-
-    r_med = float(np.median(bubbles[:, 2])) if len(bubbles) else 10.0
-    clusters_idx = cluster_points(bubbles, r_med)
-
-    if not clusters_idx:
+    r_med = float(np.median(bubbles[:, 2]))
+    clusters = cluster_points(bubbles, r_med)
+    if not clusters:
         return None, {"error": "no_clusters", "bubbles": int(len(bubbles)), "r_med": r_med, "meta": meta}
 
-    code_i = find_code_cluster(clusters_idx, bubbles, r_med)
+    code_i = find_code_cluster(clusters, bubbles, r_med)
     student_code = "UNKNOWN"
     if code_i is not None:
-        code_cluster = bubbles[clusters_idx[code_i]]
-        student_code = read_student_code(gray, code_cluster, code_cols=4)
+        student_code = read_student_code(gray, bubbles[clusters[code_i]], code_cols=4)
 
-    ans_ids = find_answer_clusters(clusters_idx, bubbles, r_med, code_cluster_i=code_i)
+    ans_ids = find_answer_clusters(clusters, bubbles, r_med, code_cluster_i=code_i)
     if not ans_ids:
-        return None, {"error": "no_answer_cluster", "bubbles": int(len(bubbles)), "r_med": r_med, "clusters": int(len(clusters_idx)), "meta": meta}
+        return None, {"error": "no_answer_cluster", "bubbles": int(len(bubbles)), "clusters": int(len(clusters)), "r_med": r_med, "meta": meta}
 
-    parsed = []
+    # pick cluster with most extracted answers
+    best_ans, best_conf = [], []
     for i in ans_ids:
-        ans_cluster = bubbles[clusters_idx[i]]
-        ans, conf = read_answers(gray, ans_cluster, r_med=r_med, option_letters="ABCDE")
-        parsed.append((i, ans, conf, len(ans_cluster)))
-
-    parsed.sort(key=lambda t: len(t[1]), reverse=True)
-
-    best_ans, best_conf = parsed[0][1], parsed[0][2]
-    merged_ans = best_ans[:]
-    merged_conf = best_conf[:]
-
-    for (_, ans, conf, _) in parsed[1:]:
-        if len(ans) >= 10:
-            merged_ans += ans
-            merged_conf += conf
+        ans, conf = read_answers(gray, bubbles[clusters[i]], r_med=r_med, option_letters="ABCDE")
+        if len(ans) > len(best_ans):
+            best_ans, best_conf = ans, conf
 
     return {
         "student_code": student_code,
-        "answers": merged_ans,
-        "confidence": merged_conf,
-        "num_answers": len(merged_ans)
+        "answers": best_ans,
+        "confidence": best_conf,
+        "num_answers": len(best_ans),
     }, {
         "bubbles": int(len(bubbles)),
+        "clusters": int(len(clusters)),
         "r_med": r_med,
-        "clusters": int(len(clusters_idx)),
         "mode": meta.get("mode"),
-        "radius_band": [meta.get("keep_lo"), meta.get("keep_hi")]
+        "radius_band": [meta.get("lo"), meta.get("hi")]
     }
 
 
-# =========================
-# 9) Scoring
-# =========================
 def score_answers(student_answers, key_answers):
     n = min(len(student_answers), len(key_answers))
     correct = 0
@@ -473,23 +396,16 @@ def score_answers(student_answers, key_answers):
 
 
 # =========================
-# 10) Streamlit UI
+# UI
 # =========================
 st.set_page_config(page_title="Smart OMR", layout="wide")
-st.title("📄 Smart OMR — قراءة الإجابات + كود الطالب (4 خانات ثابت)")
-
-st.info(
-    "الخطوات:\n"
-    "1) ارفع Answer Key (ورقة مظللة)\n"
-    "2) ارفع أوراق الطلاب (متعدد)\n\n"
-    "ملاحظة: إذا رفعت قالب فارغ كـ Answer Key فسيتم اكتشاف الشبكة، لكن الإجابات ستكون BLANK."
-)
+st.title("📄 Smart OMR — قراءة الإجابات + كود الطالب (ثابت 4 خانات)")
 
 c1, c2 = st.columns(2)
 with c1:
     key_file = st.file_uploader("1) Answer Key (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
 with c2:
-    student_files = st.file_uploader("2) أوراق الطلاب (PDF/صور) - متعدد", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
+    student_files = st.file_uploader("2) أوراق الطلاب (متعدد)", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
 
 key_answers = None
 
@@ -497,26 +413,23 @@ if key_file is not None:
     try:
         pages = load_pages(key_file.getvalue(), key_file.name, zoom=4.0)
         res, dbg = parse_page(pages[0])
-
         if res is None:
             st.error(f"فشل قراءة Answer Key: {dbg}")
         else:
             blanks = sum(1 for a in res["answers"] if a == "BLANK")
             total = res["num_answers"]
 
+            st.write("🔎 Debug Answer Key:", dbg)
+
             if total == 0:
-                st.error("تم العثور على فقاعات لكن لم يتم بناء شبكة أسئلة صحيحة. راجع الـ debug بالأسفل.")
-                st.write(dbg)
+                st.error("لم يتم بناء شبكة أسئلة صحيحة من هذا الملف.")
             elif blanks / max(1, total) > 0.85:
-                st.warning(
-                    f"تم اكتشاف شبكة أسئلة (عدد={total}) لكن أغلبها BLANK.\n"
-                    "هذا غالبًا قالب فارغ وليس Answer Key مظلّل."
-                )
-                st.write({"detected_questions": total, "student_code_detected": res["student_code"], "debug": dbg})
+                st.warning(f"تم اكتشاف شبكة أسئلة (عدد={total}) لكن أغلبها BLANK. هذا غالبًا قالب فارغ.")
+                st.write({"detected_questions": total, "student_code_detected": res["student_code"]})
             else:
                 key_answers = res["answers"]
-                st.success(f"✅ تم استخراج Answer Key بنجاح | الأسئلة: {len(key_answers)}")
-                st.write({"detected_questions": len(key_answers), "student_code_in_key": res["student_code"], "debug": dbg})
+                st.success(f"✅ تم استخراج Answer Key | عدد الأسئلة: {len(key_answers)}")
+                st.write({"answers_preview": key_answers[:20], "student_code_in_key": res["student_code"]})
 
     except Exception as e:
         st.exception(e)
@@ -524,60 +437,48 @@ if key_file is not None:
 if key_answers and student_files:
     results = []
     for f in student_files:
-        try:
-            pages = load_pages(f.getvalue(), f.name, zoom=4.0)
-            for pi, page in enumerate(pages):
-                res, dbg = parse_page(page)
-                if res is None:
-                    results.append({
-                        "file": f.name,
-                        "page": pi + 1,
-                        "student_code": "UNKNOWN",
-                        "score": 0,
-                        "total": len(key_answers),
-                        "detected_answers": 0,
-                        "mean_confidence": 0.0,
-                        "notes": str(dbg)
-                    })
-                    continue
-
-                correct, total = score_answers(res["answers"], key_answers)
-                mean_conf = float(np.mean(res["confidence"])) if res["confidence"] else 0.0
-
+        pages = load_pages(f.getvalue(), f.name, zoom=4.0)
+        for pi, page in enumerate(pages):
+            res, dbg = parse_page(page)
+            if res is None:
                 results.append({
                     "file": f.name,
                     "page": pi + 1,
-                    "student_code": res["student_code"],
-                    "score": correct,
-                    "total": total,
-                    "detected_answers": res["num_answers"],
-                    "mean_confidence": mean_conf,
-                    "notes": f"bubbles={dbg['bubbles']} r_med={dbg['r_med']:.2f} clusters={dbg['clusters']} mode={dbg['mode']}"
+                    "student_code": "UNKNOWN",
+                    "score": 0,
+                    "total": len(key_answers),
+                    "detected_answers": 0,
+                    "mean_confidence": 0.0,
+                    "notes": str(dbg),
                 })
+                continue
 
-        except Exception as e:
+            correct, total = score_answers(res["answers"], key_answers)
+            mean_conf = float(np.mean(res["confidence"])) if res["confidence"] else 0.0
+
             results.append({
                 "file": f.name,
-                "page": 1,
-                "student_code": "UNKNOWN",
-                "score": 0,
-                "total": len(key_answers),
-                "detected_answers": 0,
-                "mean_confidence": 0.0,
-                "notes": f"ERROR: {e}"
+                "page": pi + 1,
+                "student_code": res["student_code"],
+                "score": correct,
+                "total": total,
+                "detected_answers": res["num_answers"],
+                "mean_confidence": mean_conf,
+                "notes": f"bubbles={dbg['bubbles']} r_med={dbg['r_med']:.2f} clusters={dbg['clusters']} mode={dbg['mode']}",
             })
 
     df = pd.DataFrame(results)
-    st.subheader("📊 النتائج")
-    st.dataframe(df, use_container_width=True)
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    st.subheader("📊 النتائج")
+    st.dataframe(df, width="stretch")
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="results")
 
     st.download_button(
         "⬇️ تنزيل Excel النتائج",
-        data=output.getvalue(),
+        data=out.getvalue(),
         file_name="omr_results.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
