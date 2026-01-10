@@ -1,3 +1,4 @@
+# app.py
 import io
 import math
 import numpy as np
@@ -18,7 +19,7 @@ except Exception:
 def load_pages(file_bytes: bytes, filename: str, zoom: float = 4.0):
     """
     Returns list of BGR images for each page.
-    zoom=4.0 is IMPORTANT for thin bubble outlines in PDF templates.
+    zoom=4.0 IMPORTANT for thin outlines in PDF.
     """
     name = (filename or "").lower()
     if name.endswith(".pdf"):
@@ -103,15 +104,13 @@ def preprocess_page(bgr: np.ndarray):
 
 
 # =========================
-# 2) Bubble Detection (DUAL)
-#    - Mode A: contours (good for filled)
-#    - Mode B: Hough circles (good for blank templates)
+# 2) Bubble Detection (Dual + Radius-band filter)
 # =========================
-def detect_bubbles_dual(gray: np.ndarray):
+def detect_bubbles(gray: np.ndarray):
     H, W = gray.shape[:2]
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-    # ---- Mode A: threshold + contours
+    # ---- A) contours for filled marks
     thr = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7
     )
@@ -128,59 +127,66 @@ def detect_bubbles_dual(gray: np.ndarray):
         if peri <= 0:
             continue
         circularity = 4 * math.pi * area / (peri * peri + 1e-9)
-        if circularity < 0.40:
+        if circularity < 0.45:
             continue
         x, y, w, h = cv2.boundingRect(c)
         ar = w / float(h + 1e-9)
-        if ar < 0.55 or ar > 1.45:
+        if ar < 0.6 or ar > 1.4:
             continue
         cx = x + w / 2.0
         cy = y + h / 2.0
         r = (w + h) / 4.0
         bubblesA.append((cx, cy, r))
 
-    # إذا كافي، خلاص
-    if len(bubblesA) >= 120:
-        return np.array(bubblesA, dtype=np.float32), thr, "contours"
-
-    # ---- Mode B: HoughCircles (for thin outlines)
+    # ---- B) Hough for thin outlines (reduce false circles)
     circles = cv2.HoughCircles(
         gray,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
-        minDist=18,
-        param1=120,
-        param2=18,
-        minRadius=6,
-        maxRadius=60,
+        minDist=20,
+        param1=140,
+        param2=26,     # أعلى = دوائر أقل (أكثر دقة)
+        minRadius=8,
+        maxRadius=55,
     )
 
     bubblesB = []
     if circles is not None:
         circles = np.round(circles[0, :]).astype("int")
         for (x, y, r) in circles:
-            if 0 <= x < W and 0 <= y < H and 6 <= r <= 80:
+            if 0 <= x < W and 0 <= y < H and 8 <= r <= 70:
                 bubblesB.append((float(x), float(y), float(r)))
 
-    # دمج
-    bubblesAll = bubblesA + bubblesB
+    bubbles = bubblesA + bubblesB
+    if len(bubbles) == 0:
+        return np.zeros((0, 3), dtype=np.float32), thr, {"mode": "none", "r_med": 0.0}
+
+    bubbles = np.array(bubbles, dtype=np.float32)
+
+    # ✅ Radius-band filtering (يقتل 90% من false positives)
+    r = bubbles[:, 2]
+    r_med = float(np.median(r))
+    lo = 0.70 * r_med
+    hi = 1.35 * r_med
+    keep = (r >= lo) & (r <= hi)
+    bubbles = bubbles[keep]
+
     dbg = cv2.Canny(gray, 60, 160)
     dbg = cv2.dilate(dbg, kernel, iterations=1)
-    return np.array(bubblesAll, dtype=np.float32), dbg, "hough+contours"
+
+    meta = {"mode": "dual+radius_band", "r_med": r_med, "keep_lo": lo, "keep_hi": hi}
+    return bubbles, dbg, meta
 
 
 # =========================
-# 3) Clustering (auto eps)
+# 3) Clustering (eps based on r_med)
 # =========================
-def auto_cluster(bubbles_xy: np.ndarray, bubbles_r: np.ndarray):
-    if len(bubbles_xy) < 30:
+def cluster_points(bubbles: np.ndarray, r_med: float):
+    if len(bubbles) < 30:
         return []
-
-    r_med = float(np.median(bubbles_r)) if len(bubbles_r) else 10.0
-    eps = max(18.0, min(45.0, r_med * 2.2))
+    eps = max(18.0, min(55.0, r_med * 2.4))
     min_samples = 10
-
-    db = DBSCAN(eps=eps, min_samples=min_samples).fit(bubbles_xy)
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(bubbles[:, :2])
     labels = db.labels_
 
     clusters = []
@@ -188,7 +194,7 @@ def auto_cluster(bubbles_xy: np.ndarray, bubbles_r: np.ndarray):
         if lb == -1:
             continue
         idx = np.where(labels == lb)[0]
-        if len(idx) >= 20:
+        if len(idx) >= 25:
             clusters.append(idx)
     return clusters
 
@@ -202,25 +208,22 @@ def count_levels(vals, tol):
     return len(levels)
 
 
-def estimate_rows_cols(xy: np.ndarray):
-    # tolerance based on typical spacing
-    xs = xy[:, 0]
-    ys = xy[:, 1]
-    cols = count_levels(xs, tol=20)
-    rows = count_levels(ys, tol=20)
+def estimate_rows_cols(xy: np.ndarray, r_med: float):
+    tol = max(16.0, r_med * 1.8)
+    cols = count_levels(xy[:, 0], tol)
+    rows = count_levels(xy[:, 1], tol)
     return rows, cols
 
 
 # =========================
-# 4) Identify Code Grid & Answer Grids
-#    code: 10 rows x 4 cols (fixed)
+# 4) Identify code grid (10x4) and answer grids
 # =========================
-def find_code_cluster(clusters_idx, bubbles):
+def find_code_cluster(clusters_idx, bubbles, r_med: float):
     best = None
     best_score = 1e9
     for i, idx in enumerate(clusters_idx):
         xy = bubbles[idx][:, :2]
-        rows, cols = estimate_rows_cols(xy)
+        rows, cols = estimate_rows_cols(xy, r_med)
         score = abs(rows - 10) * 3 + abs(cols - 4) * 6
         if score < best_score:
             best_score = score
@@ -230,31 +233,30 @@ def find_code_cluster(clusters_idx, bubbles):
         return None
 
     xy = bubbles[clusters_idx[best]][:, :2]
-    rows, cols = estimate_rows_cols(xy)
+    rows, cols = estimate_rows_cols(xy, r_med)
     if abs(rows - 10) <= 2 and abs(cols - 4) <= 2:
         return best
     return None
 
 
-def find_answer_clusters(clusters_idx, bubbles, code_cluster_i=None):
+def find_answer_clusters(clusters_idx, bubbles, r_med: float, code_cluster_i=None):
     cands = []
     for i, idx in enumerate(clusters_idx):
         if code_cluster_i is not None and i == code_cluster_i:
             continue
         xy = bubbles[idx][:, :2]
-        rows, cols = estimate_rows_cols(xy)
-        # answers: rows big, cols around 4 or 5
+        rows, cols = estimate_rows_cols(xy, r_med)
         if rows >= 10 and cols in (4, 5, 6):
             cands.append(i)
     return cands
 
 
 # =========================
-# 5) Fill Score
+# 5) Fill score
 # =========================
 def bubble_fill_score(gray: np.ndarray, cx: float, cy: float, r: float):
     H, W = gray.shape[:2]
-    pad = int(max(8, r * 1.3))
+    pad = int(max(10, r * 1.4))
     x0 = max(int(cx) - pad, 0)
     x1 = min(int(cx) + pad, W - 1)
     y0 = max(int(cy) - pad, 0)
@@ -271,27 +273,22 @@ def bubble_fill_score(gray: np.ndarray, cx: float, cy: float, r: float):
     mask = np.zeros((mh, mw), dtype=np.uint8)
     ccx = int(cx) - x0
     ccy = int(cy) - y0
-    rr = int(max(3, r * 0.60))
+    rr = int(max(4, r * 0.62))
     cv2.circle(mask, (ccx, ccy), rr, 255, -1)
 
     inside = thr[mask == 255]
     if inside.size == 0:
         return 0.0
-
-    # 0..1 higher = filled
     return float(np.mean(inside) / 255.0)
 
 
 # =========================
-# 6) Read Student Code (4 digits)
+# 6) Read student code (4 digits)
 # =========================
 def read_student_code(gray, code_bubbles, code_cols=4):
     pts = code_bubbles.copy()
-    # sort by x
-    order = np.argsort(pts[:, 0])
-    pts = pts[order]
+    pts = pts[np.argsort(pts[:, 0])]  # by x
 
-    # group columns by x proximity
     col_bins = []
     col_center = []
     for i in range(len(pts)):
@@ -303,7 +300,6 @@ def read_student_code(gray, code_bubbles, code_cols=4):
             col_bins[-1].append(i)
             col_center[-1] = float(np.mean(pts[col_bins[-1], 0]))
 
-    # keep 4 most populated, then sort left->right
     col_bins = sorted(col_bins, key=len, reverse=True)[:code_cols]
     col_bins = sorted(col_bins, key=lambda b: float(np.mean(pts[b, 0])))
 
@@ -318,21 +314,18 @@ def read_student_code(gray, code_bubbles, code_cols=4):
 
 
 # =========================
-# 7) Read Answers (supports multiple blocks)
+# 7) Answers reading helpers
 # =========================
-def split_blocks_by_x(points_xy, gap_factor=2.5):
+def split_blocks_by_x(points_xy, gap_factor=2.6):
     xs = np.sort(points_xy[:, 0])
-    if len(xs) < 20:
+    if len(xs) < 30:
         return [np.arange(len(points_xy))]
-
     diffs = np.diff(xs)
     med = float(np.median(diffs)) if np.median(diffs) > 0 else 1.0
     cut = med * gap_factor
     cuts = np.where(diffs > cut)[0]
-
     if len(cuts) == 0:
         return [np.arange(len(points_xy))]
-
     sort_idx = np.argsort(points_xy[:, 0])
     boundaries = [0] + (cuts + 1).tolist() + [len(xs)]
     blocks = []
@@ -341,7 +334,7 @@ def split_blocks_by_x(points_xy, gap_factor=2.5):
     return blocks
 
 
-def group_rows(points, y_tol=20):
+def group_rows(points, y_tol):
     points = points[np.argsort(points[:, 1])]
     rows = []
     cur = [points[0]]
@@ -355,21 +348,32 @@ def group_rows(points, y_tol=20):
     return rows
 
 
-def read_answers(gray, ans_bubbles, option_letters="ABCDE"):
+def pick_best_4_in_row(row):
+    """
+    If row has too many points due to noise, pick 4 representative points.
+    """
+    row = row[np.argsort(row[:, 0])]
+    if len(row) <= 6:
+        return row
+    # pick 4 distributed indices
+    idxs = [0, len(row)//3, (2*len(row))//3, len(row)-1]
+    return row[idxs]
+
+
+def read_answers(gray, ans_bubbles, r_med: float, option_letters="ABCDE"):
     pts = ans_bubbles.copy()
-    blocks = split_blocks_by_x(pts[:, :2], gap_factor=2.6)
-
-    all_ans = []
-    all_conf = []
-
-    # process blocks left->right
+    blocks = split_blocks_by_x(pts[:, :2], gap_factor=2.7)
     blocks = sorted(blocks, key=lambda idxs: float(np.mean(pts[idxs, 0])))
+
+    all_ans, all_conf = [], []
+    y_tol = max(16.0, r_med * 1.9)
 
     for bidx in blocks:
         blk = pts[bidx]
-        rows = group_rows(blk, y_tol=20)
+        rows = group_rows(blk, y_tol=y_tol)
 
         for row in rows:
+            row = pick_best_4_in_row(row)
             row = row[np.argsort(row[:, 0])]
             if len(row) < 3:
                 continue
@@ -380,7 +384,6 @@ def read_answers(gray, ans_bubbles, option_letters="ABCDE"):
             second = scores_sorted[1] if len(scores_sorted) > 1 else 0.0
             conf = float(scores_sorted[0] - second)
 
-            # BLANK / MULTI rules
             if scores_sorted[0] < 0.22:
                 all_ans.append("BLANK")
                 all_conf.append(0.0)
@@ -397,44 +400,47 @@ def read_answers(gray, ans_bubbles, option_letters="ABCDE"):
 
 
 # =========================
-# 8) Parse One Page
+# 8) Parse one page
 # =========================
 def parse_page(bgr):
     warped, gray = preprocess_page(bgr)
-    bubbles, dbg_img, mode = detect_bubbles_dual(gray)
+    bubbles, dbg_img, meta = detect_bubbles(gray)
 
     if bubbles is None or len(bubbles) < 60:
-        return None, {"error": "bubbles_too_few", "bubbles": int(0 if bubbles is None else len(bubbles)), "mode": mode}
+        return None, {
+            "error": "bubbles_too_few",
+            "bubbles": int(0 if bubbles is None else len(bubbles)),
+            "meta": meta
+        }
 
-    clusters_idx = auto_cluster(bubbles[:, :2], bubbles[:, 2])
+    r_med = float(np.median(bubbles[:, 2])) if len(bubbles) else 10.0
+    clusters_idx = cluster_points(bubbles, r_med)
+
     if not clusters_idx:
-        return None, {"error": "no_clusters", "bubbles": int(len(bubbles)), "mode": mode}
+        return None, {"error": "no_clusters", "bubbles": int(len(bubbles)), "r_med": r_med, "meta": meta}
 
-    code_i = find_code_cluster(clusters_idx, bubbles)
+    code_i = find_code_cluster(clusters_idx, bubbles, r_med)
     student_code = "UNKNOWN"
     if code_i is not None:
         code_cluster = bubbles[clusters_idx[code_i]]
         student_code = read_student_code(gray, code_cluster, code_cols=4)
 
-    ans_ids = find_answer_clusters(clusters_idx, bubbles, code_cluster_i=code_i)
+    ans_ids = find_answer_clusters(clusters_idx, bubbles, r_med, code_cluster_i=code_i)
     if not ans_ids:
-        return None, {"error": "no_answer_cluster", "bubbles": int(len(bubbles)), "mode": mode}
+        return None, {"error": "no_answer_cluster", "bubbles": int(len(bubbles)), "r_med": r_med, "clusters": int(len(clusters_idx)), "meta": meta}
 
-    # read answers from ALL candidate clusters, then choose best or merge if multiple sections exist
     parsed = []
     for i in ans_ids:
         ans_cluster = bubbles[clusters_idx[i]]
-        ans, conf = read_answers(gray, ans_cluster, option_letters="ABCDE")
+        ans, conf = read_answers(gray, ans_cluster, r_med=r_med, option_letters="ABCDE")
         parsed.append((i, ans, conf, len(ans_cluster)))
 
-    # sort by number of answers extracted
     parsed.sort(key=lambda t: len(t[1]), reverse=True)
 
     best_ans, best_conf = parsed[0][1], parsed[0][2]
     merged_ans = best_ans[:]
     merged_conf = best_conf[:]
 
-    # merge other large answer zones (مثل theoretical+practical)
     for (_, ans, conf, _) in parsed[1:]:
         if len(ans) >= 10:
             merged_ans += ans
@@ -444,12 +450,13 @@ def parse_page(bgr):
         "student_code": student_code,
         "answers": merged_ans,
         "confidence": merged_conf,
-        "num_answers": len(merged_ans),
-        "mode": mode
+        "num_answers": len(merged_ans)
     }, {
         "bubbles": int(len(bubbles)),
+        "r_med": r_med,
         "clusters": int(len(clusters_idx)),
-        "mode": mode
+        "mode": meta.get("mode"),
+        "radius_band": [meta.get("keep_lo"), meta.get("keep_hi")]
     }
 
 
@@ -472,15 +479,17 @@ st.set_page_config(page_title="Smart OMR", layout="wide")
 st.title("📄 Smart OMR — قراءة الإجابات + كود الطالب (4 خانات ثابت)")
 
 st.info(
-    "✅ ارفع Answer Key (ورقة مظللة) ثم ارفع أوراق الطلاب.\n\n"
-    "⚠️ إذا رفعت قالب فارغ كـ Answer Key، البرنامج سيكتشف الشبكة لكنه لن يستطيع استخراج إجابات (لأنه لا يوجد تظليل)."
+    "الخطوات:\n"
+    "1) ارفع Answer Key (ورقة مظللة)\n"
+    "2) ارفع أوراق الطلاب (متعدد)\n\n"
+    "ملاحظة: إذا رفعت قالب فارغ كـ Answer Key فسيتم اكتشاف الشبكة، لكن الإجابات ستكون BLANK."
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    key_file = st.file_uploader("1) ارفع Answer Key (PDF أو صورة)", type=["pdf", "png", "jpg", "jpeg"])
-with col2:
-    student_files = st.file_uploader("2) ارفع أوراق الطلاب (PDF/صور) - متعدد", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
+c1, c2 = st.columns(2)
+with c1:
+    key_file = st.file_uploader("1) Answer Key (PDF/صورة)", type=["pdf", "png", "jpg", "jpeg"])
+with c2:
+    student_files = st.file_uploader("2) أوراق الطلاب (PDF/صور) - متعدد", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
 
 key_answers = None
 
@@ -492,17 +501,21 @@ if key_file is not None:
         if res is None:
             st.error(f"فشل قراءة Answer Key: {dbg}")
         else:
-            # if most are BLANK -> likely a template, not filled key
             blanks = sum(1 for a in res["answers"] if a == "BLANK")
-            if res["num_answers"] == 0 or blanks / max(1, res["num_answers"]) > 0.85:
+            total = res["num_answers"]
+
+            if total == 0:
+                st.error("تم العثور على فقاعات لكن لم يتم بناء شبكة أسئلة صحيحة. راجع الـ debug بالأسفل.")
+                st.write(dbg)
+            elif blanks / max(1, total) > 0.85:
                 st.warning(
-                    f"تم اكتشاف شبكة أسئلة (عدد={res['num_answers']}) لكن أغلبها BLANK.\n"
+                    f"تم اكتشاف شبكة أسئلة (عدد={total}) لكن أغلبها BLANK.\n"
                     "هذا غالبًا قالب فارغ وليس Answer Key مظلّل."
                 )
-                st.write({"detected_questions": res["num_answers"], "student_code_detected": res["student_code"], "debug": dbg})
+                st.write({"detected_questions": total, "student_code_detected": res["student_code"], "debug": dbg})
             else:
                 key_answers = res["answers"]
-                st.success(f"✅ تم استخراج Answer Key. عدد الأسئلة: {len(key_answers)} | طريقة الكشف: {dbg['mode']}")
+                st.success(f"✅ تم استخراج Answer Key بنجاح | الأسئلة: {len(key_answers)}")
                 st.write({"detected_questions": len(key_answers), "student_code_in_key": res["student_code"], "debug": dbg})
 
     except Exception as e:
@@ -539,7 +552,7 @@ if key_answers and student_files:
                     "total": total,
                     "detected_answers": res["num_answers"],
                     "mean_confidence": mean_conf,
-                    "notes": f"bubbles={dbg['bubbles']} clusters={dbg['clusters']} mode={dbg['mode']}"
+                    "notes": f"bubbles={dbg['bubbles']} r_med={dbg['r_med']:.2f} clusters={dbg['clusters']} mode={dbg['mode']}"
                 })
 
         except Exception as e:
@@ -558,7 +571,6 @@ if key_answers and student_files:
     st.subheader("📊 النتائج")
     st.dataframe(df, use_container_width=True)
 
-    # Export
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="results")
